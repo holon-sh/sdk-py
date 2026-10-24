@@ -1,0 +1,29 @@
+name: CI
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - name: Fetch the mcptype binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v0.0.6 --repo hughhan1/mcptype --pattern '*manylinux*x86_64.whl' --dir "$RUNNER_TEMP/mcptype"
+      - run: uv sync --all-extras --find-links "$RUNNER_TEMP/mcptype"
+      - run: uv run --no-sync pytest
+      - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding -p holon.view -p holon.extract
+      - run: uv build
+      - run: uv run --no-sync python scripts/build_tooling.py
+      - name: Verify installed wheel and sdist consumers
+        run: uv run --no-sync python scripts/verify_distribution.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holon-sh
+          path: dist/

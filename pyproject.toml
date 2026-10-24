@@ -5,15 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "holon-sh"
 version = "0.1.0"
-description = "Typed MCP clients, bindings, app views, and static contract extraction"
+description = "Typed MCP clients, bindings, and app views"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["mcp>=2.3,<3", "jsonschema>=4.26,<5"]
-
-[project.optional-dependencies]
-check = ["mcptype==0.0.6", "mypy==2.4.0"]
 
 [project.urls]
 Repository = "https://github.com/holon-sh/sdk-py"
@@ -22,7 +19,7 @@ Repository = "https://github.com/holon-sh/sdk-py"
 only-include = ["holon"]
 
 [tool.hatch.build.targets.sdist]
-include = ["holon", "tests", "scripts", "runner.py", "README.md", "pyproject.toml"]
+include = ["holon", "tests", "scripts", "README.md", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -31,4 +28,4 @@ testpaths = ["tests"]
 target-version = "py311"
 
 [dependency-groups]
-dev = ["pytest==9.1.1", "ruff==0.16.8", "types-jsonschema", "hatchling>=1.27,<2"]
+dev = ["mcptype==0.0.6", "mypy==2.4.0", "pytest==9.1.1", "ruff==0.16.8", "types-jsonschema", "hatchling>=1.27,<2"]

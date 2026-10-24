@@ -1,6 +1,6 @@
 # holon-sh
 
-Public Python runtime and static contract extractor for typed MCP clients.
+Public Python runtime for typed MCP clients.
 This repository prepares release artifacts; it does not publish them.
 
 Install the `holon-sh` distribution and import its modules from the `holon`
@@ -9,7 +9,6 @@ namespace:
 ```python
 from holon.binding import Binding, set_default_binding
 from holon.client import Apps, ToolCallError
-from holon.extract import extract
 from holon.view import app_view
 ```
 
@@ -41,32 +40,20 @@ tool call fails or requires additional input.
 `connect_domains` and `resource_domains` CSP settings. It reads and caches the
 file on the first resource request.
 
-`extract(root, entry)` inspects Python source without executing the app. It
-returns the tool/resource catalog, source hashes, `usesApps`, and a diagnostic
-when a static contract cannot be proven. Sources inside `holon/` are excluded.
-
 ## Development
 
 ```sh
-uv sync --all-extras
+uv sync
 uv run pytest
-uv run mypy --strict -p holon.client -p holon.binding -p holon.view -p holon.extract
+uv run mypy --strict -p holon.client -p holon.binding -p holon.view
 uv build
-uv run python scripts/build_tooling.py
 ```
 
-The `check` extra pins `mcptype==0.0.6` and `mypy==2.4.0`. Before mcptype 0.0.6
-is published, supply its locally built wheel with `uv sync --all-extras
---find-links /path/to/mcptype/wheels`. Do not commit platform bindings here.
+The `dev` dependency group pins `mcptype==0.0.6` and `mypy==2.4.0`, which the
+package tests use to generate and type-check a sample `holon/apps` namespace.
+Before mcptype 0.0.6 is published, supply its locally built wheel with
+`uv sync --find-links /path/to/mcptype/wheels`. Do not commit platform bindings
+here.
 
-`dist/cli-tooling-py-0.1.0.zip` contains standalone `runner.py` and `extract.py`.
-The runner accepts `python runner.py MODE CONFIG_JSON [OUTPUT_JSON]`:
-
-- `extract`: config `{"apps":[{"name":"orders","path":"/app","entry":"server.py"}]}`;
-  output maps app names to extraction results.
-- `check`: config `{"sources":{"/app/server.py":"sha256"},"check":true,"entry":"/app/server.py"}`;
-  verifies source hashes and runs mypy in the invoking Python environment.
-- `verify`: verifies the same source hashes without running mypy.
-
-The tooling archive contains no client runtime and does not require the SDK
-to extract contracts. The `check` mode requires mypy in the app environment.
+Contract extraction and type checking belong to the `holon` CLI, which carries
+its own tooling; this distribution ships only the runtime.

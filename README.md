@@ -1,7 +1,9 @@
 # holon-sh
 
 Public Python runtime for typed MCP clients.
-This repository prepares release artifacts; it does not publish them.
+This repository prepares release artifacts. Its CI does not publish them; dev
+builds are published only by a manually dispatched workflow (see
+[Dev releases](#dev-releases)).
 
 Install the `holon-sh` distribution and import its modules from the `holon`
 namespace:
@@ -57,3 +59,24 @@ here.
 
 Contract extraction and type checking belong to the `holon` CLI, which carries
 its own tooling; this distribution ships only the runtime.
+
+## Dev releases
+
+`.github/workflows/publish-dev.yml` publishes `holon-sh==0.1.0.dev<run number>`
+to PyPI. It runs only when dispatched by hand, rewrites the version in
+`pyproject.toml` inside the job without committing it, runs the test suite and
+build, and prints the exact install line in the job summary. `main` stays at
+`0.1.0`.
+
+One-time setup on pypi.org: add a pending (trusted) publisher for the project
+`holon-sh` with owner `holon-sh`, repository `sdk-py`, workflow
+`publish-dev.yml`, and no environment. Alternatively store an API token as the
+`PYPI_TOKEN` repository secret; the workflow uses it when present and OIDC
+trusted publishing otherwise.
+
+```sh
+gh workflow run publish-dev.yml
+```
+
+Consumers install a dev build with `pip install --pre holon-sh` or the exact
+version printed in the job summary, e.g. `uv add 'holon-sh==0.1.0.dev12'`.

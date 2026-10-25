@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from functools import partial
+from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar
 
 import httpx2
@@ -108,7 +110,13 @@ class _App:
             if contract is None
             else {tool["name"]: tool for tool in contract["tools"]}
         )
-        self.tools = _Tools(self)
+        self.tools = SimpleNamespace(
+            **{
+                name: partial(self._call_tool, name)
+                for name in self._definitions or ()
+                if not name.startswith("_")
+            }
+        )
 
     async def call_tool(
         self,
@@ -202,25 +210,17 @@ class _App:
             )
         return result
 
-
-class _Tools:
-    def __init__(self, client: _App) -> None:
-        self._client = client
-
-    def __getattr__(self, name: str) -> Any:
-        definitions = self._client._definitions
-        if name.startswith("_") or definitions is None or name not in definitions:
-            raise AttributeError(name)
-
-        async def call(
-            arguments: Mapping[str, object], *, timeout: float | None = None
-        ) -> object:
-            result = await self._client.call_tool(name, arguments, timeout=timeout)
-            if isinstance(result, InputRequiredResult) or result.is_error:
-                raise ToolCallError(self._client._name, name, result)
-            return result.structured_content
-
-        return call
+    async def _call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        *,
+        timeout: float | None = None,
+    ) -> object:
+        result = await self.call_tool(name, arguments, timeout=timeout)
+        if isinstance(result, InputRequiredResult) or result.is_error:
+            raise ToolCallError(self._name, name, result)
+        return result.structured_content
 
 
 class Apps:
@@ -252,19 +252,14 @@ class Apps:
         bindings: Mapping[str, Binding] | None = None,
     ) -> None:
         # Every declared dependency gets a client; those without a contract are untyped.
-        available: dict[str, dict[str, Any] | None] = {
-            name: None for name in identity["requires"]
-        }
-        available.update(contracts)
-        selected = available if bindings is None else {}
-        for name in bindings or ():
+        available = dict.fromkeys(identity["requires"]) | contracts
+        self._apps = {}
+        for name in available if bindings is None else bindings:
             if name not in available:
                 raise ValueError(f"Unknown app binding: {name}")
-            selected[name] = available[name]
-        self._apps = {
-            name: _App(name, identity, contract, bindings[name] if bindings else None)
-            for name, contract in selected.items()
-        }
+            self._apps[name] = _App(
+                name, identity, available[name], bindings[name] if bindings else None
+            )
 
     def __getitem__(self, name: str) -> _App:
         return self._apps[name]

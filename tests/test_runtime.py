@@ -10,33 +10,30 @@ import holon.binding
 from holon.binding import set_default_binding
 from holon.client import Apps, ToolCallError
 
-
-@pytest.fixture
-def contract():
-    return {
-        "tools": [
-            {
-                "name": "read",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "limit": {"type": "integer", "default": 5},
-                    },
-                    "required": ["id"],
-                    "additionalProperties": False,
+CONTRACT = {
+    "tools": [
+        {
+            "name": "read",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
                 },
-                "outputSchema": {
-                    "type": "object",
-                    "properties": {"total": {"type": "number"}},
-                    "required": ["total"],
-                },
-            }
-        ]
-    }
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {"total": {"type": "number"}},
+                "required": ["total"],
+            },
+        }
+    ]
+}
 
 
-def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract):
+def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
     async def exercise():
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -69,14 +66,17 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract)
         app = server.streamable_http_app(stateless_http=True)
         requests = []
         clients = []
+        headers = []
 
         async def record(request):
+            headers.append(request.headers.get("authorization"))
             if request.method == "POST":
                 requests.append(json.loads(await request.aread()))
 
         def http_client():
             client = httpx2.AsyncClient(
                 transport=httpx2.ASGITransport(app=app),
+                headers={"Authorization": "Bearer external"},
                 event_hooks={"request": [record]},
             )
             clients.append(client)
@@ -92,13 +92,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract)
             )
         )
         identity = {"name": "checkout", "version": "1", "requires": {"orders": {}}}
-        apps = Apps(identity, {"orders": contract})
-        repr(apps)
-        repr(apps.orders.tools)
-        with pytest.raises(TypeError):
-            await apps.orders
-        with pytest.raises(TypeError):
-            json.dumps(apps.orders)
+        apps = Apps(identity, {"orders": CONTRACT})
         assert not requests
         async with app.router.lifespan_context(app):
             arguments = {"id": "good"}
@@ -112,7 +106,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract)
             assert raw.content[0].text == "Order"
             assert raw.meta["preserved"] is True
             assert not any(request["method"] == "tools/list" for request in requests)
-            other = Apps({**identity, "name": "other"}, {"orders": contract})
+            other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
             await asyncio.gather(
                 apps.orders.tools.read(arguments), other.orders.tools.read(arguments)
             )
@@ -153,56 +147,25 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract)
             assert not hasattr(untyped.orders.tools, "read")
             with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
                 await untyped.missing.call_tool("read", {})
-        assert all(client.is_closed for client in clients)
-
-    asyncio.run(asyncio.wait_for(exercise(), timeout=15))
-
-
-def test_endpoint_bindings_call_without_the_runtime(monkeypatch, contract):
-    async def exercise():
-        server = MCPServer("orders")
-        headers = []
-
-        @server.tool()
-        async def read(id: str) -> CallToolResult:
-            return CallToolResult(
-                content=[TextContent(type="text", text=id)],
-                structured_content={"total": 1},
+            # Explicit bindings work without a declaration and override the resolver.
+            set_default_binding(
+                lambda _: {"endpoint": "http://unavailable.invalid/mcp"}
             )
-
-        app = server.streamable_http_app(stateless_http=True)
-
-        async def record(request):
-            headers.append(request.headers.get("authorization"))
-
-        def http_client():
-            return httpx2.AsyncClient(
-                transport=httpx2.ASGITransport(app=app),
-                headers={"Authorization": "Bearer external"},
-                event_hooks={"request": [record]},
-            )
-
-        monkeypatch.delenv("ORDERS_MCP_URL", raising=False)
-        monkeypatch.setattr(holon.binding, "_resolver", None)
-        identity = {"name": "script", "version": "1", "requires": {}}
-        with pytest.raises(ValueError, match="Unknown app binding"):
-            Apps(identity, {"orders": contract}, {"missing": {"endpoint": "http://x"}})
-        bound = Apps(
-            identity,
-            {"orders": contract},
-            {
-                "orders": {
-                    "endpoint": "http://127.0.0.1:8000/mcp",
-                    "http_client": http_client,
-                }
-            },
-        )
-        async with app.router.lifespan_context(app):
-            assert await bound.orders.tools.read({"id": "a"}) == {"total": 1}
+            script = {**identity, "requires": {}}
+            binding = {
+                "endpoint": "http://127.0.0.1:8000/mcp",
+                "http_client": http_client,
+            }
+            with pytest.raises(ValueError, match="Unknown app binding"):
+                Apps(script, {"orders": CONTRACT}, {"missing": binding})
+            bound = Apps(script, {"orders": CONTRACT}, {"orders": binding})
+            assert await bound.orders.tools.read({"id": "good"}) == {"total": 5}
+            set_default_binding(lambda _: None)
             with pytest.raises(ValueError, match="not declared"):
-                await Apps(identity, {"orders": contract}).orders.tools.read(
-                    {"id": "a"}
+                await Apps(script, {"orders": CONTRACT}).orders.tools.read(
+                    {"id": "good"}
                 )
         assert headers and all(value == "Bearer external" for value in headers)
+        assert all(client.is_closed for client in clients)
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=15))

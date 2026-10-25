@@ -62,11 +62,11 @@ its own tooling; this distribution ships only the runtime.
 
 ## Dev releases
 
-`.github/workflows/publish-dev.yml` publishes `holon-sh==0.1.0.dev<run number>`
+`.github/workflows/publish-dev.yml` publishes `holon-sh==0.0.1.dev<run number>`
 to PyPI. It runs only when dispatched by hand, rewrites the version in
 `pyproject.toml` inside the job without committing it, runs the test suite and
 build, and prints the exact install line in the job summary. `main` stays at
-`0.1.0`.
+`0.0.1`.
 
 One-time setup on pypi.org: add a pending (trusted) publisher for the project
 `holon-sh` with owner `holon-sh`, repository `sdk-py`, workflow
@@ -79,4 +79,4 @@ gh workflow run publish-dev.yml
 ```
 
 Consumers install a dev build with `pip install --pre holon-sh` or the exact
-version printed in the job summary, e.g. `uv add 'holon-sh==0.1.0.dev12'`.
+version printed in the job summary, e.g. `uv add 'holon-sh==0.0.1.dev12'`.

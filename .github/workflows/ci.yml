@@ -12,11 +12,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-      - name: Fetch the mcptype binding
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download v0.0.6 --repo hughhan1/mcptype --pattern '*manylinux*x86_64.whl' --dir "$RUNNER_TEMP/mcptype"
-      - run: uv sync --find-links "$RUNNER_TEMP/mcptype"
+      - run: uv sync
       - run: uv run --no-sync pytest
       - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding -p holon.view
       - run: uv build

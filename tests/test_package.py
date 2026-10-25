@@ -1,47 +1,18 @@
 """Consumer contracts at the generated namespace boundary."""
 
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
-from mcptype.compiler import generate
+# tests/fixtures/caller is produced by scripts/fixtures.sh with `holon types compile`
+# from caller.request.json (the same compiler the CLI uses to fill holon/apps/).
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path):
-    identity = {"name": "caller", "version": "1"}
-    contract = {
-        "tools": [
-            {
-                "name": "read",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"id": {"type": "string"}},
-                    "required": ["id"],
-                    "additionalProperties": False,
-                },
-                "outputSchema": {
-                    "type": "object",
-                    "properties": {"total": {"type": "number"}},
-                    "required": ["total"],
-                },
-            }
-        ]
-    }
-    result = generate(
-        {
-            "target": "python",
-            "identity": identity,
-            "requires": {"orders": {"name": "orders", "version": "1"}},
-            "contracts": {"orders": contract},
-            "python_module": "holon/apps/__init__.py",
-            "python_runtime_module": "holon.client",
-            "banner": "holon-generated-apps-v1 app=caller",
-        }
-    )
-    for name, content in result["files"].items():
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+    shutil.copytree(FIXTURES / "caller", tmp_path, dirs_exist_ok=True)
     (tmp_path / "check.py").write_text("""from pathlib import Path
 import holon
 import holon.client

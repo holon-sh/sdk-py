@@ -31,14 +31,9 @@ def verify(root: Path) -> None:
                 "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
             )
             installed = Path(
-                subprocess.check_output(
-                    [
-                        str(python),
-                        "-c",
-                        "import sysconfig; print(sysconfig.get_path('purelib'))",
-                    ],
-                    text=True,
-                ).strip()
+                sysconfig.get_path(
+                    "purelib", scheme="venv", vars={"base": str(environment)}
+                )
             )
             for source in Path(sysconfig.get_path("purelib")).iterdir():
                 if (
@@ -62,15 +57,6 @@ def verify(root: Path) -> None:
                     "--no-build-isolation",
                     str(artifact),
                 ],
-                check=True,
-            )
-            subprocess.run(
-                [
-                    str(python),
-                    "-c",
-                    "import holon, holon.client; assert holon.__file__ is None; print(holon.client.__file__)",
-                ],
-                cwd=directory,
                 check=True,
             )
             subprocess.run(

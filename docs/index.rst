@@ -17,23 +17,19 @@ their separately pinned platform runtime.
 Generated clients
 -----------------
 
-``holon.apps`` is generated for the consuming project; it is not a module shipped
-in the SDK wheel. Generation supplies ``apps``, ``create_apps``, and the project's
-input/output types. This reference describes those conventions without publishing
-application-specific tool catalogs.
+Client generation writes ``holon.apps`` for your project, supplying ``apps``,
+``create_apps``, and its input/output types.
 
-The generator is a separate executable: installing ``holon-sh`` does not install
-it. Install the standalone ``holon-cli`` wheel as a development dependency, then
-run these commands from the directory containing your project manifest:
+Install the ``holon-cli`` wheel as a development dependency, then run from the
+directory containing your project manifest:
 
 .. code-block:: sh
 
    uv run holon types generate --no-install
    uv run holon check --no-published
 
-``holon types`` alone shows help. The CLI packages are currently a development
-preview requiring a local wheel or binary; the guide below explains how to obtain
-one, install it with uv, declare dependencies, and find the generated files.
+The CLI is a development preview distributed as a local wheel or binary.
+The generation guide covers setup, dependencies, and generated files.
 
 See the `client generation guide <https://holon-labs.dev/docs/#generate-clients>`_
 and `bindings guide <https://holon-labs.dev/docs/#bind-sdk-clients>`_.

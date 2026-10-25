@@ -55,7 +55,7 @@ _result = TypeAdapter(CallToolResult | InputRequiredResult)
 
 
 class ToolCallError(RuntimeError):
-    """Raised by a ``tools.<name>`` convenience call that cannot return output.
+    """Raised by ``tools.<name>`` for tool errors or additional input requests.
 
     Attributes:
         app: Dependency name.
@@ -136,11 +136,10 @@ class _App:
 
         Raises:
             ValueError: Unknown tool, invalid input/output, or undeclared dependency.
-            RuntimeError: No endpoint can be resolved.
+            RuntimeError: Endpoint resolution failed.
 
         Transport and protocol exceptions propagate. Each call closes its HTTP
-        client and MCP session, including when an exception occurs. Python
-        clients therefore have no separate ``close`` operation.
+        client and MCP session, including when an exception occurs.
         """
         definition = None
         if self._definitions is not None:
@@ -227,13 +226,12 @@ class _Tools:
 class Apps:
     """Create the dependency collection used by generated Python clients.
 
-    Most applications use ``apps`` or ``create_apps`` from the generated
-    ``holon.apps`` module instead of constructing this runtime class directly.
+    Applications typically use ``apps`` or ``create_apps`` from ``holon.apps``.
 
     Args:
         identity: Application name, version, and declared ``requires`` mapping.
         contracts: Dependency contracts with a ``tools`` list, or ``None`` for
-            dependencies whose tools are not known at generation time.
+            untyped dependencies.
         bindings: Explicit bindings. When supplied, only these dependencies are
             included; an empty mapping selects none. Otherwise all declared
             dependencies and contracts are available.

@@ -14,5 +14,4 @@ its Sphinx page. The build fails on missing public symbols and unresolved links.
 
 `docs/_build/bundle/` contains Markdown page content and a symbol index in
 `reference.json`, plus checksums and source provenance in `manifest.json`.
-CI uploads this as `sdk-reference-python`. The website imports and renders it;
-there is no separate Sphinx website. Generated application catalogs are excluded.
+CI uploads `sdk-reference-python` for the website to import and render.

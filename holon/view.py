@@ -28,7 +28,7 @@ def app_view(
         Successful reads are cached for the lifetime of this resource instance.
 
     Raises:
-        OSError: On a resource read if the HTML file cannot be read.
+        OSError: Reading the HTML file failed.
 
     Example:
         ``resource = app_view("ui://app/index.html", "App", "dist/index.html")``

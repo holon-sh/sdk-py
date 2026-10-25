@@ -28,10 +28,7 @@ _resolver: Callable[[str], Binding | None] | None = None
 
 
 def set_default_binding(resolve: Callable[[str], Binding | None]) -> None:
-    """Resolve bindings for app clients that were not bound with ``create_apps``.
-
-    Without a resolver, or when it returns ``None``, a client falls back to its
-    ``<NAME>_MCP_URL`` environment variable.
+    """Register the default binding resolver for app clients.
 
     Args:
         resolve: Process-wide callback receiving the dependency name. Return a
@@ -43,7 +40,7 @@ def set_default_binding(resolve: Callable[[str], Binding | None]) -> None:
 
 
 def resolve_default_binding(app: str) -> Binding | None:
-    """Ask the registered resolver for a binding, without environment fallback.
+    """Return the registered resolver's binding for an app.
 
     Args:
         app: Dependency name passed unchanged to the resolver.

@@ -1,4 +1,4 @@
-"""Test each built distribution in an isolated uv environment using cached packages."""
+"""Install and test each built distribution in an isolated uv environment."""
 
 import subprocess
 import sys
@@ -19,7 +19,6 @@ for artifact in artifacts:
             "--isolated",
             "--no-project",
             "--no-config",
-            "--offline",
             "--python",
             sys.executable,
             "--with",

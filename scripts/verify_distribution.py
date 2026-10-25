@@ -65,8 +65,6 @@ def verify(root: Path) -> None:
                     "-m",
                     "pytest",
                     str(root / "tests/test_package.py"),
-                    "-k",
-                    "generated_namespace",
                 ],
                 cwd=directory,
                 check=True,

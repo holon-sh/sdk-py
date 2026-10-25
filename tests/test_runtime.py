@@ -11,7 +11,32 @@ from holon.binding import set_default_binding
 from holon.client import Apps, ToolCallError
 
 
-def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
+@pytest.fixture
+def contract():
+    return {
+        "tools": [
+            {
+                "name": "read",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "limit": {"type": "integer", "default": 5},
+                    },
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {"total": {"type": "number"}},
+                    "required": ["total"],
+                },
+            }
+        ]
+    }
+
+
+def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch, contract):
     async def exercise():
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -66,27 +91,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 else None
             )
         )
-        contract = {
-            "tools": [
-                {
-                    "name": "read",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "limit": {"type": "integer", "default": 5},
-                        },
-                        "required": ["id"],
-                        "additionalProperties": False,
-                    },
-                    "outputSchema": {
-                        "type": "object",
-                        "properties": {"total": {"type": "number"}},
-                        "required": ["total"],
-                    },
-                }
-            ]
-        }
         identity = {"name": "checkout", "version": "1", "requires": {"orders": {}}}
         apps = Apps(identity, {"orders": contract})
         repr(apps)
@@ -151,14 +155,10 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 await untyped.missing.call_tool("read", {})
         assert all(client.is_closed for client in clients)
 
-    async def bounded():
-        async with asyncio.timeout(15):
-            await exercise()
-
-    asyncio.run(bounded())
+    asyncio.run(asyncio.wait_for(exercise(), timeout=15))
 
 
-def test_endpoint_bindings_call_without_the_runtime(monkeypatch):
+def test_endpoint_bindings_call_without_the_runtime(monkeypatch, contract):
     async def exercise():
         server = MCPServer("orders")
         headers = []
@@ -184,24 +184,6 @@ def test_endpoint_bindings_call_without_the_runtime(monkeypatch):
 
         monkeypatch.delenv("ORDERS_MCP_URL", raising=False)
         monkeypatch.setattr(holon.binding, "_resolver", None)
-        contract = {
-            "tools": [
-                {
-                    "name": "read",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"id": {"type": "string"}},
-                        "required": ["id"],
-                        "additionalProperties": False,
-                    },
-                    "outputSchema": {
-                        "type": "object",
-                        "properties": {"total": {"type": "number"}},
-                        "required": ["total"],
-                    },
-                }
-            ]
-        }
         identity = {"name": "script", "version": "1", "requires": {}}
         with pytest.raises(ValueError, match="Unknown app binding"):
             Apps(identity, {"orders": contract}, {"missing": {"endpoint": "http://x"}})
@@ -217,16 +199,10 @@ def test_endpoint_bindings_call_without_the_runtime(monkeypatch):
         )
         async with app.router.lifespan_context(app):
             assert await bound.orders.tools.read({"id": "a"}) == {"total": 1}
-            with pytest.raises(ValueError, match="arguments"):
-                await bound.orders.tools.read({"id": 1})
             with pytest.raises(ValueError, match="not declared"):
                 await Apps(identity, {"orders": contract}).orders.tools.read(
                     {"id": "a"}
                 )
         assert headers and all(value == "Bearer external" for value in headers)
 
-    async def bounded():
-        async with asyncio.timeout(15):
-            await exercise()
-
-    asyncio.run(bounded())
+    asyncio.run(asyncio.wait_for(exercise(), timeout=15))

@@ -22,6 +22,7 @@ def app_view(
     built: list[str] = []
 
     def read() -> str:
+        # Concurrent first reads must all return the first cached build.
         if not built:
             built.append(page.read_text())
         return built[0]

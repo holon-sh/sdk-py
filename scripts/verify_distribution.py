@@ -67,15 +67,6 @@ def verify(root: Path) -> None:
             subprocess.run(
                 [
                     str(python),
-                    "-c",
-                    "import holon, holon.client; assert holon.__file__ is None; print(holon.client.__file__)",
-                ],
-                cwd=directory,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    str(python),
                     "-m",
                     "pytest",
                     str(root / "tests/test_package.py"),

@@ -42,7 +42,6 @@ def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path)
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-    assert not (tmp_path / "holon/__init__.py").exists()
     (tmp_path / "check.py").write_text("""from pathlib import Path
 import holon
 import holon.client

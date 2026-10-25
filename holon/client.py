@@ -30,6 +30,8 @@ Output = TypeVar("Output")
 
 
 class CompleteResult(Protocol, Generic[Output]):
+    """Successful tool result with contract-typed structured content."""
+
     result_type: Literal["complete"]
     is_error: Literal[False]
     structured_content: Output
@@ -38,6 +40,8 @@ class CompleteResult(Protocol, Generic[Output]):
 
 
 class ErrorResult(Protocol):
+    """Completed tool result reporting an application error."""
+
     result_type: Literal["complete"]
     is_error: Literal[True]
     structured_content: object
@@ -51,6 +55,16 @@ _result = TypeAdapter(CallToolResult | InputRequiredResult)
 
 
 class ToolCallError(RuntimeError):
+    """Raised by ``tools.<name>`` for tool errors or additional input requests.
+
+    Attributes:
+        app: Dependency name.
+        tool: Requested tool name.
+        result: Original MCP error or input-required result.
+        code: ``tool_error`` or ``input_required``. Use ``call_tool`` when you
+            need to inspect these results and submit additional input.
+    """
+
     def __init__(
         self, app: str, tool: str, result: CallToolResult | InputRequiredResult
     ) -> None:
@@ -106,6 +120,27 @@ class _App:
         request_state: str | None = None,
         meta: RequestParamsMeta | None = None,
     ) -> CallToolResult | InputRequiredResult:
+        """Call a dependency tool and return its full MCP result.
+
+        Args:
+            name: Tool name. Contracted dependencies reject unknown tools.
+            arguments: Tool arguments, validated against the contract if present.
+            timeout: Request read timeout in seconds, or the MCP client default.
+            input_responses: Responses to a previous input-required result.
+            request_state: Continuation state returned by the server.
+            meta: Optional MCP request metadata.
+
+        Returns:
+            A complete or input-required result. Tool error results are returned
+            unchanged; successful structured output is contract-validated.
+
+        Raises:
+            ValueError: Unknown tool, invalid input/output, or undeclared dependency.
+            RuntimeError: Endpoint resolution failed.
+
+        Transport and protocol exceptions propagate. Each call closes its HTTP
+        client and MCP session, including when an exception occurs.
+        """
         definition = None
         if self._definitions is not None:
             definition = self._definitions.get(name)
@@ -189,6 +224,27 @@ class _Tools:
 
 
 class Apps:
+    """Create the dependency collection used by generated Python clients.
+
+    Applications typically use ``apps`` or ``create_apps`` from ``holon.apps``.
+
+    Args:
+        identity: Application name, version, and declared ``requires`` mapping.
+        contracts: Dependency contracts with a ``tools`` list, or ``None`` for
+            untyped dependencies.
+        bindings: Explicit bindings. When supplied, only these dependencies are
+            included; an empty mapping selects none. Otherwise all declared
+            dependencies and contracts are available.
+
+    Raises:
+        ValueError: A binding names an unknown dependency.
+
+    Access a client with ``clients[name]`` or ``clients.name``. Its
+    ``tools.<name>(arguments, timeout=seconds)`` methods return structured output
+    and raise :class:`ToolCallError` for tool errors or additional input requests.
+    Use its ``call_tool`` method for the full result envelope.
+    """
+
     def __init__(
         self,
         identity: dict[str, Any],

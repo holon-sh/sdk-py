@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "holon-sh"
 version = "0.0.1"
 description = "Typed MCP clients, bindings, and app views"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"

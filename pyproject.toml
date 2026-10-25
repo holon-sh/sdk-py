@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["mcp>=2.3,<3", "jsonschema>=4.26,<5"]
+dependencies = ["mcp>=2.3,<3", "jsonschema>=4.26,<5", "httpx2>=2.10,<3"]
 
 [project.urls]
 Repository = "https://github.com/holon-sh/sdk-py"

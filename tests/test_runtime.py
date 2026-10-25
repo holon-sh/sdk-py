@@ -93,12 +93,13 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         )
         identity = {"name": "checkout", "version": "1", "requires": {"orders": {}}}
         apps = Apps(identity, {"orders": CONTRACT})
+        other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
         assert not requests
         async with app.router.lifespan_context(app):
             arguments = {"id": "good"}
             output, raw = await asyncio.gather(
                 apps.orders.tools.read(arguments),
-                apps.orders.call_tool("read", {"id": "good", "limit": 2}),
+                other.orders.call_tool("read", {"id": "good", "limit": 2}),
             )
             assert output == {"total": 5}
             assert arguments == {"id": "good"}
@@ -106,10 +107,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             assert raw.content[0].text == "Order"
             assert raw.meta["preserved"] is True
             assert not any(request["method"] == "tools/list" for request in requests)
-            other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
-            await asyncio.gather(
-                apps.orders.tools.read(arguments), other.orders.tools.read(arguments)
-            )
             callers = [
                 request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
                 for request in requests

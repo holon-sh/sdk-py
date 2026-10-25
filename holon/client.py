@@ -170,12 +170,10 @@ class _App:
             raise RuntimeError(
                 f"Dependency {self._name} is unavailable ({variable}). Set the endpoint or supply a binding."
             )
-        http = (
-            binding["http_client"]()
-            if binding and "http_client" in binding
-            else httpx2.AsyncClient(trust_env=False)
-        )
-        async with http:
+        http_client = partial(httpx2.AsyncClient, trust_env=False)
+        async with (
+            binding.get("http_client", http_client) if binding else http_client
+        )() as http:
             transport = streamable_http_client(endpoint, http_client=http)
             async with Client(
                 transport,

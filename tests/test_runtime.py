@@ -19,6 +19,8 @@ CONTRACT = {
                 "properties": {
                     "id": {"type": "string"},
                     "limit": {"type": "integer", "default": 5},
+                    "name": {"type": "string"},
+                    "timeout": {"type": "integer"},
                 },
                 "required": ["id"],
                 "additionalProperties": False,
@@ -40,7 +42,9 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         server = MCPServer("orders")
 
         @server.tool()
-        async def read(id: str, limit: int = 5) -> CallToolResult | InputRequiredResult:
+        async def read(
+            id: str, limit: int = 5, name: str = "", timeout: int = 0
+        ) -> CallToolResult | InputRequiredResult:
             if id == "error":
                 return CallToolResult(
                     is_error=True,
@@ -98,14 +102,37 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         async with app.router.lifespan_context(app):
             arguments = {"id": "good"}
             output, raw = await asyncio.gather(
-                apps.orders.tools.read(arguments),
-                other.orders.call_tool("read", {"id": "good", "limit": 2}),
+                apps.orders.tools.read(**arguments),
+                other.orders.call_tool(
+                    "read",
+                    {
+                        "timeout": 5,
+                        "meta": {"trace": "control"},
+                    },
+                    id="good",
+                    limit=2,
+                    name="field",
+                    timeout=7,
+                ),
             )
             assert output == {"total": 5}
             assert arguments == {"id": "good"}
             assert raw.structured_content == {"total": 2}
             assert raw.content[0].text == "Order"
             assert raw.meta["preserved"] is True
+            request = next(
+                request["params"]
+                for request in requests
+                if request["method"] == "tools/call"
+                and request["params"]["arguments"].get("name") == "field"
+            )
+            assert request["arguments"] == {
+                "id": "good",
+                "limit": 2,
+                "name": "field",
+                "timeout": 7,
+            }
+            assert request["_meta"]["trace"] == "control"
             assert not any(request["method"] == "tools/list" for request in requests)
             callers = [
                 request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
@@ -114,9 +141,9 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             ]
             assert set(callers) == {"checkout", "other"}
             for value, code in [("error", "tool_error"), ("input", "input_required")]:
-                raw = await apps.orders.call_tool("read", {"id": value})
+                raw = await apps.orders.call_tool("read", id=value)
                 with pytest.raises(ToolCallError) as error:
-                    await apps.orders.tools.read({"id": value})
+                    await apps.orders.tools.read(id=value)
                 assert error.value.code == code
                 assert error.value.app == "orders"
                 assert error.value.tool == "read"
@@ -124,26 +151,33 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 assert error.value.result.meta["preserved"] is True
                 if isinstance(raw, InputRequiredResult):
                     assert error.value.result.request_state
+                    await apps.orders.call_tool(
+                        "read",
+                        {"request_state": raw.request_state, "input_responses": {}},
+                        id=value,
+                    )
+                    assert requests[-1]["params"]["requestState"] == raw.request_state
+                    assert requests[-1]["params"]["inputResponses"] == {}
                 else:
                     assert error.value.result == raw
             before = len(requests)
             with pytest.raises(ValueError, match="arguments"):
-                await apps.orders.tools.read({"id": 1})
+                await apps.orders.tools.read(id=1)
             assert len(requests) == before
             with pytest.raises(ValueError, match="structured output"):
-                await apps.orders.tools.read({"id": "bad"})
-            task = asyncio.create_task(apps.orders.tools.read({"id": "slow"}))
+                await apps.orders.tools.read(id="bad")
+            task = asyncio.create_task(apps.orders.tools.read(id="slow"))
             await started.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             await cancelled.wait()
             untyped = Apps({**identity, "requires": {"orders": {}, "missing": {}}}, {})
-            raw = await untyped.orders.call_tool("read", {"id": "good"})
+            raw = await untyped.orders.call_tool("read", id="good")
             assert raw.structured_content == {"total": 5}
             assert not hasattr(untyped.orders.tools, "read")
             with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
-                await untyped.missing.call_tool("read", {})
+                await untyped.missing.call_tool("read")
             # Explicit bindings work without a declaration and override the resolver.
             set_default_binding(
                 lambda _: {"endpoint": "http://unavailable.invalid/mcp"}
@@ -156,12 +190,10 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             with pytest.raises(ValueError, match="Unknown app binding"):
                 Apps(script, {"orders": CONTRACT}, {"missing": binding})
             bound = Apps(script, {"orders": CONTRACT}, {"orders": binding})
-            assert await bound.orders.tools.read({"id": "good"}) == {"total": 5}
+            assert await bound.orders.tools.read(id="good") == {"total": 5}
             set_default_binding(lambda _: None)
             with pytest.raises(ValueError, match="not declared"):
-                await Apps(script, {"orders": CONTRACT}).orders.tools.read(
-                    {"id": "good"}
-                )
+                await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
         assert headers and all(value == "Bearer external" for value in headers)
         assert all(client.is_closed for client in clients)
 

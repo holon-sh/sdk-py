@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from functools import partial
 from types import SimpleNamespace
-from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
 import jsonschema  # type: ignore[import-untyped,unused-ignore]
@@ -26,7 +26,7 @@ from referencing import Registry
 from holon.binding import Binding, resolve_default_binding
 
 # Binding is re-exported for the generated holon.apps module.
-__all__ = ["Apps", "Binding", "ToolCallError", "ToolResult"]
+__all__ = ["Apps", "Binding", "CallOptions", "ToolCallError", "ToolResult"]
 
 Output = TypeVar("Output")
 
@@ -54,6 +54,15 @@ class ErrorResult(Protocol):
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
 
 _result = TypeAdapter(CallToolResult | InputRequiredResult)
+
+
+class CallOptions(TypedDict, total=False):
+    """Request controls, passed positionally to keep tool keywords available."""
+
+    timeout: float | None
+    input_responses: InputResponses | None
+    request_state: str | None
+    meta: RequestParamsMeta | None
 
 
 class ToolCallError(RuntimeError):
@@ -121,22 +130,17 @@ class _App:
     async def call_tool(
         self,
         name: str,
-        arguments: Mapping[str, object],
-        *,
-        timeout: float | None = None,
-        input_responses: InputResponses | None = None,
-        request_state: str | None = None,
-        meta: RequestParamsMeta | None = None,
+        options: CallOptions | None = None,
+        /,
+        **arguments: object,
     ) -> CallToolResult | InputRequiredResult:
         """Call a dependency tool and return its full MCP result.
 
         Args:
             name: Tool name. Contracted dependencies reject unknown tools.
-            arguments: Tool arguments, validated against the contract if present.
-            timeout: Request read timeout in seconds, or the MCP client default.
-            input_responses: Responses to a previous input-required result.
-            request_state: Continuation state returned by the server.
-            meta: Optional MCP request metadata.
+            options: Request timeout in seconds, input responses, continuation
+                state, and metadata. Passed positionally, separate from tool input.
+            **arguments: Tool input, validated against the contract if present.
 
         Returns:
             A complete or input-required result. Tool error results are returned
@@ -149,6 +153,7 @@ class _App:
         Transport and protocol exceptions propagate. Each call closes its HTTP
         client and MCP session, including when an exception occurs.
         """
+        options = options or {}
         definition = None
         if self._definitions is not None:
             definition = self._definitions.get(name)
@@ -186,14 +191,14 @@ class _App:
                     CallToolRequest(
                         params=CallToolRequestParams(
                             name=name,
-                            arguments=dict(arguments),
-                            input_responses=input_responses,
-                            request_state=request_state,
-                            _meta=meta,
+                            arguments=arguments,
+                            input_responses=options.get("input_responses"),
+                            request_state=options.get("request_state"),
+                            _meta=options.get("meta"),
                         )
                     ),
                     _result,
-                    request_read_timeout_seconds=timeout,
+                    request_read_timeout_seconds=options.get("timeout"),
                 )
         if (
             definition is not None
@@ -211,11 +216,11 @@ class _App:
     async def _call_tool(
         self,
         name: str,
-        arguments: Mapping[str, object],
-        *,
-        timeout: float | None = None,
+        options: CallOptions | None = None,
+        /,
+        **arguments: object,
     ) -> object:
-        result = await self.call_tool(name, arguments, timeout=timeout)
+        result = await self.call_tool(name, options, **arguments)
         if isinstance(result, InputRequiredResult) or result.is_error:
             raise ToolCallError(self._name, name, result)
         return result.structured_content
@@ -238,7 +243,7 @@ class Apps:
         ValueError: A binding names an unknown dependency.
 
     Access a client with ``clients[name]`` or ``clients.name``. Its
-    ``tools.<name>(arguments, timeout=seconds)`` methods return structured output
+    ``tools.<name>(**arguments)`` methods return structured output
     and raise :class:`ToolCallError` for tool errors or additional input requests.
     Use its ``call_tool`` method for the full result envelope.
     """

@@ -95,21 +95,6 @@ apps = create_apps({
 
 Every call opens and closes its own session; there is nothing to close. `holon.binding.set_default_binding` exists for hosts that bind every app at startup; apps do not need it.
 
-## Serve an MCP App view
-
-`holon.view.app_view` registers a built HTML file as an MCP App resource:
-
-```python
-from holon.view import app_view
-
-server.add_resource(app_view(
-    "ui://checkout/index.html", "Checkout", "dist/index.html",
-    connect_domains=["https://orders.example.com"],
-))
-```
-
-The file is read on first request and cached. `connect_domains` and `resource_domains` become the view's content security policy. The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
-
 ## Development
 
 The package test uses committed clients in `tests/fixtures/caller/holon/apps`.

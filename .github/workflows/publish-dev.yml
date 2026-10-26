@@ -34,7 +34,7 @@ jobs:
           python-version: "3.11"
       - run: uv sync
       - run: uv run --no-sync pytest
-      - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding -p holon.view
+      - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding
       - name: Set the dev version (not committed)
         run: |
           uv version --frozen "$VERSION"

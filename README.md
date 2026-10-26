@@ -11,10 +11,10 @@ This repository contains the Python runtime for [`holon`](https://github.com/hol
 
 ```sh
 uv add --prerelease allow holon-sh
-uv add --dev holon-types mypy==2.4.0
+uv add --dev holon-types
 ```
 
-`holon-types` is the `holon` CLI. `holon types check` runs mypy from the project's environment, so mypy is a dev dependency too.
+`holon-types` is the `holon` CLI; it brings mypy, which `holon types check` runs from the project's environment.
 
 ## Invoking MCP Servers
 

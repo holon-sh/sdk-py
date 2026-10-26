@@ -30,11 +30,9 @@ assert Path(holon.client.__file__).parent != Path(__file__).parent / "holon"
 """)
     # Runtime and typing must agree across the two namespace portions. No
     # MYPYPATH/PYTHONPATH override is allowed to hide packaging problems.
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"MYPYPATH", "PYTHONPATH"}
-    }
+    env = os.environ.copy()
+    env.pop("MYPYPATH", None)
+    env.pop("PYTHONPATH", None)
     for command in [
         [sys.executable, "-m", "mypy", "--strict", "--no-incremental", "check.py"],
         [sys.executable, "check.py"],

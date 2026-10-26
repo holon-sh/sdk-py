@@ -26,7 +26,6 @@ Generate `holon/apps/__init__.py` from the project's dependencies and type-check
 uv run holon types check
 ```
 
-
 ```python
 from holon.apps import Inputs, Outputs, apps, create_apps
 ```

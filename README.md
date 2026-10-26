@@ -20,22 +20,11 @@ uv add --dev holon-types
 
 The Holon Python SDK allows generation of type-safe MCP clients. See [Example](https://github.com/holon-sh/cli#example) for an explanation, or [Dependencies](https://github.com/holon-sh/cli#dependencies) to understand dependency resolution.
 
-Generate `holon/apps/__init__.py` from the project's dependencies and type-check the calls to it:
+### Type-checking MCP invocations
 
 ```sh
 uv run holon types check
 ```
-
-```python
-from holon.apps import Inputs, Outputs, apps, create_apps
-```
-
-| Name | What it is |
-|---|---|
-| `apps` | One client per dependency (`apps.bar`), bound through `<ALIAS>_MCP_URL`. |
-| `create_apps(bindings)` | Clients bound explicitly, for only the dependencies you pass. |
-| `Inputs.<dep>.<tool>` | The tool's argument type, a `TypedDict`. |
-| `Outputs.<dep>.<tool>` | The tool's structured result type, a `TypedDict`. |
 
 <details open>
 <summary><h3>Call a tool</h3></summary>
@@ -48,14 +37,12 @@ async def greet(name: str) -> str:
     return greeting["result"]
 ```
 
-Arguments are keywords, validated before sending; the result is validated against the output schema and returned. Request options are a positional dict; `timeout` is in seconds.
+Arguments are keywords, validated before sending; the result is validated against the output schema and returned.
 
 </details>
 
 <details open>
 <summary><h3>Handle errors</h3></summary>
-
-`tools.<tool>` raises `ToolCallError` when the tool reports an error or asks for more input:
 
 ```python
 from holon.client import ToolCallError
@@ -66,8 +53,6 @@ except ToolCallError as error:
     error.code     # "tool_error" or "input_required"
     error.result   # the original MCP result
 ```
-
-Invalid arguments or a result that does not match the schema raise `ValueError`; transport failures propagate from the MCP client.
 
 </details>
 
@@ -86,38 +71,11 @@ else:
     result.structured_content    # typed as Outputs.bar.greet
 ```
 
-The options dict also accepts `input_responses`, `request_state` and `meta`. A dependency the CLI could not obtain a contract for offers only `call_tool`, untyped.
+The options dict also accepts `input_responses`, `request_state` and `meta`.
 
 </details>
 
-## Bind a dependency
-
-By default a client reads its endpoint from an environment variable named after the dependency, upper-cased, with `-` as `_`:
-
-```sh
-BAR_MCP_URL=http://127.0.0.1:3001/mcp uv run python server.py
-```
-
-For authentication or a custom HTTP client, bind explicitly. `http_client` is a factory called once per call; the client it returns is closed afterwards:
-
-```python
-import os
-import httpx2
-from holon.apps import create_apps
-
-apps = create_apps({
-    "bar": {
-        "endpoint": "https://bar.example.com/mcp",
-        "http_client": lambda: httpx2.AsyncClient(
-            headers={"Authorization": f"Bearer {os.environ['BAR_TOKEN']}"},
-        ),
-    },
-})
-```
-
-Every call opens and closes its own session; there is nothing to close. `holon.binding.set_default_binding` exists for hosts that bind every app at startup; apps do not need it.
-
-## Serve an MCP App view
+## Serve an [MCP App](https://modelcontextprotocol.io/extensions/apps/overview) view
 
 `holon.view.app_view` registers a built HTML file as an MCP App resource:
 
@@ -130,4 +88,4 @@ server.add_resource(app_view(
 ))
 ```
 
-The file is read on first request and cached. `connect_domains` and `resource_domains` become the view's content security policy. The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
+The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).

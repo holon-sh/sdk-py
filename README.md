@@ -32,11 +32,11 @@ from holon.apps import Inputs, Outputs, apps, create_apps
 from holon.apps import apps
 
 async def total(id: str) -> float:
-    order = await apps.orders.tools.lookup({"id": id}, timeout=5.0)
+    order = await apps.orders.tools.lookup({"timeout": 5.0}, id=id)
     return order["total"]
 ```
 
-Arguments are one mapping, validated before sending; the result is validated against the output schema and returned. `timeout` is in seconds.
+Arguments are keywords, validated before sending; the result is validated against the output schema and returned. Request options are a positional dict; `timeout` is in seconds.
 
 ### Handle errors
 
@@ -46,7 +46,7 @@ Arguments are one mapping, validated before sending; the result is validated aga
 from holon.client import ToolCallError
 
 try:
-    order = await apps.orders.tools.lookup({"id": id})
+    order = await apps.orders.tools.lookup(id=id)
 except ToolCallError as error:
     error.code     # "tool_error" or "input_required"
     error.result   # the original MCP result
@@ -59,14 +59,14 @@ Invalid arguments or a result that does not match the schema raise `ValueError`;
 `call_tool` returns the full MCP result instead of raising:
 
 ```python
-result = await apps.orders.call_tool("lookup", {"id": id})
+result = await apps.orders.call_tool("lookup", id=id)
 if result.is_error:
     ...                          # inspect result.content
 else:
     result.structured_content    # typed as Outputs.orders.lookup
 ```
 
-It also accepts `input_responses`, `request_state` and `meta`. A dependency the CLI could not obtain a contract for offers only `call_tool`, untyped.
+The options dict also accepts `input_responses`, `request_state` and `meta`. A dependency the CLI could not obtain a contract for offers only `call_tool`, untyped.
 
 ## Bind a dependency
 
@@ -119,7 +119,7 @@ To refresh them, install the [holon CLI](https://github.com/holon-sh/cli) and ru
 ./scripts/fixtures.sh
 ```
 
-This runs `holon types generate ../orders` from the caller fixture. The CLI
+This runs `holon types generate -s ../orders` from the caller fixture. The CLI
 extracts `tests/fixtures/orders/server.py` without starting the server.
 
 ## License

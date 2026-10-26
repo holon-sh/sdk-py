@@ -11,20 +11,21 @@ This repository contains the Python runtime for [`holon`](https://github.com/hol
 
 ```sh
 uv add --prerelease allow holon-sh
-uv add --dev mypy==2.4.0
+uv add --dev holon-types mypy==2.4.0
 ```
 
-Then install the CLI, which generates the `holon.apps` module the examples import:
+`holon-types` is the `holon` CLI. `holon types check` runs mypy from the project's environment, so mypy is a dev dependency too.
 
-```sh
-curl -fsSL https://holon-labs.dev/install.sh | sh
-```
-
-## Type Safety
+## Invoking MCP Servers
 
 The Holon Python SDK allows generation of type-safe MCP clients. See [Example](https://github.com/holon-sh/cli#example) for an explanation, or [Dependencies](https://github.com/holon-sh/cli#dependencies) to understand dependency resolution.
 
-## The generated module
+Generate `holon/apps/__init__.py` from the project's dependencies and type-check the calls to it:
+
+```sh
+uv run holon types check
+```
+
 
 ```python
 from holon.apps import Inputs, Outputs, apps, create_apps

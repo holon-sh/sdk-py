@@ -1,0 +1,5 @@
+{
+  "name": "fixtures/caller",
+  "version": "1",
+  "description": "Consumer of the orders package fixture."
+}

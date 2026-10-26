@@ -47,7 +47,7 @@ class _Clients(_typing.Protocol):
     def __getitem__(self, name: _typing.Literal["orders"]) -> _App0: ...
 
 
-_identity, _contracts = _json.loads('[{"name":"caller","requires":{"orders":{"name":"orders","version":"1"}},"version":"1"},{"orders":{"tools":[{"name":"read","inputSchema":{"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},"outputSchema":{"properties":{"total":{"type":"number"}},"required":["total"],"type":"object"}}]}}]')
+_identity, _contracts = _json.loads('[{"name":"fixtures/caller","requires":{"orders":{"name":"fixtures/orders","version":"1"}},"version":"1"},{"orders":{"tools":[{"name":"read","inputSchema":{"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},"outputSchema":{"properties":{"total":{"type":"number"}},"required":["total"],"type":"object"}}]}}]')
 
 apps = _typing.cast(_Clients, _Apps(_identity, _contracts))
 

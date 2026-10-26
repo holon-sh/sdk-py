@@ -11,12 +11,6 @@ uv add --prerelease allow holon-sh
 uv add --dev mypy==2.4.0     # holon types check runs mypy from the app's .venv
 ```
 
-The `holon` CLI itself is a Go binary; if you would rather not install Go, it is also on PyPI as `holon-types`:
-
-```sh
-uv tool install --prerelease allow holon-types
-```
-
 The distribution is `holon-sh`; the import package is `holon`, a namespace package shared with your generated module. Do not create `holon/__init__.py` in your app, and do not edit `holon/apps/__init__.py`: the CLI rewrites it on every run.
 
 ## The generated module
@@ -115,6 +109,18 @@ server.add_resource(app_view(
 ```
 
 The file is read on first request and cached. `connect_domains` and `resource_domains` become the view's content security policy. The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
+
+## Development
+
+The package test uses committed clients in `tests/fixtures/caller/holon/apps`.
+To refresh them, install the [holon CLI](https://github.com/holon-sh/cli) and run:
+
+```sh
+./scripts/fixtures.sh
+```
+
+This runs `holon types generate ../orders` from the caller fixture. The CLI
+extracts `tests/fixtures/orders/server.py` without starting the server.
 
 ## License
 

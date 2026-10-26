@@ -131,17 +131,3 @@ server.add_resource(app_view(
 ```
 
 The file is read on first request and cached. `connect_domains` and `resource_domains` become the view's content security policy. The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
-
-## Development
-
-The package test uses committed clients in `tests/fixtures/caller/holon/apps`. To refresh them, install the [holon CLI](https://github.com/holon-sh/cli) and run:
-
-```sh
-./scripts/fixtures.sh
-```
-
-This runs `holon types generate -s ../orders` from the caller fixture. The CLI reads `tests/fixtures/orders/server.py` without starting the server.
-
-## License
-
-MIT

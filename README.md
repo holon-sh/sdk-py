@@ -36,16 +36,7 @@ async def total(id: str) -> float:
     return order["total"]
 ```
 
-Pass tool arguments as keywords, or unpack an existing mapping with `**arguments`. Inputs and structured results are validated against the tool’s JSON Schema. Optional request controls are a separate positional `CallOptions` dict; `timeout` is in seconds. This keeps tool fields such as `name`, `options`, and `timeout` available as keywords.
-
-```python
-await apps.orders.call_tool("lookup", id=id)
-await apps.orders.tools.lookup(**{"id": id})
-```
-
-For tool names that are not Python identifiers, use `call_tool("lookup-order", id=id)`. Non-identifier field names work through `**{"order-id": id}`. Generated types use app and tool names, such as `OrdersApp` and `OrdersLookupInput`, so type-checker errors identify the client.
-
-Existing calls must move tool arguments from the positional dict to keywords (or `**arguments`) and request controls into the positional options dict.
+Arguments are keywords, validated before sending; the result is validated against the output schema and returned. Request options are a positional dict; `timeout` is in seconds.
 
 ### Handle errors
 
@@ -75,7 +66,7 @@ else:
     result.structured_content    # typed as Outputs.orders.lookup
 ```
 
-Its options dict also accepts `input_responses`, `request_state` and `meta`, for example `call_tool("lookup", {"request_state": state}, id=id)`. A dependency the CLI could not obtain a contract for offers only `call_tool`, untyped.
+The options dict also accepts `input_responses`, `request_state` and `meta`. A dependency the CLI could not obtain a contract for offers only `call_tool`, untyped.
 
 ## Bind a dependency
 

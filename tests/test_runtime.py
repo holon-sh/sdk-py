@@ -100,9 +100,8 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
         assert not requests
         async with app.router.lifespan_context(app):
-            arguments = {"id": "good"}
             output, raw = await asyncio.gather(
-                apps.orders.tools.read(**arguments),
+                apps.orders.tools.read(id="good"),
                 other.orders.call_tool(
                     "read",
                     {
@@ -116,7 +115,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 ),
             )
             assert output == {"total": 5}
-            assert arguments == {"id": "good"}
             assert raw.structured_content == {"total": 2}
             assert raw.content[0].text == "Order"
             assert raw.meta["preserved"] is True

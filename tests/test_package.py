@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path):
-    # Pinned output of `holon types compile`; generation is tested in holon-sh/cli.
+    # Refresh with scripts/fixtures.sh; generation is tested in holon-sh/cli.
     shutil.copytree(Path(__file__).parent / "fixtures/caller", tmp_path, dirs_exist_ok=True)
     (tmp_path / "check.py").write_text("""from pathlib import Path
 import holon

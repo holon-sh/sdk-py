@@ -89,3 +89,42 @@ server.add_resource(app_view(
 ```
 
 The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
+
+## Function apps
+
+`holon.app.App` extends the native `MCPServer`; its decorators keep the SDK's
+signature inference, validation, contexts, and middleware.
+
+```python
+from pathlib import Path
+from holon.app import App
+from mcp.types import ToolAnnotations
+
+server = App("counter", version="1.0.0", views=Path("dist/views.json"))
+count = 0
+
+@server.resource("counter://state", mime_type="application/json")
+def state() -> dict[str, int]:
+    return {"count": count}
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=True))
+def show() -> dict[str, int]:
+    return state()
+
+@server.tool(changes=["counter://state"])
+def add(amount: int) -> dict[str, int]:
+    global count
+    count += amount
+    return state()
+```
+
+`changes` publishes resource updates after a successful call. A notification failure
+is logged without changing an already committed result. It is not an authorization
+or transaction boundary. Native `Context` parameters remain available, and other
+writers can publish through the same public subscription bus.
+
+Run `holon types generate` to generate browser references from Python annotations.
+The same `holon-ui/react` presentation and `holon-ui/build` command work with Python
+and TypeScript servers. The build writes static HTML and `views.json`; passing that
+manifest registers native MCP App resources and tool metadata. Omit `views` for a
+server without a presentation. No application modules run during extraction.

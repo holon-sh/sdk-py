@@ -100,7 +100,8 @@ from pathlib import Path
 from holon.app import App
 from mcp.types import ToolAnnotations
 
-server = App("example.com/counter", version="1.0.0", views=Path("dist/views.json"))
+server = App("example.com/counter", version="1.0.0",
+             description="A shared counter", views=Path("dist/views.json"))
 count = 0
 
 @server.resource("counter://state", mime_type="application/json")

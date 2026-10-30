@@ -26,7 +26,14 @@ from referencing import Registry
 from holon.binding import Binding, resolve_default_binding
 
 # Binding is re-exported for the generated holon.apps module.
-__all__ = ["Apps", "Binding", "CallOptions", "ToolCallError", "ToolResult"]
+__all__ = [
+    "Apps",
+    "Binding",
+    "CallOptions",
+    "CompleteResult",
+    "ToolCallError",
+    "ToolResult",
+]
 
 Output = TypeVar("Output")
 
@@ -121,8 +128,8 @@ class _App:
         )
         self.tools = SimpleNamespace(
             **{
-                name: partial(self._call_tool, name)
-                for name in self._definitions or ()
+                name: partial(self._call_tool, tool)
+                for name, tool in (self._definitions or {}).items()
                 if not name.startswith("_")
             }
         )
@@ -215,15 +222,15 @@ class _App:
 
     async def _call_tool(
         self,
-        name: str,
+        tool: dict[str, Any],
         options: CallOptions | None = None,
         /,
         **arguments: object,
     ) -> object:
-        result = await self.call_tool(name, options, **arguments)
+        result = await self.call_tool(tool["name"], options, **arguments)
         if isinstance(result, InputRequiredResult) or result.is_error:
-            raise ToolCallError(self._name, name, result)
-        return result.structured_content
+            raise ToolCallError(self._name, tool["name"], result)
+        return result.structured_content if "outputSchema" in tool else result
 
 
 class Apps:
@@ -243,8 +250,9 @@ class Apps:
         ValueError: A binding names an unknown dependency.
 
     Access a client with ``clients[name]`` or ``clients.name``. Its
-    ``tools.<name>(**arguments)`` methods return structured output
-    and raise :class:`ToolCallError` for tool errors or additional input requests.
+    ``tools.<name>(**arguments)`` methods return structured output, or the
+    complete result for a tool without an output schema, and raise
+    :class:`ToolCallError` for tool errors or additional input requests.
     Use its ``call_tool`` method for the full result envelope.
     """
 

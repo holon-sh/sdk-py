@@ -174,6 +174,11 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             raw = await untyped.orders.call_tool("read", id="good")
             assert raw.structured_content == {"total": 5}
             assert not hasattr(untyped.orders.tools, "read")
+            tool = {
+                k: v for k, v in CONTRACT["tools"][0].items() if k != "outputSchema"
+            }
+            plain = Apps(identity, {"orders": {"tools": [tool]}})
+            assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
             with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
                 await untyped.missing.call_tool("read")
             # Explicit bindings work without a declaration and override the resolver.

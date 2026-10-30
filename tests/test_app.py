@@ -41,19 +41,17 @@ def test_native_contract_and_post_success_invalidation():
     asyncio.run(run())
 
 
-def test_native_views_and_notification_failure_do_not_change_committed_result(tmp_path):
+def test_tool_meta_passes_through_and_notification_failure_keeps_committed_result():
     async def run():
         class UnavailableBus(InMemorySubscriptionBus):
             async def publish(self, event):
                 raise RuntimeError("Fan-out unavailable")
 
-        (tmp_path / "index.html").write_text("<!doctype html><p>Counter</p>")
-        (tmp_path / "views.json").write_text(
-            '[{"tool":"add","uri":"ui://counter/app.html","file":"index.html"}]'
-        )
-        app = App(
-            "counter", views=tmp_path / "views.json", subscriptions=UnavailableBus()
-        )
+        app = App("counter", subscriptions=UnavailableBus())
+
+        @app.tool(meta={"ui": {"resourceUri": "ui://counter/index.html"}})
+        def show() -> dict[str, int]:
+            return {"value": 0}
 
         @app.tool(changes=["counter://value"])
         def add() -> dict[str, int]:
@@ -61,11 +59,9 @@ def test_native_views_and_notification_failure_do_not_change_committed_result(tm
 
         result = await app.call_tool("add", {})
         assert result.structured_content == {"value": 1}
-        assert (await app.list_tools())[0].meta["ui"][
-            "resourceUri"
-        ] == "ui://counter/app.html"
-        assert (
-            "Counter" in (await app.read_resource("ui://counter/app.html"))[0].content
-        )
+        assert [tool.meta for tool in await app.list_tools()] == [
+            {"ui": {"resourceUri": "ui://counter/index.html"}},
+            {"sh.holon/changes": ["counter://value"]},
+        ]
 
     asyncio.run(run())

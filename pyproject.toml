@@ -7,7 +7,7 @@ name = "holon-sh"
 version = "0.0.1"
 description = "Typed MCP clients, bindings, and app views"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["mcp>=2.3,<3", "jsonschema>=4.26,<5", "httpx2>=2.10,<3"]

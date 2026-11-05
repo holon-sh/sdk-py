@@ -14,7 +14,7 @@ jobs:
           python-version: "3.11"
       - run: uv sync
       - run: uv run --no-sync pytest
-      - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding -p holon.view
+      - run: uv run --no-sync mypy --strict -p holon.client -p holon.binding -p holon.view -p holon.app
       - run: uv build
       - name: Verify installed wheel and sdist consumers
         run: uv run --no-sync python scripts/verify_distribution.py

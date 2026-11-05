@@ -89,3 +89,42 @@ server.add_resource(app_view(
 ```
 
 The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
+
+## Function apps
+
+`holon.app.App` extends the native `MCPServer`; its decorators keep the SDK's
+signature inference, validation, contexts, and middleware.
+
+```python
+from holon.app import App
+from holon.view import app_view
+from mcp.types import ToolAnnotations
+
+server = App("example.com/counter", version="1.0.0", description="A shared counter")
+count = 0
+
+@server.resource("counter://state", mime_type="application/json")
+def state() -> dict[str, int]:
+    return {"count": count}
+
+@server.tool(annotations=ToolAnnotations(read_only_hint=True),
+             meta={"ui": {"resourceUri": "ui://counter/index.html"}})
+def show() -> dict[str, int]:
+    return state()
+
+@server.tool(changes=["counter://state"])
+def add(amount: int) -> dict[str, int]:
+    global count
+    count += amount
+    return state()
+
+server.add_resource(app_view("ui://counter/index.html", "Counter", "dist/index.html"))
+```
+
+`changes` sets `sh.holon/changes`: tool metadata listing the resource URIs a successful
+call invalidates. It is a refresh declaration, not authorization or a transaction.
+After a successful call `App` publishes `ResourceUpdated` for each URI; a notification
+failure is logged without changing the committed result.
+
+Run `holon types generate` to generate browser references from Python annotations.
+No application modules run during extraction.

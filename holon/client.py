@@ -8,9 +8,11 @@ from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVa
 
 import httpx2
 import jsonschema  # type: ignore[import-untyped,unused-ignore]
-from mcp import Client
+from mcp import Client, MCPError
+from mcp.client.session import ElicitationFnT
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import (
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     CallToolRequest,
     CallToolRequestParams,
     CallToolResult,
@@ -77,8 +79,8 @@ class ToolCallError(RuntimeError):
     """Raised by ``tools.<name>`` for tool errors or additional input requests.
 
     Attributes:
-        result: Original MCP error or input-required result. Use ``call_tool``
-            when you need to inspect these results and submit additional input.
+        result: Original MCP error or input-required result. Bind ``elicit`` to
+            answer questions in place, or use ``call_tool`` to continue later.
     """
 
     def __init__(
@@ -151,8 +153,9 @@ class _App:
             **arguments: Tool input, validated against the contract if present.
 
         Returns:
-            A complete or input-required result. Tool error results are returned
-            unchanged; successful structured output is contract-validated.
+            A complete result, or an input-required result when the binding has
+            no ``elicit``. Tool error results are returned unchanged; successful
+            structured output is contract-validated.
 
         Raises:
             ValueError: Unknown tool, invalid input/output, or undeclared dependency.
@@ -183,7 +186,9 @@ class _App:
             raise RuntimeError(
                 f"Dependency {self._name} is unavailable ({variable}). Set the endpoint or supply a binding."
             )
+        elicit = binding.get("elicit") if binding else None
         http_client = partial(httpx2.AsyncClient, trust_env=False)
+        failure: Exception | None = None
         async with (
             binding.get("http_client", http_client) if binding else http_client
         )() as http:
@@ -194,20 +199,24 @@ class _App:
                     name=self._identity["name"], version=self._identity["version"]
                 ),
                 mode="2026-07-28",
+                elicitation_callback=elicit,
             ) as client:
-                result = await client.session.send_request(
-                    CallToolRequest(
-                        params=CallToolRequestParams(
-                            name=name,
-                            arguments=arguments,
-                            input_responses=options.get("input_responses"),
-                            request_state=options.get("request_state"),
-                            _meta=options.get("meta"),
-                        )
-                    ),
-                    _result,
-                    request_read_timeout_seconds=options.get("timeout"),
-                )
+                try:
+                    result = await self._send(client, name, arguments, options, elicit)
+                except Exception as error:  # noqa: BLE001
+                    # Raised below: the client's task group would wrap it in an ExceptionGroup.
+                    failure = error
+        if (
+            isinstance(failure, MCPError)
+            and failure.code == MISSING_REQUIRED_CLIENT_CAPABILITY
+        ):
+            raise MCPError(
+                failure.code,
+                f"{self._name}.{name}: {failure.message}. Set elicit on the binding.",
+                failure.data,
+            ) from failure
+        if failure is not None:
+            raise failure
         if (
             definition is not None
             and isinstance(result, CallToolResult)
@@ -220,6 +229,38 @@ class _App:
                 f"structured output from {self._name}.{name}",
             )
         return result
+
+    @staticmethod
+    async def _send(
+        client: Client,
+        name: str,
+        arguments: dict[str, Any],
+        options: CallOptions,
+        elicit: ElicitationFnT | None,
+    ) -> CallToolResult | InputRequiredResult:
+        if elicit:
+            # The MCP client answers input requests through the callback and retries.
+            return await client.call_tool(
+                name,
+                arguments,
+                read_timeout_seconds=options.get("timeout"),
+                input_responses=options.get("input_responses"),
+                request_state=options.get("request_state"),
+                meta=options.get("meta"),
+            )
+        return await client.session.send_request(
+            CallToolRequest(
+                params=CallToolRequestParams(
+                    name=name,
+                    arguments=arguments,
+                    input_responses=options.get("input_responses"),
+                    request_state=options.get("request_state"),
+                    _meta=options.get("meta"),
+                )
+            ),
+            _result,
+            request_read_timeout_seconds=options.get("timeout"),
+        )
 
     async def _call_tool(
         self,
@@ -253,7 +294,8 @@ class Apps:
     Access a client with ``clients[name]`` or ``clients.name``. Its
     ``tools.<name>(**arguments)`` methods return structured output, or the
     complete result for a tool without an output schema, and raise
-    :class:`ToolCallError` for tool errors or additional input requests.
+    :class:`ToolCallError` for tool errors, or additional input requests when
+    the binding has no ``elicit``.
     Use its ``call_tool`` method for the full result envelope.
     """
 

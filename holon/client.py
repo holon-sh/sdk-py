@@ -77,28 +77,21 @@ class ToolCallError(RuntimeError):
     """Raised by ``tools.<name>`` for tool errors or additional input requests.
 
     Attributes:
-        app: Dependency name.
-        tool: Requested tool name.
-        result: Original MCP error or input-required result.
-        code: ``tool_error`` or ``input_required``. Use ``call_tool`` when you
-            need to inspect these results and submit additional input.
+        result: Original MCP error or input-required result. Use ``call_tool``
+            when you need to inspect these results and submit additional input.
     """
 
     def __init__(
         self, app: str, tool: str, result: CallToolResult | InputRequiredResult
     ) -> None:
-        self.app = app
-        self.tool = tool
         self.result = result
-        self.code: Literal["tool_error", "input_required"]
         if isinstance(result, InputRequiredResult):
-            self.code, message = "input_required", "additional input required."
+            message = "additional input required."
         else:
             detail = next(
                 (part.text for part in result.content if isinstance(part, TextContent)),
                 "",
             )
-            self.code = "tool_error"
             message = f"tool failed: {detail}" if detail else "tool failed."
         super().__init__(f"{app}.{tool}: {message}")
 

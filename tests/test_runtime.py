@@ -146,17 +146,14 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 if request["method"] == "tools/call"
             ]
             assert set(callers) == {"checkout", "other"}
-            for value, code, message in [
-                ("error", "tool_error", "orders.read: tool failed: Unavailable"),
-                ("input", "input_required", "orders.read: additional input required."),
+            for value, message in [
+                ("error", "orders.read: tool failed: Unavailable"),
+                ("input", "orders.read: additional input required."),
             ]:
                 raw = await apps.orders.call_tool("read", id=value)
                 with pytest.raises(ToolCallError) as error:
                     await apps.orders.tools.read(id=value)
-                assert error.value.code == code
                 assert str(error.value) == message
-                assert error.value.app == "orders"
-                assert error.value.tool == "read"
                 assert type(error.value.result) is type(raw)
                 assert error.value.result.meta["preserved"] is True
                 if isinstance(raw, InputRequiredResult):

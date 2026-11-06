@@ -4,7 +4,7 @@ import json
 import httpx2
 import pytest
 from mcp.server import MCPServer
-from mcp.types import CallToolResult, InputRequiredResult, TextContent
+from mcp.types import CallToolResult, ImageContent, InputRequiredResult, TextContent
 
 import holon.binding
 from holon.binding import set_default_binding
@@ -35,6 +35,11 @@ CONTRACT = {
 }
 
 
+def test_tool_error_without_text_has_a_plain_message():
+    error = ToolCallError("orders", "read", CallToolResult(is_error=True, content=[]))
+    assert str(error) == "orders.read: tool failed."
+
+
 def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
     async def exercise():
         started = asyncio.Event()
@@ -48,7 +53,10 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             if id == "error":
                 return CallToolResult(
                     is_error=True,
-                    content=[TextContent(type="text", text="Unavailable")],
+                    content=[
+                        ImageContent(type="image", data="", mime_type="image/png"),
+                        TextContent(type="text", text="Unavailable"),
+                    ],
                     _meta={"preserved": True},
                 )
             if id == "input":
@@ -138,11 +146,15 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 if request["method"] == "tools/call"
             ]
             assert set(callers) == {"checkout", "other"}
-            for value, code in [("error", "tool_error"), ("input", "input_required")]:
+            for value, code, message in [
+                ("error", "tool_error", "orders.read: tool failed: Unavailable"),
+                ("input", "input_required", "orders.read: additional input required."),
+            ]:
                 raw = await apps.orders.call_tool("read", id=value)
                 with pytest.raises(ToolCallError) as error:
                     await apps.orders.tools.read(id=value)
                 assert error.value.code == code
+                assert str(error.value) == message
                 assert error.value.app == "orders"
                 assert error.value.tool == "read"
                 assert type(error.value.result) is type(raw)

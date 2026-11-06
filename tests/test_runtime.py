@@ -158,6 +158,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                     assert requests[-1]["params"]["inputResponses"] == {}
                 else:
                     assert error.value.result == raw
+                    assert "Unavailable" in str(error.value)
             before = len(requests)
             with pytest.raises(ValueError, match="arguments"):
                 await apps.orders.tools.read(id=1)

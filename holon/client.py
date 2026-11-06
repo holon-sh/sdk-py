@@ -19,6 +19,7 @@ from mcp.types import (
     InputRequiredResult,
     InputResponses,
     RequestParamsMeta,
+    TextContent,
 )
 from pydantic import TypeAdapter
 from referencing import Registry
@@ -94,7 +95,13 @@ class ToolCallError(RuntimeError):
             self.code, message = "input_required", "additional input required"
         else:
             self.code, message = "tool_error", "tool failed"
-        super().__init__(f"{app}.{tool}: {message}.")
+            detail = next(
+                (part.text for part in result.content if isinstance(part, TextContent)),
+                "",
+            )
+            if detail:
+                message = f"{message}: {detail}"
+        super().__init__(f"{app}.{tool}: {message}")
 
 
 def validate(schema: dict[str, Any], value: object, label: str) -> None:

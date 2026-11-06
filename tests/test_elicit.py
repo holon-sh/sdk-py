@@ -3,30 +3,38 @@ from typing import Annotated
 
 import httpx2
 import pytest
-from mcp import MCPError
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Elicit, Resolve
-from mcp.types import MISSING_REQUIRED_CLIENT_CAPABILITY, CallToolResult, ElicitResult
+from mcp.types import (
+    CallToolResult,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitRequestURLParams,
+    ElicitResult,
+    InputRequiredResult,
+)
 from pydantic import BaseModel
 
 from holon.client import Apps, ToolCallError
 
 QUESTION = "Which size should I ship?"
+ID_ONLY = {
+    "type": "object",
+    "properties": {"id": {"type": "string"}},
+    "required": ["id"],
+}
 CONTRACT = {
     "tools": [
         {
             "name": "ship",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "string"}},
-                "required": ["id"],
-            },
+            "inputSchema": ID_ONLY,
             "outputSchema": {
                 "type": "object",
                 "properties": {"shipped": {"type": "string"}},
                 "required": ["shipped"],
             },
-        }
+        },
+        {"name": "nag", "inputSchema": ID_ONLY},
     ]
 }
 
@@ -43,8 +51,8 @@ def ask_size() -> Elicit[Choice]:
     return Elicit(QUESTION, Choice)
 
 
-def exercise(body, elicit=None, contract=CONTRACT):
-    """Run body against a real server, through a binding that may answer its question."""
+def exercise(body, contract=CONTRACT):
+    """Run body against a real server."""
 
     async def run():
         server = MCPServer("orders")
@@ -54,6 +62,16 @@ def exercise(body, elicit=None, contract=CONTRACT):
             id: str, choice: Annotated[Choice, Resolve(ask_size)]
         ) -> Shipped:
             return Shipped(shipped=choice.size)
+
+        @server.tool()
+        async def nag(id: str) -> CallToolResult | InputRequiredResult:
+            params = ElicitRequestFormParams(
+                message=QUESTION,
+                requested_schema={"type": "object", "properties": {}},
+            )
+            return InputRequiredResult(
+                input_requests={"q": ElicitRequest(params=params)}
+            )
 
         app = server.streamable_http_app(stateless_http=True)
 
@@ -67,7 +85,6 @@ def exercise(body, elicit=None, contract=CONTRACT):
                 "orders": {
                     "endpoint": "http://127.0.0.1:8000/mcp",
                     "http_client": http_client,
-                    "elicit": elicit,
                 }
             },
         )
@@ -77,55 +94,102 @@ def exercise(body, elicit=None, contract=CONTRACT):
     asyncio.run(asyncio.wait_for(run(), timeout=15))
 
 
-def test_elicit_answers_in_place_and_the_tool_returns_typed_output():
+async def large(params):
+    return ElicitResult(action="accept", content={"size": "large"})
+
+
+def test_elicit_answers_in_place_and_the_call_returns_typed_output():
     asked = []
 
-    async def elicit(context, params):
+    async def elicit(params):
         asked.append(params.message)
-        return ElicitResult(action="accept", content={"size": "large"})
+        return await large(params)
 
     async def body(orders):
-        assert await orders.tools.ship(id="A-1") == {"shipped": "large"}
-        whole = await orders.call_tool("ship", id="A-1")
-        assert isinstance(whole, CallToolResult)
-        assert whole.structured_content == {"shipped": "large"}
+        assert await orders.tools.ship({"elicit": elicit}, id="A-1") == {
+            "shipped": "large"
+        }
 
-    exercise(body, elicit)
-    assert asked == [QUESTION, QUESTION]
+    exercise(body)
+    assert asked == [QUESTION]
 
 
 def test_accepted_output_is_still_validated():
-    async def elicit(context, params):
-        return ElicitResult(action="accept", content={"size": "large"})
-
     tool = CONTRACT["tools"][0]
     wrong = {"type": "object", "required": ["total"]}
 
     async def body(orders):
         with pytest.raises(ValueError, match="structured output"):
-            await orders.tools.ship(id="A-1")
+            await orders.tools.ship({"elicit": large}, id="A-1")
 
-    exercise(body, elicit, {"tools": [{**tool, "outputSchema": wrong}]})
+    exercise(body, {"tools": [{**tool, "outputSchema": wrong}]})
 
 
-def test_a_declined_elicitation_reaches_the_tool():
-    async def elicit(context, params):
+def test_a_declined_question_reaches_the_tool():
+    async def decline(params):
         return ElicitResult(action="decline")
 
     async def body(orders):
         with pytest.raises(ToolCallError, match="elicitation was decline"):
-            await orders.tools.ship(id="A-1")
-
-    exercise(body, elicit)
-
-
-def test_a_client_without_the_capability_is_told_how_to_declare_it():
-    async def body(orders):
-        with pytest.raises(MCPError) as error:
-            await orders.tools.ship(id="A-1")
-        assert error.value.code == MISSING_REQUIRED_CLIENT_CAPABILITY
-        assert str(error.value).startswith("orders.ship: ")
-        assert str(error.value).endswith("Set elicit on the binding.")
-        assert error.value.data["requiredCapabilities"]["elicitation"]["form"] == {}
+            await orders.tools.ship({"elicit": decline}, id="A-1")
 
     exercise(body)
+
+
+def test_a_server_that_keeps_asking_stops_after_ten_answers():
+    answers = []
+
+    async def elicit(params):
+        answers.append(params)
+        return ElicitResult(action="decline")
+
+    async def body(orders):
+        with pytest.raises(ToolCallError, match=QUESTION):
+            await orders.tools.nag({"elicit": elicit}, id="A-1")
+
+    exercise(body)
+    assert len(answers) == 10
+
+
+def test_without_elicit_the_question_reaches_the_caller_who_continues():
+    async def body(orders):
+        with pytest.raises(ToolCallError) as error:
+            await orders.tools.ship(id="A-1")
+        assert str(error.value) == f"orders.ship: additional input required: {QUESTION}"
+        result = error.value.result
+        assert isinstance(result, InputRequiredResult)
+        [(key, request)] = result.input_requests.items()
+        assert request.params.message == QUESTION
+        answer = ElicitResult(action="accept", content={"size": "small"})
+        continued = await orders.call_tool(
+            "ship",
+            {"input_responses": {key: answer}, "request_state": result.request_state},
+            id="A-1",
+        )
+        assert continued.structured_content == {"shipped": "small"}
+
+    exercise(body)
+
+
+def test_an_error_while_answering_reaches_the_caller_unwrapped():
+    async def elicit(params):
+        raise LookupError("no answer")
+
+    async def body(orders):
+        with pytest.raises(LookupError, match="no answer"):
+            await orders.tools.ship({"elicit": elicit}, id="A-1")
+
+    exercise(body)
+
+
+def test_a_url_question_names_its_url():
+    params = ElicitRequestURLParams(
+        message="Connect your account.",
+        url="https://orders.example/connect",
+        elicitation_id="link",
+    )
+    result = InputRequiredResult(input_requests={"link": ElicitRequest(params=params)})
+    assert str(ToolCallError("orders", "ship", result)) == (
+        "orders.ship: additional input required: "
+        "Connect your account. https://orders.example/connect"
+    )

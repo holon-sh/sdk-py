@@ -77,20 +77,18 @@ The options dict also accepts `input_responses`, `request_state` and `meta`.
 <details open>
 <summary><h3>Answer a server's question</h3></summary>
 
-A tool can stop and ask for input through an [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation). Bind `elicit` to answer in place, and the call returns its usual typed output:
+A tool can stop and ask for input through an [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation). Pass `elicit` to answer in place, and the call returns its usual typed output:
 
 ```python
-from holon.apps import create_apps
 from mcp.types import ElicitResult
 
-async def elicit(context, params):
+async def elicit(params):
     return ElicitResult(action="accept", content=await ask(params.message))
 
-apps = create_apps({"bar": {"endpoint": "https://bar.example.com/mcp", "elicit": elicit}})
-greeting = await apps.bar.tools.greet(name="world")
+greeting = await apps.bar.tools.greet({"elicit": elicit}, name="world")
 ```
 
-Without `elicit`, a client declares no capability, so a server that needs it rejects the call.
+Without `elicit`, the question arrives on `ToolCallError.result`, or as an `input_required` result from `call_tool`. To answer later, for example in another request, call again with `input_responses` and `request_state`.
 
 </details>
 

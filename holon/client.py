@@ -86,13 +86,15 @@ class ToolCallError(RuntimeError):
     ) -> None:
         self.result = result
         if isinstance(result, InputRequiredResult):
-            message = "additional input required."
+            message = "additional input required"
         else:
+            message = "tool failed"
             detail = next(
                 (part.text for part in result.content if isinstance(part, TextContent)),
                 "",
             )
-            message = f"tool failed: {detail}" if detail else "tool failed."
+            if detail:
+                message = f"{message}: {detail}"
         super().__init__(f"{app}.{tool}: {message}")
 
 

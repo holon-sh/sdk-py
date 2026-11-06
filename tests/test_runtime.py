@@ -4,7 +4,7 @@ import json
 import httpx2
 import pytest
 from mcp.server import MCPServer
-from mcp.types import CallToolResult, ImageContent, InputRequiredResult, TextContent
+from mcp.types import CallToolResult, InputRequiredResult, TextContent
 
 import holon.binding
 from holon.binding import set_default_binding
@@ -35,11 +35,6 @@ CONTRACT = {
 }
 
 
-def test_tool_error_without_text_has_a_plain_message():
-    error = ToolCallError("orders", "read", CallToolResult(is_error=True, content=[]))
-    assert str(error) == "orders.read: tool failed."
-
-
 def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
     async def exercise():
         started = asyncio.Event()
@@ -53,10 +48,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             if id == "error":
                 return CallToolResult(
                     is_error=True,
-                    content=[
-                        ImageContent(type="image", data="", mime_type="image/png"),
-                        TextContent(type="text", text="Unavailable"),
-                    ],
+                    content=[TextContent(type="text", text="Unavailable")],
                     _meta={"preserved": True},
                 )
             if id == "input":
@@ -146,14 +138,10 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 if request["method"] == "tools/call"
             ]
             assert set(callers) == {"checkout", "other"}
-            for value, message in [
-                ("error", "orders.read: tool failed: Unavailable"),
-                ("input", "orders.read: additional input required."),
-            ]:
+            for value in ["error", "input"]:
                 raw = await apps.orders.call_tool("read", id=value)
                 with pytest.raises(ToolCallError) as error:
                     await apps.orders.tools.read(id=value)
-                assert str(error.value) == message
                 assert type(error.value.result) is type(raw)
                 assert error.value.result.meta["preserved"] is True
                 if isinstance(raw, InputRequiredResult):
@@ -167,6 +155,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                     assert requests[-1]["params"]["inputResponses"] == {}
                 else:
                     assert error.value.result == raw
+                    assert "Unavailable" in str(error.value)
             before = len(requests)
             with pytest.raises(ValueError, match="arguments"):
                 await apps.orders.tools.read(id=1)

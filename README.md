@@ -50,8 +50,7 @@ from holon.client import ToolCallError
 try:
     await apps.bar.tools.greet(name="world")
 except ToolCallError as error:
-    error.code     # "tool_error" or "input_required"
-    error.result   # the original MCP result
+    error.result  # the original MCP result
 ```
 
 </details>

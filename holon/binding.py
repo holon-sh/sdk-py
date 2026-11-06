@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import NotRequired, TypedDict
 
 import httpx2
+from mcp.client.session import ElicitationFnT
 
 
 class Binding(TypedDict):
@@ -14,10 +15,14 @@ class Binding(TypedDict):
         http_client: Factory returning a fresh ``httpx2.AsyncClient`` for each
             call. Configure authentication headers or a custom transport here.
             The SDK closes the returned client when the call finishes.
+        elicit: Answers a server's elicitations in place, so ``tools.<name>`` and
+            ``call_tool`` return the completed result. Declares the elicitation
+            capability to the server.
     """
 
     endpoint: str
     http_client: NotRequired[Callable[[], httpx2.AsyncClient]]
+    elicit: NotRequired[ElicitationFnT]
 
 
 _resolver: Callable[[str], Binding | None] | None = None

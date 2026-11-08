@@ -8,11 +8,7 @@ _here = Path(__file__).resolve().parent
 for _portion in holon.__path__:
     _generated = Path(_portion, "apps")
     if _generated.resolve() != _here and (_generated / "__init__.py").is_file():
-        _spec = spec_from_file_location(
-            __name__,
-            _generated / "__init__.py",
-            submodule_search_locations=[str(_generated)],
-        )
+        _spec = spec_from_file_location(__name__, _generated / "__init__.py")
         assert _spec and _spec.loader
         sys.modules[__name__] = _module = module_from_spec(_spec)
         _spec.loader.exec_module(_module)

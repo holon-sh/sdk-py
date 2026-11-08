@@ -1,5 +1,3 @@
-"""Consumer contracts at the generated namespace boundary."""
-
 import os
 import shutil
 import subprocess
@@ -8,7 +6,18 @@ from pathlib import Path
 
 
 def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path):
-    # Refresh with scripts/fixtures.sh; generation is tested in holon-sh/cli.
+    env = os.environ.copy()
+    env.pop("MYPYPATH", None)
+    env.pop("PYTHONPATH", None)
+    placeholder = subprocess.run(
+        [sys.executable, "-c", "import holon.apps"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "run `holon types generate`" in placeholder.stderr
     shutil.copytree(
         Path(__file__).parent / "fixtures/caller", tmp_path, dirs_exist_ok=True
     )
@@ -48,11 +57,6 @@ async def invalid() -> None:
 assert holon.__file__ is None
 assert Path(holon.client.__file__).parent != Path(__file__).parent / "holon"
 """)
-    # Runtime and typing must agree across the two namespace portions. No
-    # MYPYPATH/PYTHONPATH override is allowed to hide packaging problems.
-    env = os.environ.copy()
-    env.pop("MYPYPATH", None)
-    env.pop("PYTHONPATH", None)
     result = subprocess.run(
         [sys.executable, "-m", "mypy", "--strict", "--no-error-summary", "check.py"],
         cwd=tmp_path,
@@ -65,3 +69,14 @@ assert Path(holon.client.__file__).parent != Path(__file__).parent / "holon"
     assert len(result.stdout.splitlines()) == 1, result.stdout
     assert '"OrdersApp" has no attribute "missing"' in result.stdout
     subprocess.run([sys.executable, "check.py"], cwd=tmp_path, env=env, check=True)
+    (tmp_path / "later").mkdir()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.append('..'); from holon.apps import apps",
+        ],
+        cwd=tmp_path / "later",
+        env=env,
+        check=True,
+    )

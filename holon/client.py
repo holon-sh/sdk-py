@@ -229,13 +229,20 @@ class _App:
             raise ValueError(
                 f"Dependency {self._name} is not declared by this application."
             )
-        variable = self._name.upper().replace("-", "_") + "_MCP_URL"
-        endpoint = binding["endpoint"] if binding else os.environ.get(variable)
+        prefix = self._name.upper().replace("-", "_") + "_MCP_"
+        endpoint = binding["endpoint"] if binding else os.environ.get(prefix + "URL")
         if not endpoint:
             raise RuntimeError(
-                f"Dependency {self._name} is unavailable ({variable}). Set the endpoint or supply a binding."
+                f"Dependency {self._name} is unavailable ({prefix}URL). Set the endpoint or supply a binding."
             )
-        http_client = partial(httpx2.AsyncClient, trust_env=False)
+        # An environment-bound client sends <NAME>_MCP_TOKEN, when set, as a bearer
+        # token. Redirects are not followed, so the token stays on its origin.
+        token = None if binding else os.environ.get(prefix + "TOKEN")
+        http_client = partial(
+            httpx2.AsyncClient,
+            trust_env=False,
+            headers={"Authorization": f"Bearer {token}"} if token else None,
+        )
         failure: Exception | None = None
         async with (
             binding.get("http_client", http_client) if binding else http_client

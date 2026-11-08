@@ -1,8 +1,10 @@
 import asyncio
 import json
+import socket
 
 import httpx2
 import pytest
+import uvicorn
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, InputRequiredResult, TextContent
 
@@ -73,13 +75,18 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         headers = []
 
         async def record(request):
-            headers.append(request.headers.get("authorization"))
             if request.method == "POST":
                 requests.append(json.loads(await request.aread()))
 
+        async def listen(scope, receive, send):
+            """Serve the app, noting the authorization header each request carried."""
+            if scope["type"] == "http":
+                headers.append(dict(scope["headers"]).get(b"authorization"))
+            await app(scope, receive, send)
+
         def http_client():
             client = httpx2.AsyncClient(
-                transport=httpx2.ASGITransport(app=app),
+                transport=httpx2.ASGITransport(app=listen),
                 headers={"Authorization": "Bearer external"},
                 event_hooks={"request": [record]},
             )
@@ -88,6 +95,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
 
         monkeypatch.setattr(holon.binding, "_resolver", None)
         monkeypatch.delenv("MISSING_MCP_URL", raising=False)
+        monkeypatch.delenv("ORDERS_MCP_TOKEN", raising=False)
         set_default_binding(
             lambda app: (
                 {"endpoint": "http://127.0.0.1:8000/mcp", "http_client": http_client}
@@ -195,7 +203,29 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             set_default_binding(lambda _: None)
             with pytest.raises(ValueError, match="not declared"):
                 await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
-        assert headers and all(value == "Bearer external" for value in headers)
+            assert headers and set(headers) == {b"Bearer external"}
+            # Without a binding the client dials <NAME>_MCP_URL itself and sends
+            # <NAME>_MCP_TOKEN, when set, as a bearer token.
+            sock = socket.create_server(("127.0.0.1", 0))
+            monkeypatch.setenv(
+                "ORDERS_MCP_URL", f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
+            )
+            http = uvicorn.Server(
+                uvicorn.Config(listen, lifespan="off", log_level="warning")
+            )
+            serving = asyncio.create_task(http.serve(sockets=[sock]))
+            try:
+                for token in [None, "secret"]:
+                    if token:
+                        monkeypatch.setenv("ORDERS_MCP_TOKEN", token)
+                    headers.clear()
+                    assert await apps.orders.tools.read(id="good") == {"total": 5}
+                    assert headers and set(headers) == {
+                        f"Bearer {token}".encode() if token else None
+                    }
+            finally:
+                http.should_exit = True
+                await serving
         assert all(client.is_closed for client in clients)
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=15))

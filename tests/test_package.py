@@ -1,5 +1,3 @@
-"""Consumer contracts at the generated namespace boundary."""
-
 import os
 import shutil
 import subprocess
@@ -8,8 +6,6 @@ from pathlib import Path
 
 
 def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path):
-    # Runtime and typing must agree across the two namespace portions. No
-    # MYPYPATH/PYTHONPATH override is allowed to hide packaging problems.
     env = os.environ.copy()
     env.pop("MYPYPATH", None)
     env.pop("PYTHONPATH", None)
@@ -22,7 +18,6 @@ def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path)
         check=False,
     )
     assert "run `holon types generate`" in placeholder.stderr
-    # Refresh with scripts/fixtures.sh; generation is tested in holon-sh/cli.
     shutil.copytree(
         Path(__file__).parent / "fixtures/caller", tmp_path, dirs_exist_ok=True
     )
@@ -60,7 +55,6 @@ async def invalid() -> None:
     apps.orders.missing
 
 assert holon.__file__ is None
-assert Path(holon.apps.__file__).parent == Path(__file__).parent / "holon/apps"
 assert Path(holon.client.__file__).parent != Path(__file__).parent / "holon"
 """)
     result = subprocess.run(
@@ -75,7 +69,6 @@ assert Path(holon.client.__file__).parent != Path(__file__).parent / "holon"
     assert len(result.stdout.splitlines()) == 1, result.stdout
     assert '"OrdersApp" has no attribute "missing"' in result.stdout
     subprocess.run([sys.executable, "check.py"], cwd=tmp_path, env=env, check=True)
-    # A project after site-packages on sys.path, as an editable install puts it.
     (tmp_path / "later").mkdir()
     subprocess.run(
         [

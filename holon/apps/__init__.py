@@ -1,9 +1,3 @@
-"""Stand-in for the client ``holon types generate`` writes into the project.
-
-``holon`` is a namespace package, so the project's generated ``holon/apps`` is
-found here even when the project comes after site-packages on ``sys.path``.
-"""
-
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path

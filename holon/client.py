@@ -30,7 +30,6 @@ from referencing import Registry
 
 from holon.binding import Binding, resolve_default_binding
 
-# Binding is re-exported for the generated holon.apps module.
 __all__ = [
     "Apps",
     "Binding",
@@ -66,6 +65,7 @@ class ErrorResult(Protocol):
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
 
 _result = TypeAdapter(CallToolResult | InputRequiredResult)
+_http_client = partial(httpx2.AsyncClient, trust_env=False)
 
 
 class CallOptions(TypedDict, total=False):
@@ -111,7 +111,6 @@ class ToolCallError(RuntimeError):
 async def _declare_elicitation(
     context: ClientRequestContext, params: ElicitRequestParams
 ) -> ElicitResult:
-    """Declare that every client can be asked; the MCP client infers it from this."""
     return ElicitResult(action="decline")
 
 
@@ -135,8 +134,6 @@ async def _send(
             _result,
             request_read_timeout_seconds=options.get("timeout"),
         )
-        # A server may keep asking, so answering stops after ten rounds, the MCP
-        # clients' own limit, and the last question reaches the caller.
         if not (elicit and answered < 10 and isinstance(result, InputRequiredResult)):
             return result
         answered += 1
@@ -171,7 +168,6 @@ class _App:
         self._name = name
         self._identity = identity
         self._binding = binding
-        # None for a dependency without a contract: any tool, unvalidated.
         self._definitions = (
             None
             if contract is None
@@ -225,29 +221,26 @@ class _App:
                 f"arguments for {self._name}.{name}",
             )
         binding = self._binding or resolve_default_binding(self._name)
-        if binding is None and self._name not in self._identity["requires"]:
-            raise ValueError(
-                f"Dependency {self._name} is not declared by this application."
-            )
-        prefix = self._name.upper().replace("-", "_") + "_MCP_"
-        endpoint = binding["endpoint"] if binding else os.environ.get(prefix + "URL")
-        if not endpoint:
-            raise RuntimeError(
-                f"Dependency {self._name} is unavailable ({prefix}URL). Set the endpoint or supply a binding."
-            )
-        # An environment-bound client sends <NAME>_MCP_TOKEN, when set, as a bearer
-        # token. Redirects are not followed, so the token stays on its origin.
-        token = None if binding else os.environ.get(prefix + "TOKEN")
-        http_client = partial(
-            httpx2.AsyncClient,
-            trust_env=False,
-            headers={"Authorization": f"Bearer {token}"} if token else None,
-        )
+        if binding is None:
+            if self._name not in self._identity["requires"]:
+                raise ValueError(
+                    f"Dependency {self._name} is not declared by this application."
+                )
+            prefix = self._name.upper().replace("-", "_") + "_MCP_"
+            endpoint = os.environ.get(prefix + "URL")
+            if not endpoint:
+                raise RuntimeError(
+                    f"Dependency {self._name} is unavailable ({prefix}URL). Set the endpoint or supply a binding."
+                )
+            token = os.environ.get(prefix + "TOKEN")
+            headers = {"Authorization": f"Bearer {token}"} if token else None
+            binding = {
+                "endpoint": endpoint,
+                "http_client": partial(_http_client, headers=headers),
+            }
         failure: Exception | None = None
-        async with (
-            binding.get("http_client", http_client) if binding else http_client
-        )() as http:
-            transport = streamable_http_client(endpoint, http_client=http)
+        async with binding.get("http_client", _http_client)() as http:
+            transport = streamable_http_client(binding["endpoint"], http_client=http)
             async with Client(
                 transport,
                 client_info=Implementation(
@@ -259,7 +252,6 @@ class _App:
                 try:
                     result = await _send(client, name, arguments, options)
                 except Exception as error:  # noqa: BLE001
-                    # Raised below: the client's task group would wrap it in an ExceptionGroup.
                     failure = error
         if failure is not None:
             raise failure
@@ -318,7 +310,6 @@ class Apps:
         contracts: dict[str, Any],
         bindings: Mapping[str, Binding] | None = None,
     ) -> None:
-        # Every declared dependency gets a client; those without a contract are untyped.
         available = dict.fromkeys(identity["requires"]) | contracts
         self._apps = {}
         for name in available if bindings is None else bindings:

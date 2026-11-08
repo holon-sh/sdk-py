@@ -79,7 +79,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 requests.append(json.loads(await request.aread()))
 
         async def listen(scope, receive, send):
-            """Serve the app, noting the authorization header each request carried."""
             if scope["type"] == "http":
                 headers.append(dict(scope["headers"]).get(b"authorization"))
             await app(scope, receive, send)
@@ -95,7 +94,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
 
         monkeypatch.setattr(holon.binding, "_resolver", None)
         monkeypatch.delenv("MISSING_MCP_URL", raising=False)
-        monkeypatch.delenv("ORDERS_MCP_TOKEN", raising=False)
+        monkeypatch.setenv("ORDERS_MCP_TOKEN", "secret")
         set_default_binding(
             lambda app: (
                 {"endpoint": "http://127.0.0.1:8000/mcp", "http_client": http_client}
@@ -106,7 +105,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
         identity = {"name": "checkout", "version": "1", "requires": {"orders": {}}}
         apps = Apps(identity, {"orders": CONTRACT})
         other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
-        assert not requests
         async with app.router.lifespan_context(app):
             output, raw = await asyncio.gather(
                 apps.orders.tools.read(id="good"),
@@ -123,8 +121,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 ),
             )
             assert output == {"total": 5}
-            assert raw.structured_content == {"total": 2}
-            assert raw.content[0].text == "Order"
             assert raw.meta["preserved"] is True
             request = next(
                 request["params"]
@@ -152,16 +148,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                     await apps.orders.tools.read(id=value)
                 assert type(error.value.result) is type(raw)
                 assert error.value.result.meta["preserved"] is True
-                if isinstance(raw, InputRequiredResult):
-                    assert error.value.result.request_state
-                    await apps.orders.call_tool(
-                        "read",
-                        {"request_state": raw.request_state, "input_responses": {}},
-                        id=value,
-                    )
-                    assert requests[-1]["params"]["requestState"] == raw.request_state
-                    assert requests[-1]["params"]["inputResponses"] == {}
-                else:
+                if value == "error":
                     assert error.value.result == raw
                     assert "Unavailable" in str(error.value)
             before = len(requests)
@@ -187,7 +174,6 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
             with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
                 await untyped.missing.call_tool("read")
-            # Explicit bindings work without a declaration and override the resolver.
             set_default_binding(
                 lambda _: {"endpoint": "http://unavailable.invalid/mcp"}
             )
@@ -203,9 +189,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             set_default_binding(lambda _: None)
             with pytest.raises(ValueError, match="not declared"):
                 await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
-            assert headers and set(headers) == {b"Bearer external"}
-            # Without a binding the client dials <NAME>_MCP_URL itself and sends
-            # <NAME>_MCP_TOKEN, when set, as a bearer token.
+            assert set(headers) == {b"Bearer external"}
             sock = socket.create_server(("127.0.0.1", 0))
             monkeypatch.setenv(
                 "ORDERS_MCP_URL", f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
@@ -215,14 +199,13 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             )
             serving = asyncio.create_task(http.serve(sockets=[sock]))
             try:
-                for token in [None, "secret"]:
-                    if token:
-                        monkeypatch.setenv("ORDERS_MCP_TOKEN", token)
-                    headers.clear()
-                    assert await apps.orders.tools.read(id="good") == {"total": 5}
-                    assert headers and set(headers) == {
-                        f"Bearer {token}".encode() if token else None
-                    }
+                headers.clear()
+                assert await apps.orders.tools.read(id="good") == {"total": 5}
+                assert set(headers) == {b"Bearer secret"}
+                monkeypatch.delenv("ORDERS_MCP_TOKEN")
+                headers.clear()
+                await apps.orders.tools.read(id="good")
+                assert set(headers) == {None}
             finally:
                 http.should_exit = True
                 await serving

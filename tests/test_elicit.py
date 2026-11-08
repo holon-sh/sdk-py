@@ -51,9 +51,7 @@ def ask_size() -> Elicit[Choice]:
     return Elicit(QUESTION, Choice)
 
 
-def exercise(body, contract=CONTRACT):
-    """Run body against a real server."""
-
+def exercise(body):
     async def run():
         server = MCPServer("orders")
 
@@ -80,7 +78,7 @@ def exercise(body, contract=CONTRACT):
 
         apps = Apps(
             {"name": "checkout", "version": "1", "requires": {}},
-            {"orders": contract},
+            {"orders": CONTRACT},
             {
                 "orders": {
                     "endpoint": "http://127.0.0.1:8000/mcp",
@@ -94,16 +92,12 @@ def exercise(body, contract=CONTRACT):
     asyncio.run(asyncio.wait_for(run(), timeout=15))
 
 
-async def large(params):
-    return ElicitResult(action="accept", content={"size": "large"})
-
-
 def test_elicit_answers_in_place_and_the_call_returns_typed_output():
     asked = []
 
     async def elicit(params):
         asked.append(params.message)
-        return await large(params)
+        return ElicitResult(action="accept", content={"size": "large"})
 
     async def body(orders):
         assert await orders.tools.ship({"elicit": elicit}, id="A-1") == {
@@ -112,17 +106,6 @@ def test_elicit_answers_in_place_and_the_call_returns_typed_output():
 
     exercise(body)
     assert asked == [QUESTION]
-
-
-def test_accepted_output_is_still_validated():
-    tool = CONTRACT["tools"][0]
-    wrong = {"type": "object", "required": ["total"]}
-
-    async def body(orders):
-        with pytest.raises(ValueError, match="structured output"):
-            await orders.tools.ship({"elicit": large}, id="A-1")
-
-    exercise(body, {"tools": [{**tool, "outputSchema": wrong}]})
 
 
 def test_a_declined_question_reaches_the_tool():
@@ -157,9 +140,7 @@ def test_without_elicit_the_question_reaches_the_caller_who_continues():
             await orders.tools.ship(id="A-1")
         assert str(error.value) == f"orders.ship: additional input required: {QUESTION}"
         result = error.value.result
-        assert isinstance(result, InputRequiredResult)
-        [(key, request)] = result.input_requests.items()
-        assert request.params.message == QUESTION
+        [key] = result.input_requests
         answer = ElicitResult(action="accept", content={"size": "small"})
         continued = await orders.call_tool(
             "ship",

@@ -34,8 +34,9 @@ def test_get_context_reads_the_caller_holon_admitted():
             {"iss": "https://id.example", "sub": "user"},
             Principal("https://id.example", "user", "web", [], {}),
         ),
-        # A hook call carries no user.
+        # A hook call carries no user, and a caller needs an issuer.
         ("", [], {"hook": {"event": "installed"}}, None),
+        ("web", [], {"sub": "user"}, None),
     ]:
         # The Holon host builds the access token this way from what it admitted.
         token = AccessToken(

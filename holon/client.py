@@ -198,7 +198,7 @@ class _App:
             options: Request timeout in seconds, input responses, continuation
                 state, metadata, and ``elicit`` to answer the server's questions in
                 place. Passed positionally, separate from tool input.
-            **arguments: Tool input, validated against the contract if present.
+            **arguments: Tool input, which the server validates.
 
         Returns:
             A complete result, or an input-required result for a question left
@@ -206,7 +206,7 @@ class _App:
             structured output is contract-validated.
 
         Raises:
-            ValueError: Unknown tool, invalid input/output, or undeclared dependency.
+            ValueError: Unknown tool, invalid output, or undeclared dependency.
             RuntimeError: Endpoint resolution failed.
 
         Transport and protocol exceptions propagate. Each call closes its HTTP
@@ -218,11 +218,6 @@ class _App:
             definition = self._definitions.get(name)
             if definition is None:
                 raise ValueError(f"Unknown tool {self._name}.{name}.")
-            validate(
-                definition["inputSchema"],
-                arguments,
-                f"arguments for {self._name}.{name}",
-            )
         binding = self._binding or resolve_default_binding(self._name)
         if binding is None:
             if self._name not in self._identity["requires"]:

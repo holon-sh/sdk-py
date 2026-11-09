@@ -20,6 +20,12 @@ uv add --dev holon-types
 
 The Holon Python SDK allows generation of type-safe MCP clients. See [Example](https://github.com/holon-sh/cli#example) for an explanation, or [Dependencies](https://github.com/holon-sh/cli#dependencies) to understand dependency resolution.
 
+### Type-checking MCP invocations
+
+```sh
+uv run holon types check
+```
+
 <details open>
 <summary><h3>Call a tool</h3></summary>
 
@@ -31,7 +37,7 @@ async def greet(name: str) -> str:
     return greeting["result"]
 ```
 
-Arguments are keywords, validated before sending; the result is validated against the output schema and returned.
+Arguments are keywords; the result is validated against the output schema and returned.
 
 </details>
 

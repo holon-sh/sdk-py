@@ -72,9 +72,9 @@ def get_context() -> RequestContext:
         ``principal = get_context().principal``
     """
     admitted = get_access_token()
-    if admitted is None or admitted.subject is None:
+    extra = (admitted.claims or {}) if admitted else {}
+    if admitted is None or admitted.subject is None or "iss" not in extra:
         return RequestContext(principal=None)
-    extra = admitted.claims or {}
     return RequestContext(
         Principal(
             issuer=extra["iss"],

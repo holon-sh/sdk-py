@@ -140,10 +140,6 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 if value == "error":
                     assert error.value.result == raw
                     assert "Unavailable" in str(error.value)
-            before = len(requests)
-            with pytest.raises(ValueError, match="arguments"):
-                await apps.orders.tools.read(id=1)
-            assert len(requests) == before
             with pytest.raises(ValueError, match="structured output"):
                 await apps.orders.tools.read(id="bad")
             untyped = Apps({**identity, "requires": {"orders": {}, "missing": {}}}, {})

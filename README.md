@@ -86,21 +86,6 @@ Without `elicit`, the question arrives on `ToolCallError.result`, or as an `inpu
 
 </details>
 
-## Serve an [MCP App](https://modelcontextprotocol.io/extensions/apps/overview) view
-
-`holon.view.app_view` registers a built HTML file as an MCP App resource:
-
-```python
-from holon.view import app_view
-
-server.add_resource(app_view(
-    "ui://foo/index.html", "Foo", "dist/index.html",
-    connect_domains=["https://bar.example.com"],
-))
-```
-
-The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
-
 ## Identify the caller
 
 Inside a tool handler, `get_context().principal` is the user Holon admitted for the request, or `None` for anonymous requests:

@@ -262,9 +262,9 @@ class _App:
         from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
         from referencing import Registry
 
+        schema = definition["outputSchema"]
         validator = self._validators.get(definition["name"])
-        if validator is None:
-            schema = definition["outputSchema"]
+        if validator is None or validator.schema is not schema:
             cls = validator_for(schema)
             cls.check_schema(schema)
             validator = self._validators[definition["name"]] = cls(

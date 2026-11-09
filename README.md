@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/holon-sh)](https://pypi.org/project/holon-sh/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://holon-labs.dev/discord/)
 
 This repository contains the Python runtime for [`holon`](https://github.com/holon-sh/cli).
 
@@ -107,3 +108,7 @@ if principal is not None:
     principal.issuer, principal.subject, principal.scopes
     principal.claims.get("email")  # standard OpenID claims are typed: str | None
 ```
+
+## Community
+
+Ask questions and share what you're building on the [Holon Discord](https://holon-labs.dev/discord/).

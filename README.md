@@ -38,7 +38,7 @@ async def greet(name: str) -> str:
     return greeting["result"]
 ```
 
-Arguments are keywords, validated before sending; the result is validated against the output schema and returned.
+Arguments are keywords; the result is validated against the output schema and returned.
 
 </details>
 
@@ -95,21 +95,15 @@ Without `elicit`, the question arrives on `ToolCallError.result`, or as an `inpu
 
 </details>
 
-## Serve an [MCP App](https://modelcontextprotocol.io/extensions/apps/overview) view
+## Identify the caller
 
-`holon.view.app_view` registers a built HTML file as an MCP App resource:
+Inside a tool handler, `get_context().principal` is the user Holon admitted for the request, or `None` for anonymous requests:
 
 ```python
-from holon.view import app_view
+from holon.context import get_context
 
-server.add_resource(
-    app_view(
-        "ui://foo/index.html",
-        "Foo",
-        "dist/index.html",
-        connect_domains=["https://bar.example.com"],
-    )
-)
+principal = get_context().principal
+if principal is not None:
+    principal.issuer, principal.subject, principal.scopes
+    principal.claims.get("email")  # standard OpenID claims are typed: str | None
 ```
-
-The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).

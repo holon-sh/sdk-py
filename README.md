@@ -106,3 +106,16 @@ server.add_resource(app_view(
 ```
 
 The page itself uses [`holon-ui`](https://github.com/holon-sh/sdk-ui).
+
+## Identify the caller
+
+Inside a tool handler, `get_context().principal` is the user Holon admitted for the request, or `None` for anonymous requests:
+
+```python
+from holon.context import get_context
+
+principal = get_context().principal
+if principal is not None:
+    principal.issuer, principal.subject, principal.scopes
+    principal.claims.get("email")  # claims as the identity provider issued them
+```

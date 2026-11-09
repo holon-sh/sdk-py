@@ -32,6 +32,7 @@ uv run holon types check
 ```python
 from holon.apps import apps
 
+
 async def greet(name: str) -> str:
     greeting = await apps.bar.tools.greet({"timeout": 5.0}, name=name)
     return greeting["result"]
@@ -63,11 +64,11 @@ except ToolCallError as error:
 ```python
 result = await apps.bar.call_tool("greet", name="world")
 if result.result_type == "input_required":
-    ...                          # call again with input_responses and request_state
+    ...  # call again with input_responses and request_state
 elif result.is_error:
-    ...                          # inspect result.content
+    ...  # inspect result.content
 else:
-    result.structured_content    # typed as Outputs.bar.greet
+    result.structured_content  # typed as Outputs.bar.greet
 ```
 
 The options dict also accepts `input_responses`, `request_state` and `meta`.
@@ -82,8 +83,10 @@ A tool can stop and ask for input through an [MCP elicitation](https://modelcont
 ```python
 from mcp.types import ElicitResult
 
+
 async def elicit(params):
     return ElicitResult(action="accept", content=await ask(params.message))
+
 
 greeting = await apps.bar.tools.greet({"elicit": elicit}, name="world")
 ```

@@ -28,7 +28,7 @@ from mcp.types import (
 from pydantic import TypeAdapter
 from referencing import Registry
 
-from holon.binding import Binding, resolve_default_binding
+from holon.binding import Binding
 
 __all__ = [
     "Apps",
@@ -65,7 +65,6 @@ class ErrorResult(Protocol):
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
 
 _result = TypeAdapter(CallToolResult | InputRequiredResult)
-# MCP's own client timeouts: a server may hold the response stream open while a tool runs.
 _http_client = partial(
     httpx2.AsyncClient, trust_env=False, timeout=httpx2.Timeout(30.0, read=300.0)
 )
@@ -218,7 +217,7 @@ class _App:
             definition = self._definitions.get(name)
             if definition is None:
                 raise ValueError(f"Unknown tool {self._name}.{name}.")
-        binding = self._binding or resolve_default_binding(self._name)
+        binding = self._binding
         if binding is None:
             if self._name not in self._identity["requires"]:
                 raise ValueError(

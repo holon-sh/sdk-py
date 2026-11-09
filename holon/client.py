@@ -7,9 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
-from jsonschema import FormatChecker
-from jsonschema.exceptions import best_match
-from jsonschema.validators import validator_for
+import jsonschema
 from mcp import Client
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
@@ -265,12 +263,14 @@ class _App:
     ) -> None:
         validator = self._validators.get(name)
         if validator is None or validator.schema is not schema:
-            cls = validator_for(schema)
+            cls = jsonschema.validators.validator_for(schema)
             cls.check_schema(schema)
             validator = self._validators[name] = cls(
-                schema, registry=Registry(), format_checker=FormatChecker()
+                schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
             )
-        if (error := best_match(validator.iter_errors(value))) is not None:
+        if (
+            error := jsonschema.exceptions.best_match(validator.iter_errors(value))
+        ) is not None:
             raise ValueError(f"Invalid {label}: {error.message}") from error
 
     async def _call_tool(

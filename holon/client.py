@@ -7,9 +7,9 @@ from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
-from jsonschema import FormatChecker  # type: ignore[import-untyped,unused-ignore]
-from jsonschema.exceptions import best_match  # type: ignore[import-untyped,unused-ignore]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
+from jsonschema import FormatChecker
+from jsonschema.exceptions import best_match
+from jsonschema.validators import validator_for
 from mcp import Client
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client

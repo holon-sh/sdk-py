@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
-import jsonschema  # type: ignore[import-untyped,unused-ignore]
+import jsonschema
 from mcp import Client
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
@@ -144,18 +144,6 @@ async def _send(
         state = result.request_state
 
 
-def validate(schema: dict[str, Any], value: object, label: str) -> None:
-    try:
-        jsonschema.validate(
-            value,
-            schema,
-            registry=Registry(),
-            format_checker=jsonschema.FormatChecker(),
-        )
-    except jsonschema.ValidationError as error:
-        raise ValueError(f"Invalid {label}: {error.message}") from error
-
-
 class _App:
     def __init__(
         self,
@@ -167,6 +155,7 @@ class _App:
         self._name = name
         self._identity = identity
         self._binding = binding
+        self._validators: dict[str, Any] = {}
         self._definitions = (
             None
             if contract is None
@@ -261,12 +250,28 @@ class _App:
             and not result.is_error
             and "outputSchema" in definition
         ):
-            validate(
+            self._validate(
+                name,
                 definition["outputSchema"],
                 result.structured_content,
                 f"structured output from {self._name}.{name}",
             )
         return result
+
+    def _validate(
+        self, name: str, schema: dict[str, Any], value: Any, label: str
+    ) -> None:
+        validator = self._validators.get(name)
+        if validator is None or validator.schema is not schema:
+            cls = jsonschema.validators.validator_for(schema)
+            cls.check_schema(schema)
+            validator = self._validators[name] = cls(
+                schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
+            )
+        if (
+            error := jsonschema.exceptions.best_match(validator.iter_errors(value))
+        ) is not None:
+            raise ValueError(f"Invalid {label}: {error.message}") from error
 
     async def _call_tool(
         self,

@@ -7,6 +7,9 @@ from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
+from jsonschema import FormatChecker  # type: ignore[import-untyped,unused-ignore]
+from jsonschema.exceptions import best_match  # type: ignore[import-untyped,unused-ignore]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
 from mcp import Client
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
@@ -25,6 +28,7 @@ from mcp.types import (
     TextContent,
 )
 from pydantic import TypeAdapter
+from referencing import Registry
 
 from holon.binding import Binding
 
@@ -259,12 +263,6 @@ class _App:
     def _validate(
         self, name: str, schema: dict[str, Any], value: Any, label: str
     ) -> None:
-        # Imported on first use: jsonschema costs tens of milliseconds to import.
-        from jsonschema import FormatChecker  # type: ignore[import-untyped,unused-ignore]
-        from jsonschema.exceptions import best_match  # type: ignore[import-untyped,unused-ignore]
-        from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
-        from referencing import Registry
-
         validator = self._validators.get(name)
         if validator is None or validator.schema is not schema:
             cls = validator_for(schema)

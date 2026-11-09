@@ -249,25 +249,27 @@ class _App:
             and "outputSchema" in definition
         ):
             self._validate(
-                definition,
+                name,
+                definition["outputSchema"],
                 result.structured_content,
                 f"structured output from {self._name}.{name}",
             )
         return result
 
-    def _validate(self, definition: dict[str, Any], value: Any, label: str) -> None:
+    def _validate(
+        self, name: str, schema: dict[str, Any], value: Any, label: str
+    ) -> None:
         # Imported on first use: jsonschema costs tens of milliseconds to import.
         from jsonschema import FormatChecker  # type: ignore[import-untyped,unused-ignore]
         from jsonschema.exceptions import best_match  # type: ignore[import-untyped,unused-ignore]
         from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
         from referencing import Registry
 
-        schema = definition["outputSchema"]
-        validator = self._validators.get(definition["name"])
+        validator = self._validators.get(name)
         if validator is None or validator.schema is not schema:
             cls = validator_for(schema)
             cls.check_schema(schema)
-            validator = self._validators[definition["name"]] = cls(
+            validator = self._validators[name] = cls(
                 schema, registry=Registry(), format_checker=FormatChecker()
             )
         if (error := best_match(validator.iter_errors(value))) is not None:

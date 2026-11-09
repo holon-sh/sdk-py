@@ -65,9 +65,6 @@ class ErrorResult(Protocol):
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
 
 _result = TypeAdapter(CallToolResult | InputRequiredResult)
-_http_client = partial(
-    httpx2.AsyncClient, trust_env=False, timeout=httpx2.Timeout(30.0, read=300.0)
-)
 
 
 class CallOptions(TypedDict, total=False):
@@ -217,6 +214,12 @@ class _App:
             definition = self._definitions.get(name)
             if definition is None:
                 raise ValueError(f"Unknown tool {self._name}.{name}.")
+        timeout = options.get("timeout")
+        http_client = partial(
+            httpx2.AsyncClient,
+            trust_env=False,
+            timeout=httpx2.Timeout(timeout, read=None),
+        )
         binding = self._binding
         if binding is None:
             if self._name not in self._identity["requires"]:
@@ -233,10 +236,10 @@ class _App:
             headers = {"Authorization": f"Bearer {token}"} if token else None
             binding = {
                 "endpoint": endpoint,
-                "http_client": partial(_http_client, headers=headers),
+                "http_client": partial(http_client, headers=headers),
             }
         failure: Exception | None = None
-        async with binding.get("http_client", _http_client)() as http:
+        async with binding.get("http_client", http_client)() as http:
             transport = streamable_http_client(binding["endpoint"], http_client=http)
             async with Client(
                 transport,

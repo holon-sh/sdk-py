@@ -18,30 +18,3 @@ class Binding(TypedDict):
 
     endpoint: str
     http_client: NotRequired[Callable[[], httpx2.AsyncClient]]
-
-
-_resolver: Callable[[str], Binding | None] | None = None
-
-
-def set_default_binding(resolve: Callable[[str], Binding | None]) -> None:
-    """Register the default binding resolver for app clients.
-
-    Args:
-        resolve: Process-wide callback receiving the dependency name. Return a
-            binding or ``None`` to use the environment fallback. Explicit
-            bindings take precedence. Register during application startup.
-    """
-    global _resolver
-    _resolver = resolve
-
-
-def resolve_default_binding(app: str) -> Binding | None:
-    """Return the registered resolver's binding for an app.
-
-    Args:
-        app: Dependency name passed unchanged to the resolver.
-
-    Returns:
-        The resolved binding, or ``None`` if none is available.
-    """
-    return _resolver(app) if _resolver is not None else None

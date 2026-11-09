@@ -65,7 +65,10 @@ class ErrorResult(Protocol):
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
 
 _result = TypeAdapter(CallToolResult | InputRequiredResult)
-_http_client = partial(httpx2.AsyncClient, trust_env=False)
+# MCP's own client timeouts: a server may hold the response stream open while a tool runs.
+_http_client = partial(
+    httpx2.AsyncClient, trust_env=False, timeout=httpx2.Timeout(30.0, read=300.0)
+)
 
 
 class CallOptions(TypedDict, total=False):

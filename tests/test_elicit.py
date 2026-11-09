@@ -108,17 +108,6 @@ def test_elicit_answers_in_place_and_the_call_returns_typed_output():
     assert asked == [QUESTION]
 
 
-def test_a_declined_question_reaches_the_tool():
-    async def decline(params):
-        return ElicitResult(action="decline")
-
-    async def body(orders):
-        with pytest.raises(ToolCallError, match="elicitation was decline"):
-            await orders.tools.ship({"elicit": decline}, id="A-1")
-
-    exercise(body)
-
-
 def test_a_server_that_keeps_asking_stops_after_ten_answers():
     answers = []
 

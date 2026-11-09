@@ -20,12 +20,6 @@ uv add --dev holon-types
 
 The Holon Python SDK allows generation of type-safe MCP clients. See [Example](https://github.com/holon-sh/cli#example) for an explanation, or [Dependencies](https://github.com/holon-sh/cli#dependencies) to understand dependency resolution.
 
-### Type-checking MCP invocations
-
-```sh
-uv run holon types check
-```
-
 <details open>
 <summary><h3>Call a tool</h3></summary>
 
@@ -117,5 +111,5 @@ from holon.context import get_context
 principal = get_context().principal
 if principal is not None:
     principal.issuer, principal.subject, principal.scopes
-    principal.claims.get("email")  # claims as the identity provider issued them
+    principal.claims.get("email")  # standard OpenID claims are typed: str | None
 ```

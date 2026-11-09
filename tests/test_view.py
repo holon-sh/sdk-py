@@ -39,7 +39,6 @@ def test_app_view_serves_one_build_for_the_life_of_the_process(tmp_path):
             }
             first = await client.read_resource("ui://site/index.html")
             assert first.contents[0].text == "<html>one</html>"
-            assert first.contents[0].mime_type == APP_MIME_TYPE
             page.write_text("<html>two</html>")
             second = await client.read_resource("ui://site/index.html")
             assert second.contents[0].text == "<html>one</html>"

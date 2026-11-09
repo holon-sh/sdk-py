@@ -15,7 +15,7 @@ uv add --prerelease allow holon-sh
 uv add --dev holon-types
 ```
 
-`holon-types` is the `holon` CLI; it brings mypy, which `holon types check` runs from the project's environment.
+`holon-types` is the `holon` CLI, with mypy.
 
 ## Invoking MCP Servers
 
@@ -27,24 +27,17 @@ The Holon Python SDK allows generation of type-safe MCP clients. See [Example](h
 uv run holon types check
 ```
 
-<details open>
-<summary><h3>Call a tool</h3></summary>
+### Call a tool
 
 ```python
 from holon.apps import apps
-
 
 async def greet(name: str) -> str:
     greeting = await apps.bar.tools.greet({"timeout": 5.0}, name=name)
     return greeting["result"]
 ```
 
-Arguments are keywords; the result is validated against the output schema and returned.
-
-</details>
-
-<details open>
-<summary><h3>Handle errors</h3></summary>
+### Handle errors
 
 ```python
 from holon.client import ToolCallError
@@ -55,10 +48,7 @@ except ToolCallError as error:
     error.result  # the original MCP result
 ```
 
-</details>
-
-<details open>
-<summary><h3>Read the whole result</h3></summary>
+### Read the whole result
 
 `call_tool` returns the full MCP result instead of raising:
 
@@ -74,27 +64,20 @@ else:
 
 The options dict also accepts `input_responses`, `request_state` and `meta`.
 
-</details>
-
-<details open>
-<summary><h3>Answer a server's question</h3></summary>
+### Answer a server's question
 
 A tool can stop and ask for input through an [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation). Pass `elicit` to answer in place, and the call returns its usual typed output:
 
 ```python
 from mcp.types import ElicitResult
 
-
 async def elicit(params):
     return ElicitResult(action="accept", content=await ask(params.message))
-
 
 greeting = await apps.bar.tools.greet({"elicit": elicit}, name="world")
 ```
 
-Without `elicit`, the question arrives on `ToolCallError.result`, or as an `input_required` result from `call_tool`. To answer later, for example in another request, call again with `input_responses` and `request_state`.
-
-</details>
+Without `elicit`, the question arrives on `ToolCallError.result`, or as an `input_required` result from `call_tool`.
 
 ## Identify the caller
 

@@ -1,10 +1,11 @@
 # Holon Python SDK
 
 [![CI](https://github.com/holon-sh/sdk-py/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/holon-sh/sdk-py/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-holon--labs.dev-blue)](https://holon-labs.dev/docs/)
 [![PyPI](https://img.shields.io/pypi/v/holon-sh)](https://pypi.org/project/holon-sh/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://holon-labs.dev/discord/)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/jXExyBdy)
 
 This repository contains the Python runtime for [`holon`](https://github.com/holon-sh/cli).
 
@@ -15,11 +16,32 @@ uv add --prerelease allow holon-sh
 uv add --dev holon-types
 ```
 
-`holon-types` is the `holon` CLI; it brings mypy, which `holon types check` runs from the project's environment.
+## Create an app
+
+```sh
+uvx create-holon-app foo
+```
 
 ## Invoking MCP Servers
 
-The Holon Python SDK allows generation of type-safe MCP clients. See [Example](https://github.com/holon-sh/cli#example) for an explanation, or [Dependencies](https://github.com/holon-sh/cli#dependencies) to understand dependency resolution.
+Declare dependencies under `sh.holon.requires` in a [`server.json`](https://modelcontextprotocol.io/registry/quickstart#step-4-create-server-json) beside the server, here the public [Hugging Face](https://huggingface.co/docs/hub/en/hf-mcp-server) MCP server:
+
+```json
+{
+  "name": "com.example/foo",
+  "version": "0.1.0",
+  "description": "Example Foo",
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "sh.holon": {
+        "requires": {
+          "huggingface": { "url": "https://huggingface.co/mcp" }
+        }
+      }
+    }
+  }
+}
+```
 
 ### Type-checking MCP invocations
 
@@ -27,88 +49,23 @@ The Holon Python SDK allows generation of type-safe MCP clients. See [Example](h
 uv run holon types check
 ```
 
-<details open>
-<summary><h3>Call a tool</h3></summary>
+A wrong tool name or argument is a type error:
 
 ```python
 from holon.apps import apps
 
+await apps.huggingface.tools.hub_repo_search(query="llama")
 
-async def greet(name: str) -> str:
-    greeting = await apps.bar.tools.greet({"timeout": 5.0}, name=name)
-    return greeting["result"]
-```
+await apps.huggingface.tools.hub_repo_search(limit="3")
+# error: Argument "limit" to "hub_repo_search" of "HuggingfaceTools" has incompatible type "str"; expected "float"  [arg-type]
 
-Arguments are keywords; the result is validated against the output schema and returned.
+await apps.huggingface.tools.hub_repo_details()
+# error: Missing named argument "repo_ids" for "hub_repo_details" of "HuggingfaceTools"  [call-arg]
 
-</details>
-
-<details open>
-<summary><h3>Handle errors</h3></summary>
-
-```python
-from holon.client import ToolCallError
-
-try:
-    await apps.bar.tools.greet(name="world")
-except ToolCallError as error:
-    error.result  # the original MCP result
-```
-
-</details>
-
-<details open>
-<summary><h3>Read the whole result</h3></summary>
-
-`call_tool` returns the full MCP result instead of raising:
-
-```python
-result = await apps.bar.call_tool("greet", name="world")
-if result.result_type == "input_required":
-    ...  # call again with input_responses and request_state
-elif result.is_error:
-    ...  # inspect result.content
-else:
-    result.structured_content  # typed as Outputs.bar.greet
-```
-
-The options dict also accepts `input_responses`, `request_state` and `meta`.
-
-</details>
-
-<details open>
-<summary><h3>Answer a server's question</h3></summary>
-
-A tool can stop and ask for input through an [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation). Pass `elicit` to answer in place, and the call returns its usual typed output:
-
-```python
-from mcp.types import ElicitResult
-
-
-async def elicit(params):
-    return ElicitResult(action="accept", content=await ask(params.message))
-
-
-greeting = await apps.bar.tools.greet({"elicit": elicit}, name="world")
-```
-
-Without `elicit`, the question arrives on `ToolCallError.result`, or as an `input_required` result from `call_tool`. To answer later, for example in another request, call again with `input_responses` and `request_state`.
-
-</details>
-
-## Identify the caller
-
-Inside a tool handler, `get_context().principal` is the user Holon admitted for the request, or `None` for anonymous requests:
-
-```python
-from holon.context import get_context
-
-principal = get_context().principal
-if principal is not None:
-    principal.issuer, principal.subject, principal.scopes
-    principal.claims.get("email")  # standard OpenID claims are typed: str | None
+await apps.huggingface.tools.hub_search(query="llama")
+# error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
 ## Community
 
-Ask questions and share what you're building on the [Holon Discord](https://holon-labs.dev/discord/).
+Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

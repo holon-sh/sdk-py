@@ -28,7 +28,7 @@ from mcp.types import (
 from pydantic import TypeAdapter
 from referencing import Registry
 
-from holon.binding import Binding, resolve_default_binding
+from holon.binding import Binding
 
 __all__ = [
     "Apps",
@@ -220,7 +220,7 @@ class _App:
                 arguments,
                 f"arguments for {self._name}.{name}",
             )
-        binding = self._binding or resolve_default_binding(self._name)
+        binding = self._binding
         if binding is None:
             if self._name not in self._identity["requires"]:
                 raise ValueError(

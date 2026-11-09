@@ -8,8 +8,6 @@ import uvicorn
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, InputRequiredResult, TextContent
 
-import holon.binding
-from holon.binding import set_default_binding
 from holon.client import Apps, ToolCallError
 
 CONTRACT = {
@@ -92,19 +90,13 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             clients.append(client)
             return client
 
-        monkeypatch.setattr(holon.binding, "_resolver", None)
         monkeypatch.delenv("MISSING_MCP_URL", raising=False)
         monkeypatch.setenv("ORDERS_MCP_TOKEN", "secret")
-        set_default_binding(
-            lambda app: (
-                {"endpoint": "http://127.0.0.1:8000/mcp", "http_client": http_client}
-                if app == "orders"
-                else None
-            )
-        )
+        binding = {"endpoint": "http://127.0.0.1:8000/mcp", "http_client": http_client}
+        bindings = {"orders": binding}
         identity = {"name": "checkout", "version": "1", "requires": {"orders": {}}}
-        apps = Apps(identity, {"orders": CONTRACT})
-        other = Apps({**identity, "name": "other"}, {"orders": CONTRACT})
+        apps = Apps(identity, {"orders": CONTRACT}, bindings)
+        other = Apps({**identity, "name": "other"}, {"orders": CONTRACT}, bindings)
         async with app.router.lifespan_context(app):
             output, raw = await asyncio.gather(
                 apps.orders.tools.read(id="good"),
@@ -163,30 +155,23 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
             with pytest.raises(asyncio.CancelledError):
                 await task
             await cancelled.wait()
-            untyped = Apps({**identity, "requires": {"orders": {}, "missing": {}}}, {})
+            undeclared = {**identity, "requires": {"orders": {}, "missing": {}}}
+            untyped = Apps(undeclared, {}, bindings)
             raw = await untyped.orders.call_tool("read", id="good")
             assert raw.structured_content == {"total": 5}
             assert not hasattr(untyped.orders.tools, "read")
             tool = {
                 k: v for k, v in CONTRACT["tools"][0].items() if k != "outputSchema"
             }
-            plain = Apps(identity, {"orders": {"tools": [tool]}})
+            plain = Apps(identity, {"orders": {"tools": [tool]}}, bindings)
             assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
             with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
-                await untyped.missing.call_tool("read")
-            set_default_binding(
-                lambda _: {"endpoint": "http://unavailable.invalid/mcp"}
-            )
+                await Apps(undeclared, {}).missing.call_tool("read")
             script = {**identity, "requires": {}}
-            binding = {
-                "endpoint": "http://127.0.0.1:8000/mcp",
-                "http_client": http_client,
-            }
             with pytest.raises(ValueError, match="Unknown app binding"):
                 Apps(script, {"orders": CONTRACT}, {"missing": binding})
-            bound = Apps(script, {"orders": CONTRACT}, {"orders": binding})
+            bound = Apps(script, {"orders": CONTRACT}, bindings)
             assert await bound.orders.tools.read(id="good") == {"total": 5}
-            set_default_binding(lambda _: None)
             with pytest.raises(ValueError, match="not declared"):
                 await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
             assert set(headers) == {b"Bearer external"}
@@ -198,6 +183,7 @@ def test_clients_preserve_mcp_results_validate_and_cancel(monkeypatch):
                 uvicorn.Config(listen, lifespan="off", log_level="warning")
             )
             serving = asyncio.create_task(http.serve(sockets=[sock]))
+            apps = Apps(identity, {"orders": CONTRACT})
             try:
                 headers.clear()
                 assert await apps.orders.tools.read(id="good") == {"total": 5}

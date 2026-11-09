@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
-import jsonschema  # type: ignore[import-untyped,unused-ignore]
 from mcp import Client
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
@@ -26,7 +25,6 @@ from mcp.types import (
     TextContent,
 )
 from pydantic import TypeAdapter
-from referencing import Registry
 
 from holon.binding import Binding
 
@@ -144,18 +142,6 @@ async def _send(
         state = result.request_state
 
 
-def validate(schema: dict[str, Any], value: object, label: str) -> None:
-    try:
-        jsonschema.validate(
-            value,
-            schema,
-            registry=Registry(),
-            format_checker=jsonschema.FormatChecker(),
-        )
-    except jsonschema.ValidationError as error:
-        raise ValueError(f"Invalid {label}: {error.message}") from error
-
-
 class _App:
     def __init__(
         self,
@@ -167,6 +153,7 @@ class _App:
         self._name = name
         self._identity = identity
         self._binding = binding
+        self._validators: dict[str, Any] = {}
         self._definitions = (
             None
             if contract is None
@@ -261,12 +248,30 @@ class _App:
             and not result.is_error
             and "outputSchema" in definition
         ):
-            validate(
-                definition["outputSchema"],
+            self._validate(
+                definition,
                 result.structured_content,
                 f"structured output from {self._name}.{name}",
             )
         return result
+
+    def _validate(self, definition: dict[str, Any], value: Any, label: str) -> None:
+        # Imported on first use: jsonschema costs tens of milliseconds to import.
+        from jsonschema import FormatChecker  # type: ignore[import-untyped,unused-ignore]
+        from jsonschema.exceptions import best_match  # type: ignore[import-untyped,unused-ignore]
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped,unused-ignore]
+        from referencing import Registry
+
+        validator = self._validators.get(definition["name"])
+        if validator is None:
+            schema = definition["outputSchema"]
+            cls = validator_for(schema)
+            cls.check_schema(schema)
+            validator = self._validators[definition["name"]] = cls(
+                schema, registry=Registry(), format_checker=FormatChecker()
+            )
+        if (error := best_match(validator.iter_errors(value))) is not None:
+            raise ValueError(f"Invalid {label}: {error.message}") from error
 
     async def _call_tool(
         self,

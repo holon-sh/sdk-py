@@ -27,7 +27,7 @@ from mcp import Client
 from mcp.client.extension import advertise
 from mcp.types import CallToolResult, DiscoverResult, PaginatedRequestParams
 
-from holon.files._wire import (
+from holon.ext.files._wire import (
     DOWNLOAD,
     EXTENSION,
     MEDIA_TYPE,

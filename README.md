@@ -71,7 +71,7 @@ await apps.huggingface.tools.hub_search(query="llama")
 Where a tool takes a file (the draft [files extension](https://github.com/modelcontextprotocol/experimental-ext-file-uploads)), pass a `File`. Small files travel inline; larger ones are uploaded where the server asks before the tool runs. Read the files a tool returns with `downloads`:
 
 ```python
-from holon.files import File, downloads
+from holon.ext.files import File, downloads
 
 await apps.storage.tools.save(folder="reports", file=File("q3.pdf"))
 
@@ -80,7 +80,9 @@ for download in downloads(result):
     await download.save("exports")
 ```
 
-A binding's `file_origins` limits where uploads and downloads may go. Servers accept file arguments with `holon.files.FileServer`.
+A binding's `file_origins` limits where uploads and downloads may go. Servers accept file arguments with `holon.ext.files.FileServer`.
+
+`holon.ext` holds draft MCP extensions: their interfaces follow the drafts and may change.
 
 ## Events
 

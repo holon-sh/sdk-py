@@ -6,15 +6,20 @@ returns with :func:`downloads`. Servers accept file arguments through
 :class:`LocalStorage`.
 """
 
-from holon.files._client import (
+from holon.ext.files._client import (
     Download,
     File,
     FileTransferError,
     OutcomeUnknownError,
     downloads,
 )
-from holon.files._server import FileServer, LocalStorage, ReceivedFile, Storage
-from holon.files._wire import EXTENSION, DownloadTarget, UploadTarget, file_input_schema
+from holon.ext.files._server import FileServer, LocalStorage, ReceivedFile, Storage
+from holon.ext.files._wire import (
+    EXTENSION,
+    DownloadTarget,
+    UploadTarget,
+    file_input_schema,
+)
 
 __all__ = [
     "EXTENSION",

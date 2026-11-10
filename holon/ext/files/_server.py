@@ -42,7 +42,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, Response
 from starlette.routing import Route, Router
 
-from holon.files._wire import (
+from holon.ext.files._wire import (
     EXTENSION,
     DownloadTarget,
     UploadTarget,

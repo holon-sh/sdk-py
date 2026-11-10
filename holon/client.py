@@ -43,14 +43,14 @@ from referencing import Registry
 
 from holon.binding import Binding
 from holon.events import FORBIDDEN, NOT_FOUND, UNSUPPORTED, Event
-from holon.files._client import (
+from holon.ext.files._client import (
     FILES,
     OutcomeUnknownError,
     Transfers,
     holds_file,
     remember,
 )
-from holon.files._wire import CALL_RESULT, UploadRequiredResult
+from holon.ext.files._wire import CALL_RESULT, UploadRequiredResult
 
 __all__ = [
     "Apps",
@@ -227,7 +227,7 @@ class _App:
                 state, metadata, and ``elicit`` to answer the server's questions in
                 place. Passed positionally, separate from tool input.
             **arguments: Tool input, which the server validates. Pass a
-                ``holon.files.File`` where the tool takes a file.
+                ``holon.ext.files.File`` where the tool takes a file.
 
         Returns:
             A complete result, or an input-required result for a question left
@@ -237,9 +237,9 @@ class _App:
         Raises:
             ValueError: Unknown tool, invalid output, or undeclared dependency.
             RuntimeError: Endpoint resolution failed.
-            holon.files.FileTransferError: A file was not sent; the tool did
+            holon.ext.files.FileTransferError: A file was not sent; the tool did
                 not run.
-            holon.files.OutcomeUnknownError: The call failed after its files
+            holon.ext.files.OutcomeUnknownError: The call failed after its files
                 were sent; the tool may have run.
 
         Transport and protocol exceptions propagate. Each call closes its HTTP

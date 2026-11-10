@@ -28,7 +28,7 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route, Router
 
 from holon.client import Apps
-from holon.files import (
+from holon.ext.files import (
     EXTENSION,
     File,
     FileServer,

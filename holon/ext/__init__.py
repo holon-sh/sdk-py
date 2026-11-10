@@ -1,1 +1,1 @@
-"""Draft MCP extensions. Their interfaces follow the drafts and may change."""
+"""Draft extensions of MCP. Their interfaces follow the drafts, so they may change in any release."""

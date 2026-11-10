@@ -18,7 +18,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.events import Events
+from holon.ext.events import Events
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 

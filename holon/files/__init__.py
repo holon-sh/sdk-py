@@ -14,34 +14,19 @@ from holon.files._client import (
     downloads,
 )
 from holon.files._server import FileServer, LocalStorage, ReceivedFile, Storage
-from holon.files._wire import (
-    EXTENSION,
-    DownloadTarget,
-    FileInput,
-    FileInputDescriptor,
-    ResultFilesMeta,
-    UploadForm,
-    UploadRequiredResult,
-    UploadTarget,
-    file_input_schema,
-)
+from holon.files._wire import EXTENSION, DownloadTarget, UploadTarget, file_input_schema
 
 __all__ = [
     "EXTENSION",
     "Download",
     "DownloadTarget",
     "File",
-    "FileInput",
-    "FileInputDescriptor",
     "FileServer",
     "FileTransferError",
     "LocalStorage",
     "OutcomeUnknownError",
     "ReceivedFile",
-    "ResultFilesMeta",
     "Storage",
-    "UploadForm",
-    "UploadRequiredResult",
     "UploadTarget",
     "downloads",
     "file_input_schema",

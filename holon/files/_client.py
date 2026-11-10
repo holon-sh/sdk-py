@@ -5,15 +5,16 @@ from __future__ import annotations
 import base64
 import contextvars
 import hashlib
+import io
 import ipaddress
 import logging
-import mimetypes
 import os
 import re
+import secrets
 import socket
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,29 +23,34 @@ from uuid import uuid4
 
 import anyio
 import httpx2
-from httpx2._multipart import DataField, FileField
 from mcp import Client
-from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
+from mcp.client.extension import advertise
 from mcp.types import CallToolResult, DiscoverResult, PaginatedRequestParams
 
 from holon.files._wire import (
+    DOWNLOAD,
     EXTENSION,
-    UNCHANGED,
+    MEDIA_TYPE,
+    UPLOAD,
+    DownloadTarget,
     Rejected,
     UploadRequiredResult,
+    UploadTarget,
     b64url,
     check_target,
     declared,
-    descriptor,
     digest_required,
     expires_at,
-    valid_media_type,
+    media_type,
     walk_files,
+    writing,
 )
 
+FILES = advertise(EXTENSION, {"upload": {}, "download": {}})
 _CHUNK = 1 << 16
-_PUT_ATTEMPTS = 3
 _TIMEOUT = httpx2.Timeout(60.0, connect=10.0)
+# The WHATWG multipart/form-data escapes for a filename, and other controls.
+_QUOTE = {ord('"'): "%22"} | {c: f"%{c:02X}" for c in range(32)}
 
 
 class FileTransferError(RuntimeError):
@@ -78,44 +84,34 @@ class File:
         name: str | None = None,
         mime_type: str | None = None,
     ) -> None:
-        self._data = source if isinstance(source, bytes) else None
-        self._path = None if isinstance(source, bytes) else Path(source)
-        self.name = name if name is not None or self._path is None else self._path.name
-        self.mime_type = (
-            mime_type
-            or (self.name and mimetypes.guess_type(self.name)[0])
-            or "application/octet-stream"
-        )
+        self._source = source
+        if name is None and not isinstance(source, bytes):
+            name = Path(source).name
+        self.name = name
+        self.mime_type = media_type(name, mime_type)
 
     def __repr__(self) -> str:
         return f"File({self.name!r}, mime_type={self.mime_type!r})"
 
     async def _size(self) -> int:
-        if self._data is not None:
-            return len(self._data)
-        assert self._path is not None
-        return (await anyio.Path(self._path).stat()).st_size
+        if isinstance(self._source, bytes):
+            return len(self._source)
+        return (await anyio.Path(self._source).stat()).st_size
 
     async def _chunks(self, size: int) -> AsyncIterator[bytes]:
         """Yield exactly ``size`` bytes, never more, or fail."""
-        if self._data is not None:
-            if len(self._data) != size:
-                raise FileTransferError("the file changed while it was sent")
-            for start in range(0, size, _CHUNK):
-                yield self._data[start : start + _CHUNK]
-            return
-        assert self._path is not None
-        left = size
-        async with await anyio.open_file(self._path, "rb") as source:
-            while left:
-                chunk = await source.read(min(_CHUNK, left))
+        source = self._source
+        async with (
+            anyio.wrap_file(io.BytesIO(source))
+            if isinstance(source, bytes)
+            else await anyio.open_file(source, "rb")
+        ) as reader:
+            while size:
+                chunk = await reader.read(min(_CHUNK, size))
                 if not chunk:
                     raise FileTransferError("the file changed while it was sent")
-                left -= len(chunk)
+                size -= len(chunk)
                 yield chunk
-
-    async def _read(self, size: int) -> bytes:
-        return b"".join([chunk async for chunk in self._chunks(size)])
 
 
 def _file_name(name: str | None) -> str:
@@ -123,42 +119,8 @@ def _file_name(name: str | None) -> str:
     return "file" if base in ("", ".", "..") else base
 
 
-@dataclass
-class _Sent:
-    file: File
-    entry: dict[str, Any]
-
-
-class _Files(ClientExtension):
-    identifier = EXTENSION
-
-    def settings(self) -> dict[str, Any]:
-        return {"upload": {}, "download": {}}
-
-    def claims(self) -> Sequence[ResultClaim[Any]]:
-        return [
-            ResultClaim(
-                result_type="upload_required",
-                model=UploadRequiredResult,
-                resolve=_unresolvable,
-            )
-        ]
-
-
-async def _unresolvable(
-    result: UploadRequiredResult, ctx: ClaimContext
-) -> CallToolResult:
-    # mcp's claim context has no tool arguments, so holon drives uploads itself.
-    raise RuntimeError("holon sends file calls itself; use holon.client.Apps")
-
-
-FILES = _Files()
-
-
 # Transfers go through this module; httpx2 logs each request URL at INFO.
-_quiet: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "holon_files_quiet", default=False
-)
+_quiet = contextvars.ContextVar("holon_files_quiet", default=False)
 
 
 class _RedactTargets(logging.Filter):
@@ -174,57 +136,57 @@ class _RedactTargets(logging.Filter):
 logging.getLogger("httpx2").addFilter(_RedactTargets())
 
 
-Origin = tuple[str, str, int]
-
-
-def _origin(url: httpx2.URL) -> Origin:
-    return (url.scheme, url.host, url.port or (443 if url.scheme == "https" else 80))
+def _origin(url: httpx2.URL) -> tuple[str, str, int]:
+    return url.scheme, url.host, url.port or (443 if url.scheme == "https" else 80)
 
 
 def _loopback(host: str) -> bool:
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
-        return False
+        return host == "localhost" or host.endswith(".localhost")
 
 
-@dataclass
-class Peer:
-    """The MCP address a call went to, and how transfers for it are sent."""
+class Transfers:
+    """One call's file transfers: where they may go and what is still owed."""
 
-    endpoint: httpx2.URL
-    http_client: Callable[[], httpx2.AsyncClient]
-    origins: frozenset[Origin] | None
-    authorization: str | None = None
-
-    @classmethod
-    def of(
-        cls,
+    def __init__(
+        self,
+        label: str,
         endpoint: str,
         http_client: Callable[[], httpx2.AsyncClient],
         file_origins: Sequence[str] | None,
-    ) -> Peer:
-        origins = None
-        if file_origins is not None:
-            origins = frozenset(_origin(httpx2.URL(origin)) for origin in file_origins)
-        return cls(httpx2.URL(endpoint), http_client, origins)
-
-    def watch(self, http: httpx2.AsyncClient) -> None:
-        """Remember the credential this client sends to the MCP address, for ``include``."""
+        http: httpx2.AsyncClient,
+    ) -> None:
+        self.label = label
+        self.endpoint = httpx2.URL(endpoint)
+        self.http_client = http_client
+        self.origins = (
+            None
+            if file_origins is None
+            else {_origin(httpx2.URL(origin)) for origin in file_origins}
+        )
+        self.http = http
+        self.authorization: str | None = None
+        self.owed: dict[str, tuple[File, dict[str, Any]]] = {}
+        self.uploaded = False
 
         async def capture(request: httpx2.Request) -> None:
             if request.url == self.endpoint:
                 self.authorization = request.headers.get("authorization")
 
         hooks = http.event_hooks
-        hooks["request"] = [*hooks.get("request", []), capture]
-        http.event_hooks = hooks
+        http.event_hooks = {**hooks, "request": [*hooks.get("request", []), capture]}
 
-    def check(self, target: Mapping[str, Any]) -> None:
+    def fail(self, reason: str) -> FileTransferError:
+        return FileTransferError(f"{self.label} did not run: {reason}")
+
+    def _listed(self, url: httpx2.URL) -> bool:
+        return self.origins is not None and _origin(url) in self.origins
+
+    def check(self, target: UploadTarget | DownloadTarget) -> None:
         """The Credentials rules and this binding's origin policy."""
-        if "path" in target:
+        if "url" not in target:
             if not (
                 self.endpoint.scheme == "https"
                 or _loopback(self.endpoint.host)
@@ -242,93 +204,63 @@ class Peer:
         if url.scheme != "https" and not self._listed(url):
             raise Rejected("its url is not https")
 
-    def _listed(self, url: httpx2.URL) -> bool:
-        return self.origins is not None and _origin(url) in self.origins
-
     @asynccontextmanager
     async def exchange(
         self,
-        target: Mapping[str, Any],
+        target: UploadTarget | DownloadTarget,
         method: str,
         headers: dict[str, str],
         content: AsyncIterator[bytes] | None = None,
-        http: httpx2.AsyncClient | None = None,
     ) -> AsyncIterator[httpx2.Response]:
-        """Send one transfer request and yield its streamed response.
-
-        A ``path`` target goes through the binding's own client, which reaches
-        the MCP address; a ``url`` target through a fresh client that connects
-        only to an address this checked.
-        """
+        """Send one transfer request and yield its streamed response."""
         if target["credentials"] == "include" and self.authorization:
             headers = {**headers, "Authorization": self.authorization}
         quiet = _quiet.set(True)
         try:
-            if "path" in target:
-                url = self.endpoint.copy_with(
-                    path=self.endpoint.path.rstrip("/") + target["path"]
-                )
-                async with self._client(http) as client:
+            async with AsyncExitStack() as stack:
+                if "url" not in target:
+                    # The binding's client reaches the MCP address; downloads
+                    # come after the call closed it.
+                    client = self.http
+                    if client.is_closed:
+                        client = await stack.enter_async_context(self.http_client())
+                    path = self.endpoint.path.rstrip("/") + target["path"]
                     request = client.build_request(
-                        method, url, headers=headers, content=content
+                        method,
+                        self.endpoint.copy_with(path=path),
+                        headers=headers,
+                        content=content,
                     )
-                    # Only the target's own headers and the MCP credential, if asked for.
-                    request.headers.pop("cookie", None)
-                    if "Authorization" not in headers:
-                        request.headers.pop("authorization", None)
-                    if "content-type" not in {name.lower() for name in headers}:
-                        request.headers.pop("content-type", None)
-                    response = await client.send(
-                        request, stream=True, auth=None, follow_redirects=False
+                    # Only the target's headers, and the MCP credential if asked.
+                    listed = {name.lower() for name in headers}
+                    for name in ("authorization", "cookie", "content-type"):
+                        if name not in listed:
+                            request.headers.pop(name, None)
+                else:  # A fresh client, connected to an address _address allows.
+                    url = httpx2.URL(target["url"])
+                    client = await stack.enter_async_context(
+                        httpx2.AsyncClient(trust_env=False, timeout=_TIMEOUT)
                     )
-                    try:
-                        yield response
-                    finally:
-                        await response.aclose()
-                return
-            url = httpx2.URL(target["url"])
-            address = await self._address(url)
-            extensions = (
-                {} if address == url.host else {"sni_hostname": url.raw_host.decode()}
-            )
-            async with httpx2.AsyncClient(
-                transport=httpx2.AsyncHTTPTransport(),
-                trust_env=False,
-                follow_redirects=False,
-                timeout=_TIMEOUT,
-            ) as client:
-                request = client.build_request(
-                    method,
-                    url.copy_with(host=address),
-                    headers={**headers, "Host": url.netloc.decode()},
-                    content=content,
-                    extensions=extensions,
+                    request = client.build_request(
+                        method,
+                        url.copy_with(host=await self._address(url)),
+                        headers={**headers, "Host": url.netloc.decode()},
+                        content=content,
+                        extensions={"sni_hostname": url.raw_host.decode()},
+                    )
+                response = await client.send(
+                    request, stream=True, auth=None, follow_redirects=False
                 )
-                response = await client.send(request, stream=True)
-                try:
-                    yield response
-                finally:
-                    await response.aclose()
+                stack.push_async_callback(response.aclose)
+                yield response
         finally:
             _quiet.reset(quiet)
 
-    @asynccontextmanager
-    async def _client(
-        self, http: httpx2.AsyncClient | None
-    ) -> AsyncIterator[httpx2.AsyncClient]:
-        if http is not None:
-            yield http
-            return
-        async with self.http_client() as client:
-            yield client
-
     async def _address(self, url: httpx2.URL) -> str:
         """The Addresses rule: connect only to a globally reachable address."""
-        listed = self._listed(url)
-        port = url.port or (443 if url.scheme == "https" else 80)
         try:
             found = await anyio.getaddrinfo(
-                url.raw_host.decode(), port, type=socket.SOCK_STREAM
+                url.raw_host.decode(), None, type=socket.SOCK_STREAM
             )
         except OSError:
             raise Rejected("its host does not resolve") from None
@@ -339,27 +271,12 @@ class Peer:
             if url.scheme == "http":
                 usable = address.is_loopback
             else:
-                usable = listed or (address.is_global and not address.is_multicast)
+                usable = self._listed(url) or (
+                    address.is_global and not address.is_multicast
+                )
             if usable:
                 return str(address)
         raise Rejected("its address is not globally reachable")
-
-
-# Uploads.
-
-
-class Upload:
-    """The file arguments of one logical call, as sent and as still owed."""
-
-    def __init__(self, label: str, peer: Peer, http: httpx2.AsyncClient) -> None:
-        self.label = label
-        self.peer = peer
-        self.http = http
-        self.owed: dict[str, _Sent] = {}
-        self.uploaded = False
-
-    def fail(self, reason: str) -> FileTransferError:
-        return FileTransferError(f"{self.label} did not run: {reason}")
 
     async def prepare(
         self,
@@ -369,20 +286,26 @@ class Upload:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         """Replace each File with a FileInput, inline or owed out of band."""
-        if schema is None:
-            schema = await _listed_schema(client, name)
-        sent: list[tuple[_Sent, Mapping[str, Any]]] = []
+        cursor = None
+        while schema is None:  # An untyped dependency: the schema it lists.
+            page = await client.session.list_tools(
+                params=PaginatedRequestParams(cursor=cursor)
+            )
+            schema = next((t.input_schema for t in page.tools if t.name == name), None)
+            if schema is None and (cursor := page.next_cursor) is None:
+                schema = {}
+        sent: list[tuple[File, dict[str, Any], Mapping[str, Any]]] = []
 
         def place(value: Any, marked: Mapping[str, Any]) -> Any:
             if not isinstance(value, File):
-                return UNCHANGED
-            item = _Sent(value, {"id": uuid4().hex, "mimeType": value.mime_type})
+                return None
+            entry = {"id": uuid4().hex, "mimeType": value.mime_type}
             if value.name is not None:
-                item.entry["name"] = value.name
-            sent.append((item, marked))
-            return item.entry
+                entry["name"] = value.name
+            sent.append((value, entry, marked))
+            return entry
 
-        replaced: dict[str, Any] = walk_files(schema or {}, arguments, place)
+        replaced: dict[str, Any] = walk_files(schema, arguments, place)
         if holds_file(replaced):
             raise ValueError(
                 f"{self.label}: a File was passed where the tool takes no file"
@@ -391,33 +314,31 @@ class Upload:
         settings = declared(DiscoverResult.model_validate(raw).capabilities)
         if settings is None:
             raise self.fail("the server does not accept file arguments")
-        limit = settings.get("maxInlineBytes")
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-            limit = 0
-        inline = 0
-        for item, marked in sent:
-            size = await item.file._size()
-            item.entry["size"] = size
-            max_size = descriptor(marked).get("maxSize")
+        for file, entry, marked in sent:
+            entry["size"] = size = await file._size()
+            max_size = marked["x-mcp-file"].get("maxSize")
             if isinstance(max_size, int) and size > max_size:
                 raise self.fail(
-                    f"{_file_name(item.file.name)!r} is larger than the tool accepts"
+                    f"{_file_name(file.name)!r} is larger than the tool accepts"
                 )
             if digest_required(marked):
-                item.entry["digest"] = {
+                hasher = hashlib.sha256()
+                async for chunk in file._chunks(size):
+                    hasher.update(chunk)
+                entry["digest"] = {
                     "algorithm": "sha-256",
-                    "value": await _digest(item.file, size),
+                    "value": b64url(hasher.digest()),
                 }
-        for item, _ in sorted(sent, key=lambda pair: pair[0].entry["size"]):
-            size = item.entry["size"]
-            if size and inline + size <= limit:
-                inline += size
-                item.entry["data"] = base64.b64encode(
-                    await item.file._read(size)
-                ).decode()
-            elif size:
-                self.owed[item.entry["id"]] = item
-        if self.owed and not isinstance(settings.get("upload"), Mapping):
+        budget = settings.get("maxInlineBytes")
+        budget = budget if isinstance(budget, int) else 0
+        for file, entry, _ in sorted(sent, key=lambda item: item[1]["size"]):
+            if 0 < entry["size"] <= budget:
+                budget -= entry["size"]
+                data = b"".join([chunk async for chunk in file._chunks(entry["size"])])
+                entry["data"] = base64.b64encode(data).decode()
+            elif entry["size"]:
+                self.owed[entry["id"]] = (file, entry)
+        if self.owed and not isinstance(settings.get("upload"), dict):
             raise self.fail("the server takes no file this large")
         return replaced
 
@@ -427,165 +348,118 @@ class Upload:
             raise OutcomeUnknownError(
                 f"{self.label}: the server asked for a second upload after the call was retried"
             )
-        if not self.owed:
-            raise self.fail("the server asked for an upload of no file")
         state = result.request_state
         if not isinstance(state, str):
             raise self.fail("the upload request has no requestState")
-        planned: list[tuple[dict[str, Any], _Sent]] = []
-        for number, raw in enumerate(result.uploads, 1):
+        uploads = result.uploads if isinstance(result.uploads, list) else []
+        targets: dict[str | None, UploadTarget] = {}
+        for number, raw in enumerate(uploads, 1):
             try:
-                target = check_target(raw, upload=True)
-                self.peer.check(target)
+                target = check_target(raw, UPLOAD)
+                self.check(target)
             except Rejected as error:
                 raise self.fail(
                     f"upload target {number} was rejected: {error}"
                 ) from None
-            item = self.owed.get(target["fileId"])
-            if item is None or any(
-                target["fileId"] == done["fileId"] for done, _ in planned
-            ):
-                raise self.fail("the upload request names a file it should not")
-            planned.append((target, item))
-        if len(planned) != len(self.owed):
-            raise self.fail("the upload request leaves out a file")
-        failures: list[str] = []
-        async with anyio.create_task_group() as group:
-            for target, item in planned:
-                group.start_soon(
-                    self._transfer, target, item, failures, group.cancel_scope
-                )
-        if failures:
-            raise self.fail(failures[0])
+            targets[target.get("fileId")] = target
+        if (
+            not self.owed
+            or len(uploads) != len(targets)
+            or targets.keys() != self.owed.keys()
+        ):
+            raise self.fail(
+                "the upload request does not list each file sent without data exactly once"
+            )
+        try:
+            # The first failure cancels the other transfers.
+            async with anyio.create_task_group() as group:
+                for target in targets.values():
+                    group.start_soon(self._transfer, target)
+        except* FileTransferError as failed:
+            raise failed.exceptions[0] from None
         self.uploaded = True
         return state
 
-    async def _transfer(
-        self,
-        target: dict[str, Any],
-        item: _Sent,
-        failures: list[str],
-        group: anyio.CancelScope,
-    ) -> None:
-        label = repr(_file_name(item.file.name))
+    async def _transfer(self, target: UploadTarget) -> None:
+        file, entry = self.owed[target.get("fileId", "")]
         method = target.get("method", "PUT")
-        attempts = _PUT_ATTEMPTS if method == "PUT" else 1
         reason = "it was not sent"
-        try:
-            for _ in range(attempts):
-                deadline = expires_at(target)
-                if deadline is not None and datetime.now(UTC) >= deadline:
-                    reason = "its target expired before the transfer started"
-                    break
-                try:
-                    status = await self._attempt(target, method, item)
-                except FileTransferError as error:
-                    reason = str(error)
-                    break
-                except (httpx2.HTTPError, OSError) as error:
-                    reason = f"the transfer failed ({type(error).__name__})"
-                    continue
-                if 200 <= status < 300:
-                    return
-                reason = f"the target answered HTTP {status}"
-                if status not in (408, 429) and status < 500:
-                    break
-        except Rejected as error:
-            reason = f"its target was rejected: {error}"
-        failures.append(f"the upload of {label} failed: {reason}")
-        group.cancel()
-
-    async def _attempt(
-        self, target: Mapping[str, Any], method: str, item: _Sent
-    ) -> int:
-        size: int = item.entry["size"]
-        headers = dict(target.get("headers", {}))
-        form = target.get("form")
-        if form is None:
-            body = item.file._chunks(size)
-            length = size
-        else:
-            boundary = os.urandom(16).hex().encode()
-            mime = item.entry["mimeType"]
-            head = b"".join(
-                b"--%s\r\n%s%s\r\n"
-                % (boundary, part.render_headers(), part.render_data())
-                for part in (DataField(f["name"], f["value"]) for f in form["fields"])
-            ) + b"--%s\r\n%s" % (
-                boundary,
-                FileField(
-                    form["fileField"],
-                    (
-                        _file_name(item.entry.get("name")),
-                        b"",
-                        mime if valid_media_type(mime) else "application/octet-stream",
-                    ),
-                ).render_headers(),
-            )
-            tail = b"\r\n--%s--\r\n" % boundary
-            body = _framed(head, item.file._chunks(size), tail)
-            length = len(head) + size + len(tail)
-            headers["Content-Type"] = (
-                f"multipart/form-data; boundary={boundary.decode()}"
-            )
-        headers["Content-Length"] = str(length)
-        async with self.peer.exchange(
-            target, method, headers, body, self.http
-        ) as response:
-            return response.status_code
+        # A failed PUT may be repeated; a POST may have been applied.
+        for _ in range(3 if method == "PUT" else 1):
+            deadline = expires_at(target)
+            if deadline is not None and datetime.now(UTC) >= deadline:
+                reason = "its target expired before the transfer started"
+                break
+            try:
+                async with self.exchange(
+                    target, method, *_body(target, file, entry)
+                ) as response:
+                    status = response.status_code
+            except (httpx2.HTTPError, OSError) as error:
+                reason = f"the transfer failed ({type(error).__name__})"
+                continue
+            except (FileTransferError, Rejected) as error:
+                reason = str(error)
+                break
+            if 200 <= status < 300:
+                return
+            reason = f"the target answered HTTP {status}"
+            if status < 500 and status not in (408, 429):
+                break
+        raise self.fail(f"the upload of {_file_name(file.name)!r} failed: {reason}")
 
 
-async def _framed(
-    head: bytes, chunks: AsyncIterator[bytes], tail: bytes
-) -> AsyncIterator[bytes]:
-    yield head
-    async for chunk in chunks:
-        yield chunk
-    yield tail
+def _body(
+    target: UploadTarget, file: File, entry: Mapping[str, Any]
+) -> tuple[dict[str, str], AsyncIterator[bytes]]:
+    """The headers and body of one transfer: the bytes, or a multipart form."""
+    size: int = entry["size"]
+    headers = dict(target.get("headers", {}))
+    head = tail = b""
+    if "form" in target:
+        form, boundary, mime = target["form"], secrets.token_hex(16), entry["mimeType"]
+        parts = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{field["name"]}"'
+            f"\r\n\r\n{field['value']}\r\n"
+            for field in form["fields"]
+        ]
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{form["fileField"]}";'
+            f' filename="{_file_name(entry.get("name")).translate(_QUOTE)}"\r\n'
+            f"Content-Type: {mime if MEDIA_TYPE.fullmatch(mime) else 'application/octet-stream'}"
+            "\r\n\r\n"
+        )
+        head, tail = "".join(parts).encode(), f"\r\n--{boundary}--\r\n".encode()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    headers["Content-Length"] = str(len(head) + size + len(tail))
 
+    async def content() -> AsyncIterator[bytes]:
+        yield head
+        async for chunk in file._chunks(size):
+            yield chunk
+        yield tail
 
-async def _digest(file: File, size: int) -> str:
-    hasher = hashlib.sha256()
-    async for chunk in file._chunks(size):
-        hasher.update(chunk)
-    return b64url(hasher.digest())
+    return headers, content()
 
 
 def holds_file(value: Any) -> bool:
-    if isinstance(value, File):
-        return True
     if isinstance(value, dict):
-        return any(holds_file(item) for item in value.values())
-    if isinstance(value, list | tuple):
-        return any(holds_file(item) for item in value)
-    return False
-
-
-async def _listed_schema(client: Client, name: str) -> Mapping[str, Any] | None:
-    cursor = None
-    while True:
-        page = await client.session.list_tools(
-            params=PaginatedRequestParams(cursor=cursor)
-        )
-        for tool in page.tools:
-            if tool.name == name:
-                return tool.input_schema
-        cursor = page.next_cursor
-        if cursor is None:
-            return None
+        value = list(value.values())
+    return isinstance(value, File) or (
+        isinstance(value, list | tuple) and any(map(holds_file, value))
+    )
 
 
 # Downloads.
 
-_peers: dict[int, Peer] = {}
+_calls: dict[int, Transfers] = {}
 
 
-def remember(result: CallToolResult, peer: Peer) -> None:
-    """Keep the MCP address a result came from, for its download targets."""
+def remember(result: CallToolResult, transfers: Transfers) -> None:
+    """Keep the call a result came from, for its download targets."""
     if EXTENSION in (result.meta or {}):
-        key = id(result)
-        _peers[key] = peer
-        weakref.finalize(result, _peers.pop, key, None)
+        _calls[id(result)] = transfers
+        weakref.finalize(result, _calls.pop, id(result), None)
 
 
 @dataclass(frozen=True)
@@ -605,8 +479,8 @@ class Download:
     size: int
     digest: str | None
     expires_at: datetime | None
-    _target: dict[str, Any] = field(repr=False)
-    _peer: Peer = field(repr=False)
+    _target: DownloadTarget = field(repr=False)
+    _call: Transfers = field(repr=False)
 
     async def read(self) -> bytes:
         """Fetch the file into memory.
@@ -614,13 +488,7 @@ class Download:
         Raises:
             FileTransferError: The fetch failed or the bytes failed a check.
         """
-        parts: list[bytes] = []
-
-        async def keep(chunk: bytes) -> None:
-            parts.append(chunk)
-
-        await self._fetch(keep)
-        return b"".join(parts)
+        return b"".join([chunk async for chunk in self._fetch()])
 
     async def save(
         self, directory: str | os.PathLike[str], *, overwrite: bool = False
@@ -645,54 +513,46 @@ class Download:
         )
         if not overwrite and destination.exists():
             raise FileExistsError(destination)
-        partial = destination.with_name(f".{destination.name}.{uuid4().hex}.part")
-        try:
-            async with await anyio.open_file(partial, "xb") as out:
-                await self._fetch(out.write)
-            if overwrite:
-                os.replace(partial, destination)
-            else:
-                os.link(partial, destination)
-        finally:
-            partial.unlink(missing_ok=True)
+        async with (
+            writing(destination, overwrite) as partial,
+            await anyio.open_file(partial, "xb") as out,
+            aclosing(self._fetch()) as chunks,
+        ):
+            async for chunk in chunks:
+                await out.write(chunk)
         return destination
 
-    async def _fetch(self, sink: Callable[[bytes], Awaitable[object]]) -> None:
-        label = repr(_file_name(self.name))
+    async def _fetch(self) -> AsyncGenerator[bytes]:
+        """Yield the file's bytes, then fail if they fail a check."""
+        label = f"the download of {_file_name(self.name)!r}"
         if self.expires_at is not None and datetime.now(UTC) >= self.expires_at:
-            raise FileTransferError(f"the download of {label} expired")
+            raise FileTransferError(f"{label} expired")
         hasher = hashlib.sha256()
         received = 0
         try:
-            async with self._peer.exchange(
+            async with self._call.exchange(
                 self._target, "GET", dict(self._target.get("headers", {}))
             ) as response:
                 if response.status_code != 200:
                     raise FileTransferError(
-                        f"the download of {label} failed: HTTP {response.status_code}"
+                        f"{label} failed: HTTP {response.status_code}"
                     )
                 async for chunk in response.aiter_bytes():
                     received += len(chunk)
                     if received > self.size:
-                        raise FileTransferError(
-                            f"the download of {label} is larger than declared"
-                        )
+                        raise FileTransferError(f"{label} is larger than declared")
                     hasher.update(chunk)
-                    await sink(chunk)
+                    yield chunk
         except Rejected as error:
-            raise FileTransferError(
-                f"the download of {label} was rejected: {error}"
-            ) from None
+            raise FileTransferError(f"{label} was rejected: {error}") from None
         except (httpx2.HTTPError, OSError) as error:
             raise FileTransferError(
-                f"the download of {label} failed ({type(error).__name__})"
+                f"{label} failed ({type(error).__name__})"
             ) from None
         if received != self.size:
-            raise FileTransferError(f"the download of {label} is smaller than declared")
+            raise FileTransferError(f"{label} is smaller than declared")
         if self.digest is not None and b64url(hasher.digest()) != self.digest:
-            raise FileTransferError(
-                f"the download of {label} does not match its digest"
-            )
+            raise FileTransferError(f"{label} does not match its digest")
 
 
 def downloads(result: CallToolResult) -> list[Download]:
@@ -709,26 +569,26 @@ def downloads(result: CallToolResult) -> list[Download]:
         listed = list(meta["downloads"])
     except (TypeError, KeyError):
         raise ValueError("the result's file metadata is malformed") from None
-    peer = _peers.get(id(result))
-    if peer is None:
+    call = _calls.get(id(result))
+    if call is None:
         raise ValueError("the result did not come from a holon client")
     found = []
     for number, raw in enumerate(listed, 1):
         try:
-            target = check_target(raw, upload=False)
-            peer.check(target)
-            deadline = expires_at(target)
+            target = check_target(raw, DOWNLOAD)
+            call.check(target)
         except Rejected as error:
             raise ValueError(f"download {number} was rejected: {error}") from None
+        digest = target["digest"]["value"] if "digest" in target else None
         found.append(
             Download(
-                name=target.get("name"),
-                mime_type=target["mimeType"],
-                size=target["size"],
-                digest=target["digest"]["value"] if "digest" in target else None,
-                expires_at=deadline,
-                _target=target,
-                _peer=peer,
+                target.get("name"),
+                target["mimeType"],
+                target["size"],
+                digest,
+                expires_at(target),
+                target,
+                call,
             )
         )
     return found

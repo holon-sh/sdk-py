@@ -4,16 +4,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from functools import partial
 from types import SimpleNamespace
-from typing import (
-    Annotated,
-    Any,
-    Generic,
-    Literal,
-    Protocol,
-    TypeAlias,
-    TypedDict,
-    TypeVar,
-)
+from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
 
 import httpx2
 import jsonschema
@@ -34,19 +25,17 @@ from mcp.types import (
     RequestParamsMeta,
     TextContent,
 )
-from pydantic import Discriminator, Tag, TypeAdapter
 from referencing import Registry
 
 from holon.binding import Binding
 from holon.files._client import (
     FILES,
     OutcomeUnknownError,
-    Peer,
-    Upload,
+    Transfers,
     holds_file,
     remember,
 )
-from holon.files._wire import UploadRequiredResult
+from holon.files._wire import CALL_RESULT, UploadRequiredResult
 
 __all__ = [
     "Apps",
@@ -81,22 +70,6 @@ class ErrorResult(Protocol):
 
 
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
-
-
-def _result_arm(value: object) -> str:
-    tag = value.get("resultType") if isinstance(value, dict) else None
-    return "upload_required" if tag == "upload_required" else "core"
-
-
-_result: TypeAdapter[CallToolResult | InputRequiredResult | UploadRequiredResult] = (
-    TypeAdapter(
-        Annotated[
-            Annotated[CallToolResult | InputRequiredResult, Tag("core")]
-            | Annotated[UploadRequiredResult, Tag("upload_required")],
-            Discriminator(_result_arm),
-        ]
-    )
-)
 
 
 class CallOptions(TypedDict, total=False):
@@ -150,7 +123,7 @@ async def _send(
     name: str,
     arguments: dict[str, Any],
     options: CallOptions,
-    upload: Upload,
+    transfers: Transfers,
 ) -> CallToolResult | InputRequiredResult:
     elicit = options.get("elicit")
     responses, state = options.get("input_responses"), options.get("request_state")
@@ -167,19 +140,19 @@ async def _send(
                         _meta=options.get("meta"),
                     )
                 ),
-                _result,
+                CALL_RESULT,
                 request_read_timeout_seconds=options.get("timeout"),
             )
         except Exception as error:
             # Once files were sent, a retry that fails may still have run the tool.
-            if upload.uploaded:
+            if transfers.uploaded:
                 raise OutcomeUnknownError(
-                    f"{upload.label}: the outcome is unknown; the call failed after its files were sent"
+                    f"{transfers.label}: the outcome is unknown; the call failed after its files were sent"
                 ) from error
             raise
         if isinstance(result, UploadRequiredResult):
             # The retry carries the earlier answers inside requestState.
-            responses, state = None, await upload.send(result)
+            responses, state = None, await transfers.send(result)
             continue
         if not (elicit and answered < 10 and isinstance(result, InputRequiredResult)):
             return result
@@ -282,10 +255,14 @@ class _App:
             }
         failure: Exception | None = None
         http_factory = binding.get("http_client", http_client)
-        peer = Peer.of(binding["endpoint"], http_factory, binding.get("file_origins"))
         async with http_factory() as http:
-            peer.watch(http)
-            upload = Upload(f"{self._name}.{name}", peer, http)
+            transfers = Transfers(
+                f"{self._name}.{name}",
+                binding["endpoint"],
+                http_factory,
+                binding.get("file_origins"),
+                http,
+            )
             transport = streamable_http_client(binding["endpoint"], http_client=http)
             async with Client(
                 transport,
@@ -299,16 +276,16 @@ class _App:
                 try:
                     if holds_file(arguments):
                         schema = definition.get("inputSchema") if definition else None
-                        arguments = await upload.prepare(
+                        arguments = await transfers.prepare(
                             client, name, schema, arguments
                         )
-                    result = await _send(client, name, arguments, options, upload)
+                    result = await _send(client, name, arguments, options, transfers)
                 except Exception as error:  # noqa: BLE001
                     failure = error
         if failure is not None:
             raise failure
         if isinstance(result, CallToolResult):
-            remember(result, peer)
+            remember(result, transfers)
         if (
             definition is not None
             and isinstance(result, CallToolResult)

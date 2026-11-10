@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import atexit
 import base64
-import binascii
 import contextvars
 import hashlib
 import json
-import mimetypes
 import os
 import secrets
 import shutil
@@ -16,9 +14,8 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import quote
 
 import anyio
@@ -36,11 +33,11 @@ from mcp.types import (
     BlobResourceContents,
     CallToolResult,
     ClientCapabilities,
-    ContentBlock,
     EmbeddedResource,
     MissingRequiredClientCapabilityErrorData,
     TextContent,
 )
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, Response
 from starlette.routing import Route, Router
@@ -51,10 +48,11 @@ from holon.files._wire import (
     UploadTarget,
     b64url,
     declared,
-    descriptor,
     digest_required,
+    media_type,
     sha256,
     walk_files,
+    writing,
 )
 
 _STATE = "files."
@@ -93,8 +91,7 @@ class ReceivedFile:
             FileExistsError: ``destination`` exists and ``overwrite`` is False.
         """
         target = Path(destination)
-        partial = target.with_name(f".{target.name}.{secrets.token_hex(8)}.part")
-        try:
+        async with writing(target, overwrite) as partial:
             if self._path is None:
                 await anyio.Path(partial).write_bytes(self._data)
             else:
@@ -102,12 +99,6 @@ class ReceivedFile:
                     os.link(self._path, partial)
                 except OSError:
                     await anyio.to_thread.run_sync(shutil.copyfile, self._path, partial)
-            if overwrite:
-                os.replace(partial, target)
-            else:
-                os.link(partial, target)
-        finally:
-            partial.unlink(missing_ok=True)
         return target
 
 
@@ -142,13 +133,32 @@ class Storage(Protocol):
         ...
 
 
-_received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
-    contextvars.ContextVar("holon_files_received", default=None)
-)
+class _Digest(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    algorithm: Literal["sha-256"]
+    value: str
+
+
+class _FileInput(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    id: Annotated[str, Field(min_length=1, max_length=128)]
+    name: str | None = None
+    mimeType: str
+    size: Annotated[int, Field(ge=0)]
+    digest: _Digest | None = None
+    # null is undecodable inline data, so it fails here.
+    data: str = ""
 
 
 class _Refused(Exception):
     """A file argument fails a check; the tool does not run."""
+
+
+_received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
+    contextvars.ContextVar("holon_files_received", default=None)
+)
 
 
 class FileServer:
@@ -202,9 +212,10 @@ class FileServer:
         Raises:
             LookupError: The argument is not a file of this call.
         """
-        files = _received.get() or {}
         file_id = file_input.get("id")
-        found = files.get(file_id) if isinstance(file_id, str) else None
+        found = (
+            (_received.get() or {}).get(file_id) if isinstance(file_id, str) else None
+        )
         if found is None:
             raise LookupError("not a file argument of this call")
         return found
@@ -228,12 +239,8 @@ class FileServer:
         """
         if name is None and not isinstance(source, bytes):
             name = Path(source).name
-        mime_type = (
-            mime_type
-            or (name and mimetypes.guess_type(name)[0])
-            or "application/octet-stream"
-        )
-        content: list[ContentBlock] = [TextContent(type="text", text=text)]
+        mime_type = media_type(name, mime_type)
+        said = TextContent(type="text", text=text)
         if "download" in (declared(ctx.session.client_capabilities) or {}):
             target = await self._storage.publish(
                 source if isinstance(source, bytes) else Path(source),
@@ -242,135 +249,118 @@ class FileServer:
                 time.time() + self._ttl,
             )
             return CallToolResult(
-                content=content, _meta={EXTENSION: {"downloads": [target]}}
+                content=[said], _meta={EXTENSION: {"downloads": [target]}}
             )
-        data = (
-            source
-            if isinstance(source, bytes)
-            else await anyio.Path(source).read_bytes()
-        )
+        if not isinstance(source, bytes):
+            source = await anyio.Path(source).read_bytes()
         resource = BlobResourceContents(
             uri=f"file:///{quote(name or 'file')}",
             mime_type=mime_type,
-            blob=base64.b64encode(data).decode(),
+            blob=base64.b64encode(source).decode(),
         )
         return CallToolResult(
-            content=[*content, EmbeddedResource(type="resource", resource=resource)]
+            content=[said, EmbeddedResource(type="resource", resource=resource)]
         )
 
     async def __call__(
         self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
     ) -> HandlerResult:
+        settings = declared(ctx.session.client_capabilities)
         if ctx.method == "tools/list":
-            return self._hide_file_tools(ctx, await call_next(ctx))
-        params = ctx.params
-        if ctx.method != "tools/call" or params is None:
-            return await call_next(ctx)
+            result = await call_next(ctx)
+            # Clients without the extension cannot fill a file argument.
+            if settings is None and isinstance(result, dict):
+                tools = [t for t in result["tools"] if not _has_file(t["inputSchema"])]
+                result = {**result, "tools": tools}
+            return result
+        params = ctx.params or {}
         name, arguments = params.get("name"), params.get("arguments")
-        definition = self._tools(name) if isinstance(name, str) else None
-        schema = definition.get("inputSchema") if definition else None
-        if not (isinstance(arguments, dict) and isinstance(schema, Mapping)):
+        if not (
+            ctx.method == "tools/call"
+            and isinstance(name, str)
+            and isinstance(arguments, dict)
+        ):
             return await call_next(ctx)
+        definition = self._tools(name) or {}
         found: list[tuple[Any, Mapping[str, Any]]] = []
 
         def collect(value: Any, marked: Mapping[str, Any]) -> Any:
+            # Anything but an object is another branch's value, such as null.
+            if not isinstance(value, dict):
+                return None
             found.append((value, marked))
             return value
 
-        walk_files(schema, arguments, collect)
+        if isinstance(schema := definition.get("inputSchema"), Mapping):
+            walk_files(schema, arguments, collect)
         if not found:
             return await call_next(ctx)
-        assert definition is not None and isinstance(name, str)
         state = params.get("requestState")
+        record = None
         if isinstance(state, str) and state.startswith(_STATE):
-            return await self._retry(
-                ctx, call_next, name, arguments, definition, found, state
-            )
+            # Retry steps 1 and 2: the state verifies and binds this call.
+            try:
+                record = json.loads(self._codec.unseal(state[len(_STATE) :]))
+                valid = time.time() < record["e"] and record["b"] == self._binding(
+                    ctx, name, arguments
+                )
+            except (InvalidRequestState, ValueError, KeyError, TypeError):
+                valid = False
+            if not valid:
+                raise _invalid_state()
         try:
             received, owed = _inspect(found, self._max_inline_bytes)
         except _Refused as refusal:
             return _error(str(refusal))
-        if not owed:
+        if record is None and not owed:
             return await self._run(ctx, call_next, received)
-        if "upload" not in (declared(ctx.session.client_capabilities) or {}):
-            required = ClientCapabilities(extensions={EXTENSION: {"upload": {}}})
-            raise MCPError(
-                code=MISSING_REQUIRED_CLIENT_CAPABILITY,
-                message="This file must be uploaded, and the request did not declare upload.",
-                data=MissingRequiredClientCapabilityErrorData(
+        if record is None:
+            if "upload" not in (settings or {}):
+                required = ClientCapabilities(extensions={EXTENSION: {"upload": {}}})
+                data = MissingRequiredClientCapabilityErrorData(
                     required_capabilities=required
-                ).model_dump(by_alias=True, mode="json", exclude_none=True),
+                )
+                raise MCPError(
+                    code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+                    message="This file must be uploaded; the request did not declare upload.",
+                    data=data.model_dump(by_alias=True, mode="json", exclude_none=True),
+                )
+            record = {
+                "b": self._binding(ctx, name, arguments),
+                "e": time.time() + self._ttl,
+                "f": {},
+            }
+            uploads = []
+            for file, _ in owed:
+                record["f"][file.id] = key = secrets.token_hex(16)
+                target = await self._storage.issue(
+                    key, file.size, file.mimeType, record["e"]
+                )
+                uploads.append({**target, "fileId": file.id})
+            return {
+                "resultType": "upload_required",
+                "uploads": uploads,
+                "requestState": self._seal(record, None),
+            }
+        for file, digest in owed:  # Step 3: confirm the bytes.
+            key = record["f"].get(file.id)
+            path = key and await self._storage.confirm(key, file.size, digest)
+            if not path:
+                return _error(
+                    f"The bytes of file {file.name or file.id!r} did not arrive intact."
+                )
+            received[file.id] = ReceivedFile(
+                file.name, file.mimeType, file.size, digest, path
             )
-        now = time.time()
-        record: dict[str, Any] = {
-            "t": name,
-            "a": _arguments_digest(arguments),
-            "p": self._principal_digest(ctx),
-            "e": now + self._ttl,
-            "f": {},
-        }
-        uploads = []
-        for file_input in owed:
-            key = secrets.token_hex(16)
-            digest = (
-                file_input["digest"]["value"] if file_input.get("_verify") else None
-            )
-            record["f"][file_input["id"]] = [
-                key,
-                file_input["size"],
-                file_input["mimeType"],
-                digest,
-                file_input.get("name"),
-            ]
-            target = await self._storage.issue(
-                key, file_input["size"], file_input["mimeType"], record["e"]
-            )
-            uploads.append({**target, "fileId": file_input["id"]})
-        return {
-            "resultType": "upload_required",
-            "uploads": uploads,
-            "requestState": self._seal(record, None),
-        }
-
-    async def _retry(
-        self,
-        ctx: ServerRequestContext[Any, Any],
-        call_next: CallNext,
-        name: str,
-        arguments: dict[str, Any],
-        definition: Mapping[str, Any],
-        found: list[tuple[Any, Mapping[str, Any]]],
-        state: str,
-    ) -> HandlerResult:
-        record = self._unseal(state)
-        if (
-            record["t"] != name
-            or record["a"] != _arguments_digest(arguments)
-            or record["p"] != self._principal_digest(ctx)
+        annotations = definition.get("annotations") or {}
+        if annotations.get("idempotentHint") is not True and not (
+            await self._storage.consume(record["n"], record["e"])
         ):
-            raise _invalid_state()
-        try:
-            received, _ = _inspect(found, self._max_inline_bytes)
-        except _Refused as refusal:
-            return _error(str(refusal))
-        for file_id, (key, size, mime_type, digest, file_name) in record["f"].items():
-            path = await self._storage.confirm(key, size, digest)
-            if path is None:
-                return _error(f"The bytes of file {file_id!r} did not arrive intact.")
-            received[file_id] = ReceivedFile(file_name, mime_type, size, digest, path)
-        annotations = definition.get("annotations")
-        idempotent = (
-            isinstance(annotations, Mapping)
-            and annotations.get("idempotentHint") is True
-        )
-        if not idempotent and not await self._storage.consume(record["n"], record["e"]):
-            raise _invalid_state()
-        params = dict(ctx.params or {})
-        if record["i"] is None:
-            del params["requestState"]
-        else:
-            params["requestState"] = record["i"]
-        result = await self._run(replace(ctx, params=params), call_next, received)
+            raise _invalid_state()  # Step 4: another retry used this state.
+        inner = {key: value for key, value in params.items() if key != "requestState"}
+        if record["i"] is not None:
+            inner["requestState"] = record["i"]
+        result = await self._run(replace(ctx, params=inner), call_next, received)
         if isinstance(result, dict) and result.get("resultType") == "input_required":
             # Later rounds keep the files bound; the inner state rides inside ours.
             return {
@@ -391,57 +381,23 @@ class FileServer:
         finally:
             _received.reset(token)
 
+    def _binding(
+        self, ctx: ServerRequestContext[Any, Any], name: str, arguments: Any
+    ) -> str:
+        """The tool, its arguments as a JSON Schema instance, and the principal."""
+        bound = [name, _canonical(arguments), self._principal(ctx)]
+        return sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode())
+
     def _seal(self, record: dict[str, Any], inner: object) -> str:
         # A fresh nonce per result: each requestState is accepted at most once.
         sealed = {**record, "n": secrets.token_hex(16), "i": inner}
         return _STATE + self._codec.seal(json.dumps(sealed).encode())
 
-    def _unseal(self, state: str) -> dict[str, Any]:
-        try:
-            record = json.loads(self._codec.unseal(state[len(_STATE) :]))
-        except (InvalidRequestState, ValueError):
-            raise _invalid_state() from None
-        if not (
-            isinstance(record, dict)
-            and isinstance(record.get("e"), float)
-            and time.time() < record["e"]
-        ):
-            raise _invalid_state()
-        return record
-
-    def _principal_digest(self, ctx: ServerRequestContext[Any, Any]) -> str | None:
-        principal = self._principal(ctx)
-        return (
-            None
-            if principal is None
-            else sha256(principal.encode("utf-8", "surrogatepass"))
-        )
-
-    def _hide_file_tools(
-        self, ctx: ServerRequestContext[Any, Any], result: HandlerResult
-    ) -> HandlerResult:
-        # Clients without the extension cannot fill a file argument.
-        if declared(ctx.session.client_capabilities) is not None or not isinstance(
-            result, dict
-        ):
-            return result
-        tools = result.get("tools")
-        if not isinstance(tools, list):
-            return result
-        return {
-            **result,
-            "tools": [tool for tool in tools if not _has_file(tool.get("inputSchema"))],
-        }
-
 
 def _has_file(schema: object) -> bool:
     if isinstance(schema, dict):
-        return "x-mcp-file" in schema or any(
-            _has_file(value) for value in schema.values()
-        )
-    if isinstance(schema, list):
-        return any(_has_file(value) for value in schema)
-    return False
+        return "x-mcp-file" in schema or _has_file(list(schema.values()))
+    return isinstance(schema, list) and any(map(_has_file, schema))
 
 
 def _invalid_state() -> MCPError:
@@ -454,162 +410,96 @@ def _error(message: str) -> CallToolResult:
     )
 
 
-def _arguments_digest(arguments: Any) -> str:
-    """Hash arguments so equal JSON Schema instances hash alike."""
-
-    def canonical(value: Any) -> Any:
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
-        if isinstance(value, list):
-            return [canonical(item) for item in value]
-        if isinstance(value, dict):
-            return {key: canonical(item) for key, item in value.items()}
-        return value
-
-    return sha256(
-        json.dumps(canonical(arguments), sort_keys=True, separators=(",", ":")).encode()
-    )
+def _canonical(value: Any) -> Any:
+    """Equal JSON Schema instances serialize alike: 1.0 is 1."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_canonical(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _canonical(item) for key, item in value.items()}
+    return value
 
 
 def _inspect(
     found: list[tuple[Any, Mapping[str, Any]]], max_inline_bytes: int
-) -> tuple[dict[str, ReceivedFile], list[dict[str, Any]]]:
-    """Check file metadata and inline bytes; return the received files and those owed."""
+) -> tuple[dict[str, ReceivedFile], list[tuple[_FileInput, str | None]]]:
+    """Check file metadata and inline bytes.
+
+    Returns the files received inline, and those owed with the digest to verify.
+    """
     received: dict[str, ReceivedFile] = {}
-    owed: list[dict[str, Any]] = []
+    owed: list[tuple[_FileInput, str | None]] = []
     seen: set[str] = set()
     inline = 0
     for value, marked in found:
-        file_input = _file_input(value)
-        file_id, size, mime_type = (
-            file_input["id"],
-            file_input["size"],
-            file_input["mimeType"],
-        )
-        label = repr(file_input.get("name") or file_id)
-        if file_id in seen:
-            raise _Refused(f"Two file arguments share the id {file_id!r}.")
-        seen.add(file_id)
-        rules = descriptor(marked)
-        max_size = rules.get("maxSize")
-        if isinstance(max_size, int) and size > max_size:
+        try:
+            file = _FileInput.model_validate(value)
+        except ValidationError:
+            raise _Refused("A file argument is not a valid FileInput.") from None
+        label = repr(file.name or file.id)
+        rules = marked["x-mcp-file"]
+        if file.id in seen:
+            raise _Refused(f"Two file arguments share the id {file.id!r}.")
+        seen.add(file.id)
+        max_size, accept = rules.get("maxSize"), rules.get("accept")
+        if isinstance(max_size, int) and file.size > max_size:
             raise _Refused(
                 f"File {label} is larger than this tool accepts ({max_size} bytes)."
             )
-        accept = rules.get("accept")
-        if isinstance(accept, list) and not _accepted(
-            accept, mime_type, file_input.get("name")
-        ):
+        if isinstance(accept, list) and not _accepted(accept, file.mimeType, file.name):
             raise _Refused(f"This tool does not accept the type of file {label}.")
         verify = digest_required(marked)
-        if verify and "digest" not in file_input:
+        digest = file.digest.value if verify and file.digest else None
+        if verify and digest is None:
             raise _Refused(f"File {label} needs a SHA-256 digest.")
-        if "data" in file_input or size == 0:
-            data = file_input.get("data", "")
-            try:
-                raw = (
-                    base64.b64decode(data, validate=True)
-                    if isinstance(data, str)
-                    else None
-                )
-            except binascii.Error:
-                raw = None
-            if raw is None or len(raw) != size:
-                raise _Refused(
-                    f"The inline data of file {label} is invalid or does not match its size."
-                )
-            if verify and sha256(raw) != file_input["digest"]["value"]:
-                raise _Refused(f"File {label} does not match its digest.")
-            inline += size
-            received[file_id] = ReceivedFile(
-                file_input.get("name"),
-                mime_type,
-                size,
-                sha256(raw) if verify else None,
-                None,
-                raw,
+        if file.size and "data" not in file.model_fields_set:
+            owed.append((file, digest))
+            continue
+        try:
+            raw = base64.b64decode(file.data, validate=True)
+        except ValueError:
+            raw = None
+        if raw is None or len(raw) != file.size:
+            raise _Refused(
+                f"The inline data of file {label} is invalid or does not match its size."
             )
-        else:
-            owed.append({**file_input, "_verify": verify})
+        if digest is not None and sha256(raw) != digest:
+            raise _Refused(f"File {label} does not match its digest.")
+        inline += file.size
+        received[file.id] = ReceivedFile(
+            file.name, file.mimeType, file.size, digest, None, raw
+        )
     if inline > max_inline_bytes:
         raise _Refused("The inline file data is larger than this server accepts.")
     return received, owed
 
 
-def _file_input(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise _Refused("A file argument is not an object.")
-    file_id, size = value.get("id"), value.get("size")
-    digest = value.get("digest")
-    if not (
-        isinstance(file_id, str)
-        and 1 <= len(file_id) <= 128
-        and isinstance(value.get("mimeType"), str)
-        and isinstance(size, int)
-        and not isinstance(size, bool)
-        and size >= 0
-        and isinstance(value.get("name", ""), str)
-        and (
-            digest is None
-            or (
-                isinstance(digest, dict)
-                and digest.get("algorithm") == "sha-256"
-                and isinstance(digest.get("value"), str)
-            )
-        )
-    ):
-        raise _Refused("A file argument is not a valid FileInput.")
-    return {
-        key: item
-        for key, item in value.items()
-        if not (key == "digest" and item is None)
-    }
-
-
-def _accepted(accept: list[Any], mime_type: str, name: object) -> bool:
+def _accepted(accept: list[Any], mime_type: str, name: str | None) -> bool:
     media = mime_type.split(";")[0].strip().lower()
-    for entry in accept:
-        if not isinstance(entry, str):
-            continue
-        entry = entry.strip().lower()
-        if entry.startswith("."):
-            if isinstance(name, str) and name.lower().endswith(entry):
-                return True
-        elif entry == media or (entry.endswith("/*") and media.startswith(entry[:-1])):
-            return True
-    return False
-
-
-def _rfc3339(when: float) -> str:
-    return (
-        datetime.fromtimestamp(when, UTC)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+    return any(
+        (name or "").lower().endswith(entry)
+        if entry.startswith(".")
+        else entry == media or (entry.endswith("/*") and media.startswith(entry[:-1]))
+        for entry in (item.strip().lower() for item in accept if isinstance(item, str))
     )
 
 
-@dataclass
-class _Slot:
-    key: str
-    size: int
-    start_by: float
-    busy: bool = False
+def _rfc3339(when: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
 
 
-@dataclass
-class _Published:
-    path: Path
-    name: str | None
-    mime_type: str
-    expires_at: float
+def _hash_file(path: Path) -> str:
+    with path.open("rb") as source:
+        return b64url(hashlib.file_digest(source, "sha256").digest())
 
 
 class LocalStorage:
     """``Storage`` on a local directory, for one server process.
 
     Mount ``app`` at ``{MCP address}{path}``. Its targets are ``path`` targets
-    authorized by an unguessable token alone. Tokens, one-write records and
-    consumed nonces live in this process, and files left by a restart are not
+    authorized by a token alone, sealed with a key this process holds.
+    Consumed nonces live in this process, and files left by a restart are not
     cleaned up.
 
     Args:
@@ -623,9 +513,8 @@ class LocalStorage:
     ) -> None:
         self._root = None if root is None else Path(root)
         self._path = path.rstrip("/")
-        self._slots: dict[str, _Slot] = {}
-        self._staged: dict[str, float] = {}
-        self._published: dict[str, _Published] = {}
+        self._codec = AESGCMRequestStateCodec([os.urandom(32)])
+        self._files: dict[Path, float] = {}  # removed once their time is up
         self._nonces: dict[str, float] = {}
         self.app = Router(
             routes=[
@@ -641,11 +530,8 @@ class LocalStorage:
         now = time.time()
         # Half the lifetime to start the transfer leaves the rest for it and the retry.
         start_by = now + (expires_at - now) / 2
-        token = secrets.token_urlsafe(32)
-        self._slots[token] = _Slot(key, size, start_by)
-        self._staged[key] = expires_at
         return {
-            "path": f"{self._path}/u/{token}",
+            "path": f"{self._path}/u/{self._seal('u', start_by, key, size, expires_at)}",
             "method": "PUT",
             "credentials": "omit",
             "expiresAt": _rfc3339(start_by),
@@ -653,11 +539,10 @@ class LocalStorage:
 
     async def confirm(self, key: str, size: int, digest: str | None) -> Path | None:
         path = self._dir("u") / key
-        if key not in self._staged or not path.is_file() or path.stat().st_size != size:
+        if not path.is_file() or path.stat().st_size != size:
             return None
-        if (
-            digest is not None
-            and await anyio.to_thread.run_sync(_hash_file, path) != digest
+        if digest is not None and digest != await anyio.to_thread.run_sync(
+            _hash_file, path
         ):
             return None
         return path
@@ -673,13 +558,13 @@ class LocalStorage:
         self, source: Path | bytes, name: str | None, mime_type: str, expires_at: float
     ) -> DownloadTarget:
         self._sweep()
-        token = secrets.token_urlsafe(32)
-        path = self._dir("d") / token
+        path = self._dir("d") / secrets.token_hex(16)
         if isinstance(source, bytes):
             await anyio.Path(path).write_bytes(source)
         else:
             await anyio.to_thread.run_sync(shutil.copyfile, source, path)
-        self._published[token] = _Published(path, name, mime_type, expires_at)
+        self._files[path] = expires_at
+        token = self._seal("d", expires_at, path.name, name, mime_type)
         target: DownloadTarget = {
             "mimeType": mime_type,
             "size": path.stat().st_size,
@@ -707,64 +592,55 @@ class LocalStorage:
 
     def _sweep(self) -> None:
         now = time.time()
-        self._slots = {
-            token: slot for token, slot in self._slots.items() if slot.start_by > now
-        }
-        for key in [key for key, until in self._staged.items() if until <= now]:
-            del self._staged[key]
-            (self._dir("u") / key).unlink(missing_ok=True)
-        for token in [
-            token for token, item in self._published.items() if item.expires_at <= now
-        ]:
-            self._published.pop(token).path.unlink(missing_ok=True)
-        self._nonces = {
-            nonce: until for nonce, until in self._nonces.items() if until > now
-        }
+        for path in [path for path, until in self._files.items() if until <= now]:
+            del self._files[path]
+            path.unlink(missing_ok=True)
+        self._nonces = {n: until for n, until in self._nonces.items() if until > now}
+
+    def _seal(self, kind: str, until: float, *claims: object) -> str:
+        return self._codec.seal(json.dumps([kind, until, *claims]).encode())
+
+    def _unseal(self, request: Request, kind: str) -> list[Any] | None:
+        """The claims of a token for ``kind`` that is still valid."""
+        try:
+            claims = json.loads(self._codec.unseal(request.path_params["token"]))
+        except (InvalidRequestState, ValueError):
+            return None
+        if claims[0] != kind or claims[1] <= time.time():
+            return None
+        return list(claims[2:])
 
     async def _put(self, request: Request) -> Response:
-        slot = self._slots.get(request.path_params["token"])
-        if slot is None or slot.start_by <= time.time() or slot.key not in self._staged:
+        claims = self._unseal(request, "u")
+        if claims is None:
             return Response(status_code=404)
-        if slot.busy:
+        key, size, keep_until = claims
+        staged = self._dir("u") / key
+        if staged.exists():  # One write: the target is spent.
             return Response(status_code=409)
-        length = request.headers.get("content-length", "")
-        if not length.isdigit() or int(length) != slot.size:
-            return Response(status_code=400)
-        slot.busy = True
-        staged = self._dir("u") / slot.key
-        partial = staged.with_name(f"{slot.key}.part")
+        written = 0
         try:
-            written = 0
-            async with await anyio.open_file(partial, "xb") as out:
+            if request.headers.get("content-length") != str(size):
+                raise ValueError("not the declared size")
+            async with (
+                writing(staged, overwrite=False) as partial,
+                await anyio.open_file(partial, "xb") as out,
+            ):
                 async for chunk in request.stream():
                     written += len(chunk)
-                    if written > slot.size:
-                        return Response(status_code=413)
+                    if written > size:
+                        raise ValueError("more than the declared size")
                     await out.write(chunk)
-            if written != slot.size:
-                return Response(status_code=400)
-            os.link(partial, staged)
-        except FileExistsError:
-            return Response(status_code=409)
-        except ClientDisconnect:
+                if written != size:
+                    raise ValueError("less than the declared size")
+        except (ValueError, OSError, ClientDisconnect):
             return Response(status_code=400)
-        finally:
-            slot.busy = False
-            partial.unlink(missing_ok=True)
-        # One write: the target is spent.
-        self._slots.pop(request.path_params["token"], None)
+        self._files[staged] = keep_until
         return Response(status_code=201)
 
     async def _get(self, request: Request) -> Response:
-        item = self._published.get(request.path_params["token"])
-        if item is None or item.expires_at <= time.time():
+        claims = self._unseal(request, "d")
+        if claims is None:
             return Response(status_code=404)
-        return FileResponse(item.path, media_type=item.mime_type, filename=item.name)
-
-
-def _hash_file(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1 << 16):
-            hasher.update(chunk)
-    return b64url(hasher.digest())
+        file, name, mime_type = claims
+        return FileResponse(self._dir("d") / file, media_type=mime_type, filename=name)

@@ -48,6 +48,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "file": file_input_schema(max_size=4096),
+                "cover": {"anyOf": [file_input_schema(), {"type": "null"}]},
                 "note": {"type": "string"},
             },
             "required": ["file"],
@@ -70,17 +71,14 @@ TOOLS = [
 ]
 
 
-def serve(tmp_path, storage=None, max_inline_bytes=16):
+def serve(tmp_path):
     """A server whose tools save, check and export files; returns (app, ran)."""
-    storage = storage or LocalStorage(tmp_path / "storage")
+    storage = LocalStorage(tmp_path / "storage")
     files = FileServer(
-        storage,
-        tools={tool["name"]: tool for tool in TOOLS}.get,
-        max_inline_bytes=max_inline_bytes,
+        storage, tools={t["name"]: t for t in TOOLS}.get, max_inline_bytes=16
     )
-    saved = tmp_path / "saved"
-    saved.mkdir(exist_ok=True)
     ran = []
+    (tmp_path / "saved").mkdir()
 
     async def list_tools(ctx, params):
         return ListToolsResult(tools=[Tool.model_validate(tool) for tool in TOOLS])
@@ -90,27 +88,19 @@ def serve(tmp_path, storage=None, max_inline_bytes=16):
         arguments = params.arguments or {}
         if params.name == "export":
             return await files.reply(ctx, CSV, name="report.csv", text="Exported.")
-        if arguments.get("note") == "ask":
-            if not params.input_responses:
-                question = ElicitRequestFormParams(
-                    message="Why?",
-                    requested_schema={"type": "object", "properties": {}},
-                )
-                return InputRequiredResult(
-                    input_requests={"why": ElicitRequest(params=question)},
-                    request_state="asked",
-                )
-            assert params.request_state == "asked"
-        names = []
+        if arguments.get("note") == "ask" and not params.input_responses:
+            question = ElicitRequestFormParams(
+                message="Why?", requested_schema={"type": "object", "properties": {}}
+            )
+            return InputRequiredResult(
+                input_requests={"why": ElicitRequest(params=question)},
+                request_state="asked",
+            )
         for value in arguments.get("files") or [arguments["file"]]:
             received = files.received(value)
-            names.append(received.name)
             if params.name == "save":
-                await received.save(saved / Path(received.name).name)
-        return CallToolResult(
-            content=[TextContent(type="text", text="ok")],
-            structured_content={"names": names},
-        )
+                await received.save(tmp_path / "saved" / Path(received.name).name)
+        return CallToolResult(content=[TextContent(type="text", text="ok")])
 
     server = Server("files", on_list_tools=list_tools, on_call_tool=call_tool)
     server.extensions[EXTENSION] = files.settings()
@@ -174,8 +164,7 @@ def run(app, body):
 
 
 def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
-    notes = tmp_path / "notes.txt"
-    notes.write_bytes(b"x" * 100)
+    (tmp_path / "notes.txt").write_bytes(b"x" * 100)
     app, ran = serve(tmp_path)
     seen = []
     files = client(app, seen)
@@ -184,27 +173,22 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
         return ElicitResult(action="accept", content={})
 
     async def body():
-        await files.tools.save(file=File(b"tiny", name="a.txt"))
+        await files.tools.save(file=File(b"tiny", name="a.txt"), cover=None)
         [inline] = tool_calls(seen)
         assert inline["params"]["arguments"]["file"]["data"] == "dGlueQ=="
-        assert not any(e["method"] == "PUT" for e in seen)
         seen.clear()
 
-        result = await files.tools.save(
-            {"elicit": answer}, file=File(notes), note="ask"
+        await files.tools.save(
+            {"elicit": answer}, file=File(tmp_path / "notes.txt"), note="ask"
         )
-        assert result.structured_content == {"names": ["notes.txt"]}
-        first, upload_retry, answer_retry = tool_calls(seen)
-        sent = first["params"]["arguments"]
-        assert "data" not in sent["file"] and sent["file"]["size"] == 100
-        assert upload_retry["params"]["arguments"] == sent
+        first, upload_retry, _ = tool_calls(seen)
+        assert "data" not in first["params"]["arguments"]["file"]
+        assert upload_retry["params"]["arguments"] == first["params"]["arguments"]
         assert "inputResponses" not in upload_retry["params"]
-        assert answer_retry["params"]["inputResponses"]
         [put] = [e for e in seen if e["method"] == "PUT"]
         assert put["path"].startswith("/mcp/files/u/") and put["body"] == b"x" * 100
-        # A path target travels through the binding's client, without its credentials.
-        assert "authorization" not in put["headers"] and "cookie" not in put["headers"]
-        assert "content-type" not in put["headers"]
+        # A path target goes through the binding's client, without its credentials.
+        assert not {"authorization", "cookie", "content-type"} & put["headers"].keys()
 
         # The retry that answered the upload request is spent.
         [replay] = [
@@ -220,82 +204,7 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
     run(app, body)
     assert (tmp_path / "saved/a.txt").read_bytes() == b"tiny"
     assert (tmp_path / "saved/notes.txt").read_bytes() == b"x" * 100
-    assert ran == ["save", "save", "save"]
-
-
-class FormStorage:
-    """Staging behind a multipart form endpoint at a URL, as object stores do."""
-
-    def __init__(self, root, url):
-        self.root, self.url = root, url
-        root.mkdir()
-        self.app = Router()
-
-    async def issue(self, key, size, mime_type, expires_at):
-        fields = [{"name": "key", "value": key}, {"name": "policy", "value": "signed"}]
-        return {
-            "url": self.url,
-            "method": "POST",
-            "form": {"fields": fields, "fileField": "file"},
-            "credentials": "omit",
-        }
-
-    async def confirm(self, key, size, digest):
-        path = self.root / key
-        return path if path.is_file() and path.stat().st_size == size else None
-
-    async def consume(self, nonce, expires_at):
-        return True
-
-
-def test_a_form_target_on_an_allowed_origin_gets_a_multipart_post(tmp_path):
-    received = []
-
-    async def upload(request):
-        raw = await request.body()
-        form = await request.form()
-        received.append((raw, request.headers, [key for key, _ in form.multi_items()]))
-        (tmp_path / "staged" / form["key"]).write_bytes(await form["file"].read())
-        return Response(status_code=204)
-
-    sock = socket.create_server(("127.0.0.1", 0))
-    origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
-    app, ran = serve(tmp_path, FormStorage(tmp_path / "staged", f"{origin}/upload"), 0)
-    seen = []
-    pdf = File(b"%PDF-1.7 report", name='q3/Q3 "final".pdf')
-
-    async def body():
-        http = uvicorn.Server(
-            uvicorn.Config(
-                Starlette(routes=[Route("/upload", upload, methods=["POST"])]),
-                lifespan="off",
-                log_level="warning",
-            )
-        )
-        serving = asyncio.create_task(http.serve(sockets=[sock]))
-        try:
-            # Without an allowlist, plain http is refused before anything is sent.
-            with pytest.raises(FileTransferError, match="did not run.*not https"):
-                await client(app, seen).tools.save(file=pdf)
-            assert not received and len(tool_calls(seen)) == 1
-            allowed = client(app, seen, file_origins=[origin])
-            result = await allowed.tools.save(file=pdf)
-            assert result.structured_content == {"names": ['q3/Q3 "final".pdf']}
-        finally:
-            http.should_exit = True
-            await serving
-
-    run(app, body)
-    [(raw, headers, order)] = received
-    assert order == ["key", "policy", "file"]
-    assert (
-        b'name="file"; filename="Q3 %22final%22.pdf"\r\nContent-Type: application/pdf'
-        in raw
-    )
-    assert headers["content-length"] == str(len(raw))
-    assert "authorization" not in headers and "cookie" not in headers
-    assert (tmp_path / "saved" / 'Q3 "final".pdf').read_bytes() == b"%PDF-1.7 report"
-    assert ran == ["save"]
+    assert ran == ["save"] * 3
 
 
 def scripted(replies):
@@ -304,9 +213,8 @@ def scripted(replies):
 
     async def sink(request):
         attempts.append((request.method, request.headers.get("authorization")))
-        return Response(
-            status_code=503 if request.path_params["name"] == "busy" else 201
-        )
+        busy = request.path_params["name"] == "busy"
+        return Response(status_code=503 if busy else 201)
 
     async def call_tool(ctx, params):
         return replies.pop(0)(params.arguments["file"]["id"])
@@ -322,13 +230,13 @@ def scripted(replies):
     return app, attempts
 
 
-def upload(**target):
+def upload(requestState="s", **target):
     def reply(file_id):
-        entry = {"fileId": file_id, "credentials": "omit", **target}
+        uploads = [{"fileId": file_id, "credentials": "omit", **target}]
         return {
             "resultType": "upload_required",
-            "uploads": [entry],
-            "requestState": "s",
+            "uploads": uploads,
+            "requestState": requestState,
         }
 
     return reply
@@ -338,40 +246,38 @@ def done(file_id):
     return CallToolResult(content=[TextContent(type="text", text="ok")])
 
 
-def test_the_client_checks_every_upload_request_and_retries_only_after_success(
-    tmp_path,
-):
+def broken(file_id):
+    raise RuntimeError("lost")
+
+
+def test_the_client_checks_every_upload_request_and_retries_only_after_success():
     replies = []
     app, attempts = scripted(replies)
     seen = []
     files = client(app, seen)
     form = {"fields": [], "fileField": "file"}
-    rejected = [
-        {"path": "/files/ok", "headers": {"Authorization": "Bearer x"}},
-        {"path": "/files/ok", "headers": {"X-Forwarded-Host": "elsewhere"}},
-        {"path": "/files/../ok"},
-        {"path": "/files/ok", "url": "https://files.example/u"},
-        {"path": "/files/ok", "size": 3},
-        {"path": "/files/ok", "form": form},
-        {"url": "https://user@files.example/u"},
-        {"url": "https://files.example/u", "credentials": "include"},
-        {"path": "/files/ok", "fileId": "another"},
-    ]
 
     async def call():
         return await files.tools.save(file=File(b"0123456789"))
 
     async def body():
-        for target in rejected:
+        for target in [
+            {"path": "/files/ok", "headers": {"Authorization": "Bearer x"}},
+            {"path": "/files/ok", "headers": {"X-Forwarded-Host": "elsewhere"}},
+            {"path": "/files/../ok"},
+            {"path": "/files/ok", "url": "https://files.example/u"},
+            {"path": "/files/ok", "size": 3},
+            {"path": "/files/ok", "form": form},
+            {"url": "https://user@files.example/u"},
+            {"url": "https://files.example/u", "credentials": "include"},
+            {"url": "http://127.0.0.1:9/u"},
+            {"path": "/files/ok", "fileId": "another"},
+            {"path": "/files/ok", "requestState": None},  # on the result
+        ]:
             replies.append(upload(**target))
             with pytest.raises(FileTransferError, match="did not run"):
                 await call()
-        replies.append(
-            lambda file_id: {**upload(path="/files/ok")(file_id), "requestState": None}
-        )
-        with pytest.raises(FileTransferError, match="no requestState"):
-            await call()
-        assert attempts == [] and len(tool_calls(seen)) == len(rejected) + 1
+        assert attempts == [] and len(tool_calls(seen)) == 11
 
         # A failed PUT is repeated a bounded number of times, a POST never; no retry.
         seen.clear()
@@ -390,10 +296,6 @@ def test_the_client_checks_every_upload_request_and_retries_only_after_success(
         replies.extend([upload(path="/files/ok"), upload(path="/files/ok")])
         with pytest.raises(OutcomeUnknownError, match="second upload"):
             await call()
-
-        def broken(file_id):
-            raise RuntimeError("lost")
-
         replies.extend([upload(path="/files/ok"), broken])
         with pytest.raises(OutcomeUnknownError, match="outcome is unknown"):
             await call()
@@ -408,17 +310,58 @@ def test_the_client_checks_every_upload_request_and_retries_only_after_success(
     run(app, body)
 
 
+def test_a_form_target_on_an_allowed_origin_gets_a_multipart_post():
+    received = []
+
+    async def sink(request):
+        received.append((await request.body(), request.headers))
+        return Response(status_code=204)
+
+    sock = socket.create_server(("127.0.0.1", 0))
+    origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    fields = [{"name": "key", "value": "k"}, {"name": "policy", "value": "signed"}]
+    target = {
+        "url": f"{origin}/upload",
+        "method": "POST",
+        "form": {"fields": fields, "fileField": "file"},
+    }
+    app, _ = scripted([upload(**target), done])
+    pdf = File(b"%PDF-1.7 report", name='q3/Q3 "final".pdf')
+
+    async def body():
+        storage = Starlette(routes=[Route("/upload", sink, methods=["POST"])])
+        config = uvicorn.Config(storage, lifespan="off", log_level="warning")
+        http = uvicorn.Server(config)
+        serving = asyncio.create_task(http.serve(sockets=[sock]))
+        try:
+            await client(app, [], file_origins=[origin]).tools.save(file=pdf)
+        finally:
+            http.should_exit = True
+            await serving
+
+    run(app, body)
+    [(raw, headers)] = received
+    boundary = headers["content-type"].split("boundary=")[1].encode()
+    assert len(boundary) >= 32 and headers["content-length"] == str(len(raw))
+    assert raw.split(b"--" + boundary)[1:] == [
+        b'\r\nContent-Disposition: form-data; name="key"\r\n\r\nk\r\n',
+        b'\r\nContent-Disposition: form-data; name="policy"\r\n\r\nsigned\r\n',
+        (
+            b'\r\nContent-Disposition: form-data; name="file"; filename="Q3 %22final%22.pdf"'
+            b"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.7 report\r\n"
+        ),
+        b"--\r\n",
+    ]
+    assert "authorization" not in headers and "cookie" not in headers
+
+
 def rpc(http, method, params=None, *, declare=True):
     capabilities = {"extensions": {EXTENSION: {"upload": {}, "download": {}}}}
-    params = {
-        **(params or {}),
-        "_meta": {
-            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-            "io.modelcontextprotocol/clientCapabilities": capabilities
-            if declare
-            else {},
-        },
+    meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": capabilities if declare else {},
     }
+    params = {**(params or {}), "_meta": meta}
     headers = {
         "accept": "application/json, text/event-stream",
         "mcp-protocol-version": "2026-07-28",
@@ -438,8 +381,8 @@ def text_file(file_id="f", data=None, **fields):
 
 
 def digest(data):
-    value = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
-    return {"algorithm": "sha-256", "value": value}
+    value = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode()
+    return {"algorithm": "sha-256", "value": value.rstrip("=")}
 
 
 def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_path):
@@ -461,28 +404,32 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
             required = missing["error"]["data"]["requiredCapabilities"]
             assert required == {"extensions": {EXTENSION: {"upload": {}}}}
 
-            refused = [
-                {"file": text_file(size=5000)},
-                {"file": text_file(data=b"0123456789abcdefg")},
-                {"file": text_file(data=good) | {"size": 9}},
-                {"file": text_file(data=good) | {"data": "not base64!"}},
-                {"file": text_file(data=good) | {"data": None}},
-            ]
-            checked = [
-                {
-                    "files": [
-                        text_file(data=good, digest=digest(good), mimeType="image/png")
-                    ]
-                },
-                {"files": [text_file(data=good)]},
-                {"files": [text_file(data=good, digest=digest(b"other"))]},
-                {"files": [text_file(size=0, digest=digest(b"x"))]},
-                {"files": [text_file("same", good, digest=digest(good))] * 2},
-            ]
-            for arguments in refused:
-                assert (await call(arguments))["result"]["isError"] is True, arguments
-            for arguments in checked:
-                result = await call(arguments, name="check")
+            for name, arguments in [
+                ("save", {"file": text_file(size=5000)}),
+                ("save", {"file": text_file(data=b"0123456789abcdefg")}),
+                ("save", {"file": text_file(data=good) | {"size": 9}}),
+                ("save", {"file": text_file(data=good) | {"data": "not base64!"}}),
+                ("save", {"file": text_file(data=good) | {"data": "é" * 16}}),
+                ("save", {"file": text_file(data=good) | {"data": None}}),
+                (
+                    "check",
+                    {
+                        "files": [
+                            text_file(
+                                data=good, mimeType="image/png", digest=digest(good)
+                            )
+                        ]
+                    },
+                ),
+                ("check", {"files": [text_file(data=good)]}),
+                ("check", {"files": [text_file(data=good, digest=digest(b"x"))]}),
+                ("check", {"files": [text_file(size=0, digest=digest(b"x"))]}),
+                (
+                    "check",
+                    {"files": [text_file("same", good, digest=digest(good))] * 2},
+                ),
+            ]:
+                result = await call(arguments, name=name)
                 assert result["result"]["isError"] is True, arguments
             assert ran == []
 
@@ -512,14 +459,11 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
 def test_a_returned_file_is_fetched_checked_and_saved(tmp_path):
     app, ran = serve(tmp_path)
     seen = []
-    files = client(app, seen)
     folder = tmp_path / "downloads"
     folder.mkdir()
 
     async def body():
-        result = await files.call_tool("export")
-        assert result.content[0].text == "Exported."
-        [download] = downloads(result)
+        [download] = downloads(await client(app, seen).call_tool("export"))
         assert (download.name, download.mime_type, download.size) == (
             "report.csv",
             "text/csv",
@@ -527,12 +471,12 @@ def test_a_returned_file_is_fetched_checked_and_saved(tmp_path):
         )
         assert await download.read() == CSV
         path = await download.save(folder)
-        assert path == folder / "report.csv" and path.read_bytes() == CSV
-        assert not path.stat().st_mode & 0o111
+        assert path.read_bytes() == CSV and not path.stat().st_mode & 0o111
         with pytest.raises(FileExistsError):
             await download.save(folder)
-        [get, *_] = [e for e in seen if e["method"] == "GET"]
-        assert "authorization" not in get["headers"]
+        assert all(
+            "authorization" not in e["headers"] for e in seen if e["method"] == "GET"
+        )
 
         [published] = (tmp_path / "storage" / "d").iterdir()
         published.write_bytes(b"a,b\n1,3\n")

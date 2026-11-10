@@ -146,26 +146,30 @@ def _loopback(host: str) -> bool:
 
 
 class Transfers:
-    def __init__(
-        self,
-        label: str,
-        endpoint: str,
-        http_client: Callable[[], httpx2.AsyncClient],
-        file_origins: Sequence[str] | None,
-        http: httpx2.AsyncClient,
-    ) -> None:
+    endpoint: httpx2.URL
+    http_client: Callable[[], httpx2.AsyncClient]
+    http: httpx2.AsyncClient
+
+    def __init__(self, label: str, file_origins: Sequence[str] | None) -> None:
         self.label = label
-        self.endpoint = httpx2.URL(endpoint)
-        self.http_client = http_client
         self.origins = (
             None
             if file_origins is None
             else {_origin(httpx2.URL(origin)) for origin in file_origins}
         )
-        self.http = http
         self.authorization: str | None = None
         self.owed: dict[str, tuple[File, dict[str, Any]]] = {}
         self.uploaded = False
+
+    def bind(
+        self,
+        endpoint: str,
+        http_client: Callable[[], httpx2.AsyncClient],
+        http: httpx2.AsyncClient,
+    ) -> None:
+        self.endpoint = httpx2.URL(endpoint)
+        self.http_client = http_client
+        self.http = http
 
         async def capture(request: httpx2.Request) -> None:
             if request.url == self.endpoint:

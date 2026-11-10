@@ -276,8 +276,9 @@ class EventType(Generic[A, D]):
     _subscriptions: dict[str, _Entry] = field(default_factory=dict)
     # Subscriptions being torn down, which one that begins with the same id waits for.
     _closing: dict[str, asyncio.Event] = field(default_factory=dict)
-    # Subscriptions of a type with a check function, held by nothing, that an event emitted to them could not reach.
-    _missed: set[str] = field(default_factory=set)
+    # Subscriptions of a type with a check function, held by nothing, that an event emitted to them could not reach,
+    # oldest first. Ids that never come back are let go once there are as many as the events kept.
+    _missed: dict[str, None] = field(default_factory=dict)
 
     def emit(
         self,
@@ -320,7 +321,9 @@ class EventType(Generic[A, D]):
             # nothing now can be given this.
             if self._check is not None:
                 if not holds:
-                    self._missed.add(subscription)
+                    self._missed[subscription] = None
+                    if len(self._missed) > self._events._keep_events:
+                        del self._missed[next(iter(self._missed))]
                 for hold in holds:
                     hold.missed |= hold.delivery == "poll" and hold.request.targetable
         for hold in holds:
@@ -941,7 +944,7 @@ class Events(Extension):
             declared._subscriptions[request.id] = entry
         hold = _Hold(declared, request, delivery, entry, wake)
         if request.targetable and request.id in declared._missed:
-            declared._missed.discard(request.id)
+            del declared._missed[request.id]
             hold.missed = True
         entry.holds.add(hold)
         return hold

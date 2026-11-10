@@ -68,14 +68,14 @@ await apps.huggingface.tools.hub_search(query="llama")
 
 ## Events
 
-`holon.events` serves [MCP Events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md), the Triggers & Events Working Group's draft, by poll and push. Declare an event type once and emit:
+`holon.ext.events` serves [MCP Events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md), the Triggers & Events Working Group's draft, by poll and push. Like everything under `holon.ext`, it follows a draft and may change in any release. Declare an event type once and emit:
 
 ```python
 from pydantic import BaseModel
 from mcp.server import MCPServer
 from starlette.applications import Starlette
 from starlette.routing import Mount
-from holon.events import Events
+from holon.ext.events import Events
 
 
 class Board(BaseModel):

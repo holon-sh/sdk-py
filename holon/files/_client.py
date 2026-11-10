@@ -99,7 +99,6 @@ class File:
         return (await anyio.Path(self._source).stat()).st_size
 
     async def _chunks(self, size: int) -> AsyncIterator[bytes]:
-        """Yield exactly ``size`` bytes, never more, or fail."""
         source = self._source
         async with (
             anyio.wrap_file(io.BytesIO(source))
@@ -119,7 +118,6 @@ def _file_name(name: str | None) -> str:
     return "file" if base in ("", ".", "..") else base
 
 
-# Transfers go through this module; httpx2 logs each request URL at INFO.
 _quiet = contextvars.ContextVar("holon_files_quiet", default=False)
 
 
@@ -148,8 +146,6 @@ def _loopback(host: str) -> bool:
 
 
 class Transfers:
-    """One call's file transfers: where they may go and what is still owed."""
-
     def __init__(
         self,
         label: str,
@@ -212,15 +208,12 @@ class Transfers:
         headers: dict[str, str],
         content: AsyncIterator[bytes] | None = None,
     ) -> AsyncIterator[httpx2.Response]:
-        """Send one transfer request and yield its streamed response."""
         if target["credentials"] == "include" and self.authorization:
             headers = {**headers, "Authorization": self.authorization}
         quiet = _quiet.set(True)
         try:
             async with AsyncExitStack() as stack:
                 if "url" not in target:
-                    # The binding's client reaches the MCP address; downloads
-                    # come after the call closed it.
                     client = self.http
                     if client.is_closed:
                         client = await stack.enter_async_context(self.http_client())
@@ -231,7 +224,6 @@ class Transfers:
                         headers=headers,
                         content=content,
                     )
-                    # Only the target's headers, and the MCP credential if asked.
                     listed = {name.lower() for name in headers}
                     for name in ("authorization", "cookie", "content-type"):
                         if name not in listed:
@@ -285,7 +277,6 @@ class Transfers:
         schema: Mapping[str, Any] | None,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        """Replace each File with a FileInput, inline or owed out of band."""
         cursor = None
         while schema is None:  # An untyped dependency: the schema it lists.
             page = await client.session.list_tools(
@@ -343,7 +334,6 @@ class Transfers:
         return replaced
 
     async def send(self, result: UploadRequiredResult) -> str:
-        """Check an upload request, transfer every file, and return its requestState."""
         if self.uploaded:
             raise OutcomeUnknownError(
                 f"{self.label}: the server asked for a second upload after the call was retried"
@@ -371,7 +361,6 @@ class Transfers:
                 "the upload request does not list each file sent without data exactly once"
             )
         try:
-            # The first failure cancels the other transfers.
             async with anyio.create_task_group() as group:
                 for target in targets.values():
                     group.start_soon(self._transfer, target)
@@ -384,7 +373,6 @@ class Transfers:
         file, entry = self.owed[target.get("fileId", "")]
         method = target.get("method", "PUT")
         reason = "it was not sent"
-        # A failed PUT may be repeated; a POST may have been applied.
         for _ in range(3 if method == "PUT" else 1):
             deadline = expires_at(target)
             if deadline is not None and datetime.now(UTC) >= deadline:
@@ -412,7 +400,6 @@ class Transfers:
 def _body(
     target: UploadTarget, file: File, entry: Mapping[str, Any]
 ) -> tuple[dict[str, str], AsyncIterator[bytes]]:
-    """The headers and body of one transfer: the bytes, or a multipart form."""
     size: int = entry["size"]
     headers = dict(target.get("headers", {}))
     head = tail = b""
@@ -450,13 +437,10 @@ def holds_file(value: Any) -> bool:
     )
 
 
-# Downloads.
-
 _calls: dict[int, Transfers] = {}
 
 
 def remember(result: CallToolResult, transfers: Transfers) -> None:
-    """Keep the call a result came from, for its download targets."""
     if EXTENSION in (result.meta or {}):
         _calls[id(result)] = transfers
         weakref.finalize(result, _calls.pop, id(result), None)
@@ -523,7 +507,6 @@ class Download:
         return destination
 
     async def _fetch(self) -> AsyncGenerator[bytes]:
-        """Yield the file's bytes, then fail if they fail a check."""
         label = f"the download of {_file_name(self.name)!r}"
         if self.expires_at is not None and datetime.now(UTC) >= self.expires_at:
             raise FileTransferError(f"{label} expired")

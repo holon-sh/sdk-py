@@ -84,14 +84,11 @@ UPLOAD, DOWNLOAD = TypeAdapter(UploadTarget), TypeAdapter(DownloadTarget)
 
 
 class UploadRequiredResult(Result):
-    """The ``upload_required`` result of ``tools/call``; the client checks it."""
-
     result_type: Literal["upload_required"]
     uploads: object = None
     request_state: object = None
 
 
-# The results of tools/call; no core result has the resultType tried first.
 CALL_RESULT: TypeAdapter[UploadRequiredResult | CallToolResult | InputRequiredResult]
 CALL_RESULT = TypeAdapter(
     Annotated[
@@ -162,15 +159,12 @@ def digest_required(schema: Mapping[str, Any]) -> bool:
 def declared(
     capabilities: ClientCapabilities | ServerCapabilities | None,
 ) -> Mapping[str, Any] | None:
-    """The extension's settings a peer declared, or None."""
     settings = ((capabilities and capabilities.extensions) or {}).get(EXTENSION)
-    # A revision this code does not know is a different extension.
     return None if settings is None or "revision" in settings else settings
 
 
 @asynccontextmanager
 async def writing(destination: Path, overwrite: bool) -> AsyncIterator[Path]:
-    """Yield a path beside ``destination`` that becomes it if the block succeeds."""
     partial = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.part")
     try:
         yield partial
@@ -187,11 +181,6 @@ def walk_files(
     value: Any,
     visit: Callable[[Any, Mapping[str, Any]], Any],
 ) -> Any:
-    """Return ``value`` with ``visit(value, marked_schema)`` applied at file positions.
-
-    ``visit`` returns its replacement, or None where the value is not a file
-    (an ``anyOf`` branch can allow ``null`` beside a file).
-    """
     resolver = Registry().resolver_with_root(DRAFT202012.create_resource(schema))
 
     def expand(node: Any, seen: set[int]) -> list[Mapping[str, Any]]:
@@ -245,8 +234,7 @@ def _item_schema(schema: Mapping[str, Any], index: int) -> Any:
 # Targets: the rules every upload and download target must pass.
 
 
-class Rejected(Exception):
-    """A target broke a rule. The reason names no secret."""
+class Rejected(Exception): ...
 
 
 _TOKEN = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
@@ -278,7 +266,6 @@ _Kind = TypeVar("_Kind", UploadTarget, DownloadTarget)
 
 
 def _absent(value: object, key: object = None) -> object:
-    """A member whose value is null is absent; a header value is not a member."""
     if isinstance(value, dict) and key != "headers":
         return {
             name: _absent(item, name)
@@ -305,7 +292,6 @@ def check_target(raw: object, kind: TypeAdapter[_Kind]) -> _Kind:
             url = httpx2.URL(target["url"])
         except httpx2.InvalidURL:
             raise Rejected("its url is not an absolute https URL") from None
-        # Plain http is only ever allowed by an operator allowlist, checked later.
         if url.scheme not in ("https", "http") or not url.host:
             raise Rejected("its url is not an absolute https URL")
         if url.userinfo:

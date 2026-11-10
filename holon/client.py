@@ -144,14 +144,12 @@ async def _send(
                 request_read_timeout_seconds=options.get("timeout"),
             )
         except Exception as error:
-            # Once files were sent, a retry that fails may still have run the tool.
             if transfers.uploaded:
                 raise OutcomeUnknownError(
                     f"{transfers.label}: the outcome is unknown; the call failed after its files were sent"
                 ) from error
             raise
         if isinstance(result, UploadRequiredResult):
-            # The retry carries the earlier answers inside requestState.
             responses, state = None, await transfers.send(result)
             continue
         if not (elicit and answered < 10 and isinstance(result, InputRequiredResult)):

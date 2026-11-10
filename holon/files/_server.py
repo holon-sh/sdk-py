@@ -148,12 +148,10 @@ class _FileInput(BaseModel):
     mimeType: str
     size: Annotated[int, Field(ge=0)]
     digest: _Digest | None = None
-    # null is undecodable inline data, so it fails here.
     data: str = ""
 
 
-class _Refused(Exception):
-    """A file argument fails a check; the tool does not run."""
+class _Refused(Exception): ...
 
 
 _received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
@@ -268,7 +266,6 @@ class FileServer:
         settings = declared(ctx.session.client_capabilities)
         if ctx.method == "tools/list":
             result = await call_next(ctx)
-            # Clients without the extension cannot fill a file argument.
             if settings is None and isinstance(result, dict):
                 tools = [t for t in result["tools"] if not _has_file(t["inputSchema"])]
                 result = {**result, "tools": tools}
@@ -285,7 +282,6 @@ class FileServer:
         found: list[tuple[Any, Mapping[str, Any]]] = []
 
         def collect(value: Any, marked: Mapping[str, Any]) -> Any:
-            # Anything but an object is another branch's value, such as null.
             if not isinstance(value, dict):
                 return None
             found.append((value, marked))
@@ -362,7 +358,6 @@ class FileServer:
             inner["requestState"] = record["i"]
         result = await self._run(replace(ctx, params=inner), call_next, received)
         if isinstance(result, dict) and result.get("resultType") == "input_required":
-            # Later rounds keep the files bound; the inner state rides inside ours.
             return {
                 **result,
                 "requestState": self._seal(record, result.get("requestState")),
@@ -384,12 +379,10 @@ class FileServer:
     def _binding(
         self, ctx: ServerRequestContext[Any, Any], name: str, arguments: Any
     ) -> str:
-        """The tool, its arguments as a JSON Schema instance, and the principal."""
         bound = [name, _canonical(arguments), self._principal(ctx)]
         return sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode())
 
     def _seal(self, record: dict[str, Any], inner: object) -> str:
-        # A fresh nonce per result: each requestState is accepted at most once.
         sealed = {**record, "n": secrets.token_hex(16), "i": inner}
         return _STATE + self._codec.seal(json.dumps(sealed).encode())
 
@@ -411,7 +404,6 @@ def _error(message: str) -> CallToolResult:
 
 
 def _canonical(value: Any) -> Any:
-    """Equal JSON Schema instances serialize alike: 1.0 is 1."""
     if isinstance(value, float) and value.is_integer():
         return int(value)
     if isinstance(value, list):
@@ -424,10 +416,6 @@ def _canonical(value: Any) -> Any:
 def _inspect(
     found: list[tuple[Any, Mapping[str, Any]]], max_inline_bytes: int
 ) -> tuple[dict[str, ReceivedFile], list[tuple[_FileInput, str | None]]]:
-    """Check file metadata and inline bytes.
-
-    Returns the files received inline, and those owed with the digest to verify.
-    """
     received: dict[str, ReceivedFile] = {}
     owed: list[tuple[_FileInput, str | None]] = []
     seen: set[str] = set()
@@ -528,7 +516,6 @@ class LocalStorage:
     ) -> UploadTarget:
         self._sweep()
         now = time.time()
-        # Half the lifetime to start the transfer leaves the rest for it and the retry.
         start_by = now + (expires_at - now) / 2
         return {
             "path": f"{self._path}/u/{self._seal('u', start_by, key, size, expires_at)}",
@@ -582,8 +569,6 @@ class LocalStorage:
 
     def _dir(self, kind: str) -> Path:
         if self._root is None:
-            # Made on first use, not when constructed, so a server can be built
-            # where nothing may be written, such as while its contract is read.
             self._root = Path(tempfile.mkdtemp(prefix="holon-files-"))
             atexit.register(shutil.rmtree, self._root, ignore_errors=True)
         directory = self._root / kind
@@ -601,7 +586,6 @@ class LocalStorage:
         return self._codec.seal(json.dumps([kind, until, *claims]).encode())
 
     def _unseal(self, request: Request, kind: str) -> list[Any] | None:
-        """The claims of a token for ``kind`` that is still valid."""
         try:
             claims = json.loads(self._codec.unseal(request.path_params["token"]))
         except (InvalidRequestState, ValueError):

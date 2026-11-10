@@ -78,7 +78,6 @@ if TYPE_CHECKING:
 __all__ = [
     "EVENTS_EXTENSION",
     "AppEvents",
-    "EmitBuffer",
     "Event",
     "EventResult",
     "EventType",
@@ -100,23 +99,31 @@ UNSUPPORTED = -32026
 _PAGE = 1000
 # Marks a request that came through `Events.asgi`, whose answer can be a stream.
 _STREAMS = "holon.ext.events.streams"
+# What each event type keeps of what it emits, for polls and for streams that are behind or reconnect: the sketch's
+# emit buffer. For how long in seconds, how many events, and how many bytes their data takes as JSON. The newest is
+# kept whatever it takes.
+_KEEP_AGE = 600.0
+_KEEP_EVENTS = 10_000
+_KEEP_BYTES = 4 * 2**20
+# Seconds a poll is told to wait, and how often a stream asks a type's check function.
+_INTERVAL = 1.0
+# Seconds between a stream's heartbeats. One whose reader takes nothing for two is closed, to reconnect from its cursor.
+_HEARTBEAT = 30.0
+# Seconds a poll subscription lasts after its last poll: a minute or three intervals.
+_POLL_SUBSCRIPTION_TTL = max(60.0, 3 * _INTERVAL)
+# The bytes of events every stream together is sending at once, of which one caller's streams may send a quarter.
+_MAX_SENDING_BYTES = 16 * 2**20
+# The subscriptions held at once, streams and poll leases alike, and those of one caller.
+_MAX_SUBSCRIPTIONS = 10_000
+_MAX_SUBSCRIPTIONS_PER_CALLER = 100
+# How many types events/list returns at a time.
+_LIST_PAGE_SIZE = 100
+# Seconds a type's on_subscribe has to return before the subscription is refused.
+_SUBSCRIBE_TIMEOUT = 30.0
 
 A = TypeVar("A")
 D = TypeVar("D")
 Delivery: TypeAlias = Literal["poll", "push"]
-
-
-@dataclass(frozen=True)
-class EmitBuffer:
-    """The sketch's emit buffer: what each event type keeps of what it emits, for polls and streams that are behind
-    or reconnect."""
-
-    max_age: float = 600.0
-    """For how long, in seconds."""
-    max_events: int = 10_000
-    """How many events."""
-    max_bytes: int = 4 * 2**20
-    """How many bytes their data takes as JSON. The newest is kept whatever it takes."""
 
 
 @dataclass(frozen=True)
@@ -297,7 +304,6 @@ class EventType(Generic[A, D]):
     _transform: Transform[D, A] | None
     _key: Callable[[D], str] | None
     _check: Check[A, D] | None
-    _interval: float
     _delivery: list[Delivery]
     _authorize: Authorize[A] | None
     _on_subscribe: SubscriptionHook[A] | None
@@ -358,7 +364,7 @@ class EventType(Generic[A, D]):
             if self._check is not None:
                 if not holds:
                     self._missed[subscription_id] = None
-                    if len(self._missed) > self._events._keep_events:
+                    if len(self._missed) > _KEEP_EVENTS:
                         del self._missed[next(iter(self._missed))]
                 for hold in holds:
                     hold.missed |= hold.delivery == "poll" and hold.request.targetable
@@ -406,7 +412,6 @@ class EventType(Generic[A, D]):
         )
 
     def _keep(self, kept: _Kept) -> None:
-        events = self._events
         self._sequence += 1
         kept.sequence, kept.at = self._sequence, time.monotonic()
         # An event with a key replaces the one before it with the same key, for the same subscriptions.
@@ -425,9 +430,9 @@ class EventType(Generic[A, D]):
         # The newest is kept whatever it weighs, since streams read it from here.
         dropped = 0
         while len(self._kept) - dropped > 1 and (
-            len(self._kept) - dropped > events._keep_events
-            or self._bytes > events._keep_bytes
-            or self._kept[dropped].at < kept.at - events._keep_age
+            len(self._kept) - dropped > _KEEP_EVENTS
+            or self._bytes > _KEEP_BYTES
+            or self._kept[dropped].at < kept.at - _KEEP_AGE
         ):
             oldest = self._kept[dropped]
             self._dropped = oldest.sequence
@@ -617,51 +622,25 @@ class Events(Extension):
     Pass it to ``MCPServer(extensions=[events])``, or call :meth:`serve` on a low-level ``Server``. Over Streamable
     HTTP, push is offered only on an endpoint mounted through :meth:`asgi`; elsewhere clients poll.
 
-    Each type keeps what it emits, as ``emit_buffer`` bounds it, for polls and for streams that are behind or reconnect;
-    those cursors last as long as the process, and after a restart a client is told that events were skipped. A
-    type with a check function serves polls from it instead, with cursors that are its source's. A type is asked
-    again, and a poll told to come back, every ``interval`` seconds unless the type says otherwise. A stream hears
-    from the server every ``heartbeat`` seconds, and one whose reader has taken nothing for two heartbeats is closed,
-    to reconnect from its cursor. A poll subscription lasts ``poll_subscription_ttl`` seconds after its last poll, a
-    minute or three of the type's intervals unless given.
+    Each type keeps what it emits, for ten minutes and up to 10,000 events and 4 MiB, for polls and for streams that
+    are behind or reconnect; those cursors last as long as the process, and after a restart a client is told that
+    events were skipped. A type with a check function serves polls from it instead, with cursors that are its
+    source's. A type is asked again, and a poll told to come back, every second. A stream hears from the server every
+    30 seconds, and one whose reader has taken nothing for two heartbeats is closed, to reconnect from its cursor. A
+    poll subscription lasts a minute after its last poll.
 
-    A stream sends one event at a time and holds nothing else of its own. ``max_sending_bytes`` bounds the events
-    every stream together is sending at once, and one caller's streams a quarter of it; an event is sent alone when
-    nothing else is, whatever it weighs. Waiting for room counts toward the two heartbeats.
-    ``max_subscriptions`` bounds the subscriptions held at once, streams and poll leases alike, and
-    ``max_subscriptions_per_caller`` those of one caller; callers without an identity count together as one.
-    ``page_size`` is how many types ``events/list`` returns at a time. A subscription whose ``on_subscribe`` has not
-    returned after ``subscribe_timeout`` seconds is refused, and may be tried again. With the defaults, events take
-    about 4 MiB kept for each type and 16 MiB being sent, whatever one caller does.
+    A stream sends one event at a time and holds nothing else of its own. Every stream together sends at most 16 MiB
+    of events at once, and one caller's streams a quarter of it; an event is sent alone when nothing else is, whatever
+    it weighs. Waiting for room counts toward the two heartbeats. At most 10,000 subscriptions are held at once,
+    streams and poll leases alike, and 100 of one caller; callers without an identity count together as one.
+    ``events/list`` returns 100 types at a time. A subscription whose ``on_subscribe`` has not returned after 30
+    seconds is refused, and may be tried again. Events thus take about 4 MiB kept for each type and 16 MiB being
+    sent, whatever one caller does.
     """
 
     identifier = EVENTS_EXTENSION
 
-    def __init__(
-        self,
-        *,
-        emit_buffer: EmitBuffer | None = None,
-        interval: float = 1.0,
-        heartbeat: float = 30.0,
-        poll_subscription_ttl: float | None = None,
-        max_sending_bytes: int = 16 * 2**20,
-        max_subscriptions: int = 10_000,
-        max_subscriptions_per_caller: int = 100,
-        page_size: int = 100,
-        subscribe_timeout: float = 30.0,
-    ) -> None:
-        emit_buffer = emit_buffer or EmitBuffer()
-        self._keep_events = emit_buffer.max_events
-        self._keep_age = emit_buffer.max_age
-        self._keep_bytes = emit_buffer.max_bytes
-        self._interval = interval
-        self._heartbeat = heartbeat
-        self._poll_subscription_ttl = poll_subscription_ttl
-        self._max_sending = max_sending_bytes
-        self._max_subscriptions = max_subscriptions
-        self._max_per_caller = max_subscriptions_per_caller
-        self._page_size = page_size
-        self._subscribe_timeout = subscribe_timeout
+    def __init__(self) -> None:
         # Cursors of kept events are positions in this process's memory; one from another process names nothing.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
@@ -687,7 +666,6 @@ class Events(Extension):
         transform: Transform[D, A] | None = None,
         key: Callable[[D], str] | None = None,
         check: Check[A, D] | None = None,
-        interval: float | None = None,
         delivery: Sequence[Delivery] = ("poll", "push"),
         authorize: Authorize[A] | None = None,
         on_subscribe: SubscriptionHook[A] | None = None,
@@ -709,10 +687,9 @@ class Events(Extension):
                 ``match`` must then answer the same for every occurrence of a key. Do not give a key to events that
                 each say what changed.
             check: ``(context, arguments, cursor)``: what happened after a cursor, for a source that keeps its own
-                history. Polls are answered by it, and streams ask it every ``interval``. A None cursor asks for the
+                history. Polls are answered by it, and streams ask it every second. A None cursor asks for the
                 current position. It filters and shapes for the arguments itself; ``match`` and ``transform`` apply
                 only to what is emitted.
-            interval: Seconds a poll is told to wait, and how often a stream asks the check function.
             delivery: The delivery modes this type offers.
             authorize: ``(context, arguments)``: whether the caller may subscribe. A subscription is refused with
                 Forbidden when it may not, and one already held is ended when it no longer may: each poll asks, and
@@ -759,7 +736,6 @@ class Events(Extension):
             transform,
             key,
             check,
-            self._interval if interval is None else interval,
             list(delivery),
             authorize,
             on_subscribe,
@@ -827,7 +803,7 @@ class Events(Extension):
                 ),
                 len(declared),
             )
-        page = declared[start : start + self._page_size]
+        page = declared[start : start + _LIST_PAGE_SIZE]
         streams = _streams(ctx)
         listed = []
         for each in page:
@@ -836,7 +812,7 @@ class Events(Extension):
             ]:
                 listed.append({**each._descriptor, "delivery": delivery})
         result: dict[str, Any] = {"events": listed}
-        if start + self._page_size < len(declared):
+        if start + _LIST_PAGE_SIZE < len(declared):
             result["nextCursor"] = str(page[-1]._order)
         return result
 
@@ -858,7 +834,7 @@ class Events(Extension):
             "cursor": read.cursor,
             "truncated": read.truncated,
             "hasMore": read.has_more,
-            "nextPollMs": round(declared._interval * 1000),
+            "nextPollMs": round(_INTERVAL * 1000),
         }
 
     async def _stream(
@@ -963,17 +939,20 @@ class Events(Extension):
     ) -> _Hold:
         if self._types.get(declared.name) is not declared:
             raise MCPError.from_error_data(_REMOVED)
-        if self._held >= self._max_subscriptions:
+        if self._held >= _MAX_SUBSCRIPTIONS:
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",
-                {"limit": "subscriptions", "max": self._max_subscriptions},
+                {"limit": "subscriptions", "max": _MAX_SUBSCRIPTIONS},
             )
-        if self._callers.get(request.caller, 0) >= self._max_per_caller:
+        if self._callers.get(request.caller, 0) >= _MAX_SUBSCRIPTIONS_PER_CALLER:
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",
-                {"limit": "subscriptionsPerCaller", "max": self._max_per_caller},
+                {
+                    "limit": "subscriptionsPerCaller",
+                    "max": _MAX_SUBSCRIPTIONS_PER_CALLER,
+                },
             )
         self._held += 1
         self._callers[request.caller] = self._callers.get(request.caller, 0) + 1
@@ -994,7 +973,7 @@ class Events(Extension):
         if declared._on_subscribe is None:
             return
         # A hook that never returns would hold its id for good: past the deadline the subscription is refused.
-        async with asyncio.timeout(self._subscribe_timeout):
+        async with asyncio.timeout(_SUBSCRIBE_TIMEOUT):
             await _settle(
                 declared._on_subscribe(request.context, request.arguments, request.id)
             )
@@ -1068,13 +1047,8 @@ class Events(Extension):
         # Renewed before waiting, so that a poll which gives up during setup still lets the lease lapse.
         if lease.timer is not None:
             lease.timer.cancel()
-        length = (
-            self._poll_subscription_ttl
-            if self._poll_subscription_ttl is not None
-            else max(60.0, 3 * declared._interval)
-        )
         lease.timer = asyncio.get_running_loop().call_later(
-            length, self._stop, request.id, lease
+            _POLL_SUBSCRIPTION_TTL, self._stop, request.id, lease
         )
         try:
             await self._ready(lease.hold)
@@ -1094,9 +1068,9 @@ class Events(Extension):
     # event of `size`. A caller may send a quarter of the whole, so that one cannot hold up the rest.
     @asynccontextmanager
     async def _send_budget(self, size: int, caller: str) -> AsyncIterator[None]:
-        while (self._sending and self._sending + size > self._max_sending) or (
+        while (self._sending and self._sending + size > _MAX_SENDING_BYTES) or (
             (mine := self._sending_by.get(caller, 0))
-            and mine + size > self._max_sending // 4
+            and mine + size > _MAX_SENDING_BYTES // 4
         ):
             await self._sent.wait()
         self._sending += size
@@ -1133,7 +1107,7 @@ class Events(Extension):
                     **body.get("_meta", {}),
                     SUBSCRIPTION_ID_META_KEY: request_id,
                 }
-                with anyio.move_on_after(2 * self._heartbeat) as waited:
+                with anyio.move_on_after(2 * _HEARTBEAT) as waited:
                     async with self._send_budget(size, request.caller):
                         await notify(f"notifications/events/{method}", body)
                 if waited.cancelled_caught:
@@ -1160,16 +1134,16 @@ class Events(Extension):
                 await say("active", {"cursor": read.start, "truncated": read.truncated})
                 for occurrence, after in read.events:
                     await deliver(occurrence, after)
-                due = time.monotonic() + (0 if read.has_more else declared._interval)
+                due = time.monotonic() + (0 if read.has_more else _INTERVAL)
             else:
                 seen, truncated = declared._resume(params.cursor, params.max_age_ms)
                 await say("active", {"cursor": position(), "truncated": truncated})
                 due = math.inf
-            beat = time.monotonic() + self._heartbeat
+            beat = time.monotonic() + _HEARTBEAT
             while hold.ended is None:
                 wake.clear()
                 if time.monotonic() >= beat:
-                    beat = time.monotonic() + self._heartbeat
+                    beat = time.monotonic() + _HEARTBEAT
                     # Access is checked again while the subscription lasts, and one that is lost ends it.
                     try:
                         allowed = await declared._allows(
@@ -1189,16 +1163,14 @@ class Events(Extension):
                         )
                     except Exception as error:  # noqa: BLE001
                         await say("error", {"error": _described(error)})
-                        due = time.monotonic() + declared._interval
+                        due = time.monotonic() + _INTERVAL
                         continue
                     if read.truncated:
                         await say("active", {"cursor": read.start, "truncated": True})
                     for occurrence, after in read.events:
                         await deliver(occurrence, after)
                     cursor = read.cursor
-                    due = time.monotonic() + (
-                        0 if read.has_more else declared._interval
-                    )
+                    due = time.monotonic() + (0 if read.has_more else _INTERVAL)
                 elif seen < declared._dropped:
                     # What the stream had yet to send was let go: a gap, from the oldest still kept, or for a type
                     # with a check function, from where its check has reached.

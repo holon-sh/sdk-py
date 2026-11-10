@@ -18,7 +18,8 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import EmitBuffer, Events, NoCompatibleDeliveryMode
+from holon.ext import events as events_module
+from holon.ext.events import Events, NoCompatibleDeliveryMode
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 
@@ -146,9 +147,14 @@ def test_push_delivers_what_matches_as_shaped_and_resumes_after_the_connection_d
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
 
 
-def test_a_reader_that_falls_behind_what_is_kept_is_told_of_a_gap_and_goes_on():
+def test_a_reader_that_falls_behind_what_is_kept_is_told_of_a_gap_and_goes_on(
+    monkeypatch,
+):
+    monkeypatch.setattr(events_module, "_KEEP_EVENTS", 50)
+    monkeypatch.setattr(events_module, "_KEEP_BYTES", 2**30)
+
     async def exercise():
-        events = Events(emit_buffer=EmitBuffer(max_events=50, max_bytes=2**30))
+        events = Events()
         changed = declare(events)
         server = MCPServer("boards", extensions=[events])
         port, stop = await serve(mounted(server, events))
@@ -174,9 +180,13 @@ def test_a_reader_that_falls_behind_what_is_kept_is_told_of_a_gap_and_goes_on():
     asyncio.run(asyncio.wait_for(exercise(), timeout=30))
 
 
-def test_poll_reports_a_gap_before_the_events_after_it_and_after_a_restart():
+def test_poll_reports_a_gap_before_the_events_after_it_and_after_a_restart(
+    monkeypatch,
+):
+    monkeypatch.setattr(events_module, "_KEEP_EVENTS", 2)
+
     async def exercise():
-        before = Events(emit_buffer=EmitBuffer(max_events=2))
+        before = Events()
         changed = declare(before)
         port, stop = await serve(
             mounted(MCPServer("boards", extensions=[before]), before)
@@ -236,9 +246,12 @@ def request(method, params, id=1):
     }
 
 
-def test_the_messages_on_the_wire_are_the_sketchs():
+def test_the_messages_on_the_wire_are_the_sketchs(monkeypatch):
+    monkeypatch.setattr(events_module, "_HEARTBEAT", 0.2)
+    monkeypatch.setattr(events_module, "_MAX_SUBSCRIPTIONS", 3)
+
     async def exercise():
-        events = Events(heartbeat=0.2, max_subscriptions=3)
+        events = Events()
 
         def shaped(context, event, arguments):
             if event.data.text == "bad":
@@ -395,9 +408,14 @@ def test_the_messages_on_the_wire_are_the_sketchs():
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
 
 
-def test_a_poll_that_gives_up_while_it_is_set_up_still_lets_its_lease_lapse():
+def test_a_poll_that_gives_up_while_it_is_set_up_still_lets_its_lease_lapse(
+    monkeypatch,
+):
+    monkeypatch.setattr(events_module, "_POLL_SUBSCRIPTION_TTL", 0.3)
+    monkeypatch.setattr(events_module, "_MAX_SUBSCRIPTIONS", 1)
+
     async def exercise():
-        events = Events(poll_subscription_ttl=0.3, max_subscriptions=1)
+        events = Events()
         ended = []
 
         async def on_subscribe(context, arguments, id):
@@ -472,9 +490,13 @@ def test_where_push_cannot_be_served_it_is_not_offered_and_a_subscription_polls(
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
 
 
-def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_releases_the_id():
+def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_releases_the_id(
+    monkeypatch,
+):
+    monkeypatch.setattr(events_module, "_SUBSCRIBE_TIMEOUT", 0.2)
+
     async def exercise():
-        events = Events(subscribe_timeout=0.2)
+        events = Events()
         calls = []
 
         async def on_subscribe(context, arguments, id):

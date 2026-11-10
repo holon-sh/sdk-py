@@ -191,7 +191,8 @@ class _App:
                 if not name.startswith("_")
             }
         )
-        self.events = AppEvents(self, contract)
+        # Draft extensions, whose interfaces may change with the drafts.
+        self.ext = SimpleNamespace(events=AppEvents(self, contract))
 
     async def call_tool(
         self,

@@ -30,7 +30,6 @@ from typing import (
     Generic,
     Literal,
     TypeAlias,
-    TypedDict,
     TypeVar,
     cast,
 )
@@ -79,11 +78,12 @@ if TYPE_CHECKING:
 __all__ = [
     "EVENTS_EXTENSION",
     "AppEvents",
-    "CheckResult",
+    "EmitBuffer",
     "Event",
+    "EventResult",
     "EventType",
     "Events",
-    "Keep",
+    "NoCompatibleDeliveryMode",
     "Subscription",
 ]
 
@@ -104,18 +104,19 @@ _STREAMS = "holon.ext.events.streams"
 A = TypeVar("A")
 D = TypeVar("D")
 Delivery: TypeAlias = Literal["poll", "push"]
-Teardown: TypeAlias = Callable[[], object]
 
 
-class Keep(TypedDict, total=False):
-    """What each event type keeps of what it emits, for polls and streams that are behind or reconnect."""
+@dataclass(frozen=True)
+class EmitBuffer:
+    """The sketch's emit buffer: what each event type keeps of what it emits, for polls and streams that are behind
+    or reconnect."""
 
-    events: int
-    """How many events. Ten thousand unless given."""
-    age: float
-    """For how long, in seconds. Ten minutes unless given."""
-    bytes: int
-    """How many bytes their data takes as JSON. The newest is kept whatever it takes. 4 MiB unless given."""
+    max_age: float = 600.0
+    """For how long, in seconds."""
+    max_events: int = 10_000
+    """How many events."""
+    max_bytes: int = 4 * 2**20
+    """How many bytes their data takes as JSON. The newest is kept whatever it takes."""
 
 
 @dataclass(frozen=True)
@@ -139,8 +140,8 @@ class Event(Generic[D]):
 
 
 @dataclass(frozen=True)
-class CheckResult(Generic[D]):
-    """What happened after a cursor, as a check function finds it."""
+class EventResult(Generic[D]):
+    """What happened after a cursor, as a check function finds it: the sketch's EventResult."""
 
     events: Sequence[Event[D]]
     """Empty when the cursor was None, which asks only for the current position. A source without positions
@@ -154,14 +155,12 @@ class CheckResult(Generic[D]):
 
 
 Check: TypeAlias = Callable[
-    [RequestContext, A, str | None], CheckResult[D] | Awaitable[CheckResult[D]]
+    [RequestContext, A, str | None], EventResult[D] | Awaitable[EventResult[D]]
 ]
 Match: TypeAlias = Callable[[RequestContext, Event[D], A], bool]
 Transform: TypeAlias = Callable[[RequestContext, Event[D], A], object]
 Authorize: TypeAlias = Callable[[RequestContext, A], bool | Awaitable[bool]]
-OnSubscribe: TypeAlias = Callable[
-    [RequestContext, A, str, Delivery], Teardown | None | Awaitable[Teardown | None]
-]
+SubscriptionHook: TypeAlias = Callable[[RequestContext, A, str], None | Awaitable[None]]
 
 
 class _SubscribeParams(RequestParams):
@@ -258,7 +257,9 @@ class _Read:
 class _Entry:
     """A subscription held by one or more streams or poll leases, set up once by the type's on_subscribe."""
 
-    ready: asyncio.Future[Any]
+    ready: asyncio.Future[None]
+    request: _Request
+    """The request that began it, whose context and arguments on_unsubscribe is given."""
     holds: set[_Hold] = field(default_factory=set)
 
 
@@ -299,7 +300,8 @@ class EventType(Generic[A, D]):
     _interval: float
     _delivery: list[Delivery]
     _authorize: Authorize[A] | None
-    _on_subscribe: OnSubscribe[A] | None
+    _on_subscribe: SubscriptionHook[A] | None
+    _on_unsubscribe: SubscriptionHook[A] | None
     # What was emitted, oldest first. `_dropped` is the last sequence let go for room or age.
     _kept: list[_Kept] = field(default_factory=list)
     _sequence: int = 0
@@ -307,7 +309,7 @@ class EventType(Generic[A, D]):
     _bytes: int = 0
     _latest: dict[tuple[str | None, str], _Kept] = field(default_factory=dict)
     _subscriptions: dict[str, _Entry] = field(default_factory=dict)
-    # Subscriptions being torn down, which one that begins with the same id waits for.
+    # Subscriptions being told they ended, which one that begins with the same id waits for.
     _closing: dict[str, asyncio.Event] = field(default_factory=dict)
     # Subscriptions of a type with a check function, held by nothing, that an event emitted to them could not reach,
     # oldest first. Ids that never come back are let go once there are as many as the events kept.
@@ -319,12 +321,13 @@ class EventType(Generic[A, D]):
         *,
         event_id: str | None = None,
         timestamp: datetime | str | None = None,
-        subscription: str | None = None,
+        subscription_id: str | None = None,
     ) -> None:
         """Emit an occurrence to the subscriptions it matches.
 
         Give the source's own ``event_id`` when it has one, so that a client drops an occurrence it has seen. With
-        ``subscription``, the occurrence goes to that subscription alone, whatever its arguments. It is kept like any
+        ``subscription_id``, the sketch's targeted emit, the occurrence goes to that subscription alone, whatever its
+        arguments. It is kept like any
         other, so a subscription that reconnects or polls from its cursor still has it, or is told of a gap. A type
         with a check function serves polls from the check function, so an occurrence emitted to a subscription that
         has no open stream is reported to it as a gap.
@@ -341,20 +344,20 @@ class EventType(Generic[A, D]):
             data, event_id or str(uuid.uuid4()), _iso(timestamp), name=self.name
         )
         self._keep(
-            _Kept(event, size, subscription, self._key(data) if self._key else None)
+            _Kept(event, size, subscription_id, self._key(data) if self._key else None)
         )
-        if subscription is None:
+        if subscription_id is None:
             holds = [
                 hold for entry in self._subscriptions.values() for hold in entry.holds
             ]
         else:
-            entry = self._subscriptions.get(subscription)
+            entry = self._subscriptions.get(subscription_id)
             holds = list(entry.holds) if entry else []
             # A type with a check function answers polls from it, so neither a poll nor a subscription held by
             # nothing now can be given this.
             if self._check is not None:
                 if not holds:
-                    self._missed[subscription] = None
+                    self._missed[subscription_id] = None
                     if len(self._missed) > self._events._keep_events:
                         del self._missed[next(iter(self._missed))]
                 for hold in holds:
@@ -375,16 +378,16 @@ class EventType(Generic[A, D]):
             )
         return self._position()
 
-    def end(
-        self, subscription: str | None = None, error: ErrorData | None = None
+    def terminate(
+        self, subscription_id: str | None = None, error: ErrorData | None = None
     ) -> None:
-        """End one subscription, or all of this type's. A stream is told ``error`` and closed, and the next poll
-        is answered with it. Forbidden unless given."""
-        if subscription is None:
+        """Terminate one subscription, or all of this type's: a stream is sent ``notifications/events/terminated``
+        with ``error`` and closed, and the next poll is answered with it. Forbidden unless given."""
+        if subscription_id is None:
             entries = list(self._subscriptions.values())
         else:
             entries = (
-                [entry] if (entry := self._subscriptions.get(subscription)) else []
+                [entry] if (entry := self._subscriptions.get(subscription_id)) else []
             )
         for hold in [hold for entry in entries for hold in entry.holds]:
             if hold.ended is None:
@@ -395,7 +398,7 @@ class EventType(Generic[A, D]):
         """Stop offering this event type: its subscriptions end with NotFound."""
         if self._events._types.get(self.name) is self:
             del self._events._types[self.name]
-            self.end(error=_REMOVED)
+            self.terminate(error=_REMOVED)
 
     def _position(self, sequence: int | None = None) -> str:
         return (
@@ -614,13 +617,13 @@ class Events(Extension):
     Pass it to ``MCPServer(extensions=[events])``, or call :meth:`serve` on a low-level ``Server``. Over Streamable
     HTTP, push is offered only on an endpoint mounted through :meth:`asgi`; elsewhere clients poll.
 
-    Each type keeps what it emits, as ``keep`` bounds it, for polls and for streams that are behind or reconnect;
+    Each type keeps what it emits, as ``emit_buffer`` bounds it, for polls and for streams that are behind or reconnect;
     those cursors last as long as the process, and after a restart a client is told that events were skipped. A
     type with a check function serves polls from it instead, with cursors that are its source's. A type is asked
     again, and a poll told to come back, every ``interval`` seconds unless the type says otherwise. A stream hears
     from the server every ``heartbeat`` seconds, and one whose reader has taken nothing for two heartbeats is closed,
-    to reconnect from its cursor. A poll subscription lasts ``poll_lease`` seconds after its last poll, a minute or
-    three of the type's intervals unless given.
+    to reconnect from its cursor. A poll subscription lasts ``poll_subscription_ttl`` seconds after its last poll, a
+    minute or three of the type's intervals unless given.
 
     A stream sends one event at a time and holds nothing else of its own. ``max_sending_bytes`` bounds the events
     every stream together is sending at once, and one caller's streams a quarter of it; an event is sent alone when
@@ -637,23 +640,23 @@ class Events(Extension):
     def __init__(
         self,
         *,
-        keep: Keep | None = None,
+        emit_buffer: EmitBuffer | None = None,
         interval: float = 1.0,
         heartbeat: float = 30.0,
-        poll_lease: float | None = None,
+        poll_subscription_ttl: float | None = None,
         max_sending_bytes: int = 16 * 2**20,
         max_subscriptions: int = 10_000,
         max_subscriptions_per_caller: int = 100,
         page_size: int = 100,
         subscribe_timeout: float = 30.0,
     ) -> None:
-        keep = keep or {}
-        self._keep_events = keep.get("events", 10_000)
-        self._keep_age = keep.get("age", 600.0)
-        self._keep_bytes = keep.get("bytes", 4 * 2**20)
+        emit_buffer = emit_buffer or EmitBuffer()
+        self._keep_events = emit_buffer.max_events
+        self._keep_age = emit_buffer.max_age
+        self._keep_bytes = emit_buffer.max_bytes
         self._interval = interval
         self._heartbeat = heartbeat
-        self._poll_lease = poll_lease
+        self._poll_subscription_ttl = poll_subscription_ttl
         self._max_sending = max_sending_bytes
         self._max_subscriptions = max_subscriptions
         self._max_per_caller = max_subscriptions_per_caller
@@ -687,7 +690,8 @@ class Events(Extension):
         interval: float | None = None,
         delivery: Sequence[Delivery] = ("poll", "push"),
         authorize: Authorize[A] | None = None,
-        on_subscribe: OnSubscribe[A] | None = None,
+        on_subscribe: SubscriptionHook[A] | None = None,
+        on_unsubscribe: SubscriptionHook[A] | None = None,
     ) -> EventType[A, D]:
         """Declare an event type.
 
@@ -713,11 +717,12 @@ class Events(Extension):
             authorize: ``(context, arguments)``: whether the caller may subscribe. A subscription is refused with
                 Forbidden when it may not, and one already held is ended when it no longer may: each poll asks, and
                 a stream asks at each heartbeat. A refused poll ends its lease at once.
-            on_subscribe: ``(context, arguments, subscription_id, delivery)``: called when a subscription begins,
-                to set up what its events come from. What it returns is called when the subscription ends: its last
-                stream closes, its poll lease lapses because polls stopped, or the app ends it. A subscription held
-                by two streams at once is set up once, and one that begins again waits for its teardown. A server
-                that restarts calls it again, with the same id for a caller with an identity.
+            on_subscribe: ``(context, arguments, subscription_id)``: called when a subscription begins, to set up
+                what its events come from. A subscription held by two streams at once is set up once. A server that
+                restarts calls it again, with the same id for a caller with an identity.
+            on_unsubscribe: ``(context, arguments, subscription_id)``: called when a subscription that was set up
+                ends: its last stream closes, its poll lease lapses because polls stopped, or the app terminates it.
+                One that begins again with the same id waits for it to return.
         """
         if name in self._types:
             raise ValueError(f"Event {name} is already declared.")
@@ -758,10 +763,13 @@ class Events(Extension):
             list(delivery),
             authorize,
             on_subscribe,
+            on_unsubscribe,
         )
         self._types[name] = declared
         return declared
 
+    # Declared under capabilities.extensions only. The sketch also declares capabilities.events, but the MCP SDK's
+    # ServerCapabilities drops top-level keys it does not know, and offers no way to add one.
     def settings(self) -> dict[str, Any]:
         # Event types change only in the process, and the SDK has no channel to tell every client of it.
         return {"listChanged": False}
@@ -937,7 +945,7 @@ class Events(Extension):
             targetable=principal is not None or delivery == "push",
         )
         if not await declared._allows(context, arguments):
-            declared.end(id, _FORBIDDEN)
+            declared.terminate(id, _FORBIDDEN)
             if lease := self._leases.get(id):
                 self._stop(id, lease)
             raise MCPError.from_error_data(_FORBIDDEN)
@@ -945,7 +953,7 @@ class Events(Extension):
 
     # Begins holding a subscription, by a stream or a poll lease: counted against the limits first, so a refused one
     # provisions nothing. The type's on_subscribe runs, apart from the request, when the first hold of an id begins,
-    # and its teardown when the last ends. Await `_ready` before serving the hold.
+    # and its on_unsubscribe when the last ends. Await `_ready` before serving the hold.
     def _open(
         self,
         declared: EventType[Any, Any],
@@ -972,7 +980,7 @@ class Events(Extension):
         entry = declared._subscriptions.get(request.id)
         if entry is None:
             entry = _Entry(
-                asyncio.ensure_future(self._set_up(declared, request, delivery))
+                asyncio.ensure_future(self._set_up(declared, request)), request
             )
             declared._subscriptions[request.id] = entry
         hold = _Hold(declared, request, delivery, entry, wake)
@@ -982,17 +990,14 @@ class Events(Extension):
         entry.holds.add(hold)
         return hold
 
-    async def _set_up(
-        self, declared: EventType[Any, Any], request: _Request, delivery: Delivery
-    ) -> Teardown | None:
+    async def _set_up(self, declared: EventType[Any, Any], request: _Request) -> None:
         if declared._on_subscribe is None:
-            return None
+            return
         # A hook that never returns would hold its id for good: past the deadline the subscription is refused.
         async with asyncio.timeout(self._subscribe_timeout):
-            setup = declared._on_subscribe(
-                request.context, request.arguments, request.id, delivery
+            await _settle(
+                declared._on_subscribe(request.context, request.arguments, request.id)
             )
-            return cast(Teardown | None, await _settle(setup))
 
     async def _ready(self, hold: _Hold) -> None:
         await asyncio.shield(hold.entry.ready)
@@ -1017,26 +1022,30 @@ class Events(Extension):
         if declared._subscriptions.get(id) is entry:
             del declared._subscriptions[id]
         closing = declared._closing[id] = asyncio.Event()
-        task = asyncio.ensure_future(
-            self._tear_down(declared, id, entry.ready, closing)
-        )
+        task = asyncio.ensure_future(self._tear_down(declared, id, entry, closing))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    # A setup or teardown that fails has nobody to tell but the log, and must not take the process down.
+    # Only a subscription that was set up is told it ended. A hook that fails has nobody to tell but the log, and must
+    # not take the process down.
     async def _tear_down(
         self,
         declared: EventType[Any, Any],
         id: str,
-        ready: asyncio.Future[Any],
+        entry: _Entry,
         closing: asyncio.Event,
     ) -> None:
         try:
-            teardown = await ready
-            if callable(teardown):
-                await _settle(teardown())
+            await entry.ready
+            if declared._on_unsubscribe is not None:
+                request = entry.request
+                await _settle(
+                    declared._on_unsubscribe(request.context, request.arguments, id)
+                )
         except Exception:
-            logger.exception("An event subscription's setup or teardown failed")
+            logger.exception(
+                "An event subscription's on_subscribe or on_unsubscribe failed"
+            )
         finally:
             if declared._closing.get(id) is closing:
                 del declared._closing[id]
@@ -1060,8 +1069,8 @@ class Events(Extension):
         if lease.timer is not None:
             lease.timer.cancel()
         length = (
-            self._poll_lease
-            if self._poll_lease is not None
+            self._poll_subscription_ttl
+            if self._poll_subscription_ttl is not None
             else max(60.0, 3 * declared._interval)
         )
         lease.timer = asyncio.get_running_loop().call_later(
@@ -1298,8 +1307,12 @@ def _refused(error: Exception) -> bool:
     )
 
 
+class NoCompatibleDeliveryMode(Exception):
+    """The sketch's: none of the delivery modes the app offers for an event type is one this subscription uses."""
+
+
 class AppEvents:
-    """The events of one app, as its client lists and subscribes to them: ``app.events``."""
+    """The events of one app, as its client lists and subscribes to them: ``app.ext.events``."""
 
     def __init__(self, app: _App, contract: dict[str, Any] | None) -> None:
         self._app = app
@@ -1350,14 +1363,15 @@ class AppEvents:
             arguments: The subscription's arguments, as the type's ``inputSchema`` describes them.
             cursor: Where to resume from, as a subscription's ``cursor`` was. From now unless given.
             max_age: Seconds: events older than this are not replayed from ``cursor``.
-            delivery: ``"push"`` or ``"poll"``. Push when the app offers it, else poll, unless given.
+            delivery: ``"push"`` or ``"poll"``. Push when the app offers it, else poll, unless given. One the app
+                does not offer raises :class:`NoCompatibleDeliveryMode`.
             on_gap: Called when events were skipped, before the events after the gap.
 
         Returns:
             A :class:`Subscription` to enter with ``async with`` and iterate.
         """
         return Subscription(
-            self._app, name, dict(arguments or {}), cursor, max_age, delivery, on_gap
+            self, name, dict(arguments or {}), cursor, max_age, delivery, on_gap
         )
 
 
@@ -1372,25 +1386,25 @@ class _Reached:
 
 
 class Subscription(Generic[D]):
-    """A subscription to one event type, from ``app.events.subscribe``.
+    """A subscription to one event type, from ``app.ext.events.subscribe``.
 
     Entering it with ``async with`` subscribes, and returns once the app has confirmed the subscription; a refusal
     raises ``MCPError``. Iterating it yields each :class:`Event` once, in order, dropping one whose
-    ``event_id`` was seen. A dropped connection is reconnected, and resumes from the cursor. Leaving the block, or
-    cancelling its task, is what ends the subscription: breaking out of ``async for`` alone does not. Iteration
-    raises ``MCPError`` when the app ends it.
+    ``event_id`` was seen. A dropped connection is reconnected, and resumes from the cursor. :meth:`cancel`, leaving
+    the block, or cancelling its task ends the subscription: breaking out of ``async for`` alone does not. Iteration
+    raises ``MCPError`` when the app terminates it.
 
     ``cursor`` is the position after the last event iterated, to persist and resume from. ``delivery`` is how
     events arrive, once entered.
 
     Example:
-        ``async with app.events.subscribe("board.changed", {"board": "b1"}) as events:``
+        ``async with app.ext.events.subscribe("board.changed", {"board": "b1"}) as events:``
         ``    async for event in events: ...``
     """
 
     def __init__(
         self,
-        app: _App,
+        events: AppEvents,
         name: str,
         arguments: dict[str, Any],
         cursor: str | None,
@@ -1401,7 +1415,8 @@ class Subscription(Generic[D]):
         self.cursor = cursor
         self.delivery = delivery
         self._forced = delivery is not None
-        self._app = app
+        self._events = events
+        self._app = events._app
         self._name = name
         self._request: dict[str, Any] = {"name": name, "arguments": arguments}
         if max_age is not None:
@@ -1419,21 +1434,23 @@ class Subscription(Generic[D]):
             Event[Any] | _Gap | _Reached
         ]()
         self._group: anyio.abc.TaskGroup | None = None
+        self._running = anyio.CancelScope()
         # The open stream request, which a notification ends when the app ended the subscription.
         self._stream: anyio.CancelScope | None = None
         self._ended: Exception | None = None
 
     async def __aenter__(self) -> Subscription[D]:
-        if self.delivery is None:
-            offered: list[str] = next(
-                (
-                    each.get("delivery", [])
-                    for each in await self._app.events.list()
-                    if each["name"] == self._name
-                ),
-                [],
+        listed = [
+            each for each in await self._events.list() if each["name"] == self._name
+        ]
+        # A type the app does not list is refused by the app, with NotFound.
+        offered: list[str] = listed[0].get("delivery", []) if listed else ["poll"]
+        wanted = [self.delivery] if self.delivery else ["push", "poll"]
+        if not (usable := [mode for mode in wanted if mode in offered]):
+            raise NoCompatibleDeliveryMode(
+                f"{self._app._name} does not deliver {self._name} by {' or '.join(wanted)}."
             )
-            self.delivery = "push" if "push" in offered else "poll"
+        self.delivery = cast(Delivery, usable[0])
         self._group = anyio.create_task_group()
         await self._group.__aenter__()
         self._group.start_soon(self._run)
@@ -1455,6 +1472,12 @@ class Subscription(Generic[D]):
         traceback: TracebackType | None,
     ) -> None:
         await self._close()
+
+    async def cancel(self) -> None:
+        """The sketch's ``sub.cancel()``: ends the subscription, and iteration stops. Leaving the block does too."""
+        # The block's own code runs inside the task group, so only the work behind the iterator is cancelled here.
+        self._running.cancel()
+        self._receive.close()
 
     async def _close(self) -> None:
         if self._group is not None:
@@ -1485,31 +1508,32 @@ class Subscription(Generic[D]):
                 return item
 
     async def _run(self) -> None:
-        try:
-            async with self._app._session(
-                _TIMEOUT, partial(_ordered, notified=self._notified)
-            ) as client:
-                try:
-                    if self.delivery == "push":
-                        try:
-                            await self._push(client)
-                        except MCPError as error:
-                            # An endpoint that cannot stream refuses push, and the subscription polls instead.
-                            if (
-                                self._forced
-                                or self._active
-                                or error.code != UNSUPPORTED
-                            ):
-                                raise
-                            self.delivery = "poll"
-                    await self._poll(client)
-                except Exception as error:  # noqa: BLE001
-                    self._failure = error
-        except Exception as error:  # noqa: BLE001
-            self._failure = self._failure or error
-        finally:
-            self._settled.set()
-            self._send.close()
+        with self._running:
+            try:
+                async with self._app._session(
+                    _TIMEOUT, partial(_ordered, notified=self._notified)
+                ) as client:
+                    try:
+                        if self.delivery == "push":
+                            try:
+                                await self._push(client)
+                            except MCPError as error:
+                                # An endpoint that cannot stream refuses push, and the subscription polls instead.
+                                if (
+                                    self._forced
+                                    or self._active
+                                    or error.code != UNSUPPORTED
+                                ):
+                                    raise
+                                self.delivery = "poll"
+                        await self._poll(client)
+                    except Exception as error:  # noqa: BLE001
+                        self._failure = error
+            except Exception as error:  # noqa: BLE001
+                self._failure = self._failure or error
+            finally:
+                self._settled.set()
+                self._send.close()
 
     def _confirm(self) -> None:
         self._active = True
@@ -1533,7 +1557,7 @@ class Subscription(Generic[D]):
             if len(self._seen) > 1024:
                 del self._seen[next(iter(self._seen))]
         data = occurrence.get("data")
-        if (schema := self._app.events._payloads.get(self._name)) is not None:
+        if (schema := self._events._payloads.get(self._name)) is not None:
             self._app._validate(
                 "events/" + self._name,
                 schema,

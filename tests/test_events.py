@@ -266,7 +266,7 @@ def test_the_messages_on_the_wire_are_the_sketchs(monkeypatch):
             delivery=["poll"],
             authorize=lambda context, arguments: arguments.board != "secret",
         )
-        server = MCPServer("boards", extensions=[events])
+        server = MCPServer("boards", extensions=[events], middleware=[events])
         port, stop = await serve(mounted(server, events))
         url = f"http://127.0.0.1:{port}/mcp/"
         b1 = {"name": "board.changed", "arguments": {"board": "b1"}}
@@ -276,6 +276,10 @@ def test_the_messages_on_the_wire_are_the_sketchs(monkeypatch):
             return response.json()
 
         async with httpx2.AsyncClient(timeout=10) as http:
+            discovered = await answer(http, "server/discover", {})
+            assert discovered["result"]["capabilities"]["events"] == {
+                "listChanged": False
+            }
             listed = (await answer(http, "events/list", {}))["result"]["events"]
             assert listed[0] == {
                 "name": "board.changed",

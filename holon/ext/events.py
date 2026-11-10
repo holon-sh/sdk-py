@@ -38,7 +38,7 @@ import anyio
 from mcp import Client
 from mcp.client import Transport
 from mcp.client._transport import TransportStreams
-from mcp.server.context import HandlerResult, ServerRequestContext
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.lowlevel.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -619,8 +619,9 @@ def _streams(ctx: ServerRequestContext[Any, Any]) -> bool:
 class Events(Extension):
     """The event types an app serves as MCP Events, by poll and push.
 
-    Pass it to ``MCPServer(extensions=[events])``, or call :meth:`serve` on a low-level ``Server``. Over Streamable
-    HTTP, push is offered only on an endpoint mounted through :meth:`asgi`; elsewhere clients poll.
+    Pass it to ``MCPServer(extensions=[events], middleware=[events])``, or call :meth:`serve` on a low-level
+    ``Server``. Over Streamable HTTP, push is offered only on an endpoint mounted through :meth:`asgi`; elsewhere
+    clients poll.
 
     Each type keeps what it emits, for ten minutes and up to 10,000 events and 4 MiB, for polls and for streams that
     are behind or reconnect; those cursors last as long as the process, and after a restart a client is told that
@@ -744,8 +745,6 @@ class Events(Extension):
         self._types[name] = declared
         return declared
 
-    # Declared under capabilities.extensions only. The sketch also declares capabilities.events, but the MCP SDK's
-    # ServerCapabilities drops top-level keys it does not know, and offers no way to add one.
     def settings(self) -> dict[str, Any]:
         # Event types change only in the process, and the SDK has no channel to tell every client of it.
         return {"listChanged": False}
@@ -764,6 +763,21 @@ class Events(Extension):
                 binding.method, binding.params_type, binding.handler
             )
         server.extensions[self.identifier] = self.settings()
+        server.middleware.append(self)
+
+    async def __call__(
+        self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
+    ) -> HandlerResult:
+        """Declare ``capabilities.events`` beside ``capabilities.extensions``, as middleware of the server."""
+        result = await call_next(ctx)
+        if ctx.method in ("initialize", "server/discover") and isinstance(result, dict):
+            capabilities = result.get("capabilities")
+            if isinstance(capabilities, dict):
+                result = {
+                    **result,
+                    "capabilities": {**capabilities, "events": self.settings()},
+                }
+        return result
 
     def asgi(self, manager: StreamableHTTPSessionManager) -> ASGIApp:
         """The endpoint of ``manager``, on which push is offered.

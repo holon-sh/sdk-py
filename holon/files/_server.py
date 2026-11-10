@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import binascii
 import contextvars
@@ -11,6 +12,7 @@ import mimetypes
 import os
 import secrets
 import shutil
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -611,12 +613,15 @@ class LocalStorage:
     cleaned up.
 
     Args:
-        root: Directory for staged uploads and published downloads.
+        root: Directory for staged uploads and published downloads. Defaults
+            to a temporary directory made on first use and removed at exit.
         path: Where ``app`` is mounted, relative to the MCP address.
     """
 
-    def __init__(self, root: str | os.PathLike[str], *, path: str = "/files") -> None:
-        self._root = Path(root)
+    def __init__(
+        self, root: str | os.PathLike[str] | None = None, *, path: str = "/files"
+    ) -> None:
+        self._root = None if root is None else Path(root)
         self._path = path.rstrip("/")
         self._slots: dict[str, _Slot] = {}
         self._staged: dict[str, float] = {}
@@ -691,6 +696,11 @@ class LocalStorage:
         return target
 
     def _dir(self, kind: str) -> Path:
+        if self._root is None:
+            # Made on first use, not when constructed, so a server can be built
+            # where nothing may be written, such as while its contract is read.
+            self._root = Path(tempfile.mkdtemp(prefix="holon-files-"))
+            atexit.register(shutil.rmtree, self._root, ignore_errors=True)
         directory = self._root / kind
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         return directory

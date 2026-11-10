@@ -66,6 +66,22 @@ await apps.huggingface.tools.hub_search(query="llama")
 # error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
+### Files
+
+Where a tool takes a file (the draft [files extension](https://github.com/modelcontextprotocol/experimental-ext-file-uploads)), pass a `File`. Small files travel inline; larger ones are uploaded where the server asks before the tool runs. Read the files a tool returns with `downloads`:
+
+```python
+from holon.files import File, downloads
+
+await apps.storage.tools.save(folder="reports", file=File("q3.pdf"))
+
+result = await apps.storage.call_tool("export", folder="reports")
+for download in downloads(result):
+    await download.save("exports")
+```
+
+A binding's `file_origins` limits where uploads and downloads may go. Servers accept file arguments with `holon.files.FileServer`.
+
 ## Community
 
 Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

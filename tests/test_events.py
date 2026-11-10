@@ -1,6 +1,7 @@
 import asyncio
 import json
 import socket
+import sys
 from typing import Annotated, Literal
 
 import httpx2
@@ -423,26 +424,65 @@ def test_a_poll_that_gives_up_while_it_is_set_up_still_lets_its_lease_lapse():
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
 
 
-def test_without_the_wrapper_push_is_not_offered_and_a_subscription_polls():
+def test_where_push_cannot_be_served_it_is_not_offered_and_a_subscription_polls(
+    monkeypatch,
+):
     async def exercise():
         events = Events()
         changed = declare(events)
+        bare = MCPServer("boards", extensions=[events])
+        # An SDK release without the private stream path the wrapper borrows on a JSON endpoint.
+        monkeypatch.setitem(sys.modules, "mcp.server._streamable_http_modern", None)
+        wrapped = MCPServer("boards", extensions=[events])
+        wrapped.streamable_http_app(stateless_http=True, json_response=True)
+        manager = wrapped.session_manager
+        endpoints = [
+            bare.streamable_http_app(stateless_http=True, json_response=True),
+            Starlette(
+                routes=[Mount("/mcp", app=events.asgi(manager))],
+                lifespan=lambda app: manager.run(),
+            ),
+        ]
+        params = {"name": "board.changed", "arguments": {"board": "b1"}}
+        for app, path in zip(endpoints, ["/mcp", "/mcp/"], strict=True):
+            port, stop = await serve(app)
+            url = f"http://127.0.0.1:{port}{path}"
+            async with httpx2.AsyncClient(timeout=10) as http:
+                listed = (await http.post(url, **request("events/list", {}))).json()
+                assert listed["result"]["events"][0]["delivery"] == ["poll"]
+                stream = await http.post(url, **request("events/stream", params))
+                assert stream.json()["error"]["code"] == -32026
+            async with boards(port, path).events.subscribe(
+                "board.changed", {"board": "b1"}
+            ) as changes:
+                assert changes.delivery == "poll"
+                changed.emit(Change(board="b1", text="polled"))
+                assert (await anext(changes)).data["text"] == "polled"
+            await stop()
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=20))
+
+
+def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_releases_the_id():
+    async def exercise():
+        events = Events(subscribe_timeout=0.2)
+        calls = []
+
+        async def on_subscribe(context, arguments, id, delivery):
+            calls.append(id)
+            if len(calls) == 1:
+                await asyncio.Event().wait()
+
+        declare(events, on_subscribe=on_subscribe)
         server = MCPServer("boards", extensions=[events])
-        app = server.streamable_http_app(stateless_http=True, json_response=True)
-        port, stop = await serve(app)
-        url = f"http://127.0.0.1:{port}/mcp"
+        port, stop = await serve(mounted(server, events))
+        url = f"http://127.0.0.1:{port}/mcp/"
         params = {"name": "board.changed", "arguments": {"board": "b1"}}
         async with httpx2.AsyncClient(timeout=10) as http:
-            listed = (await http.post(url, **request("events/list", {}))).json()
-            assert listed["result"]["events"][0]["delivery"] == ["poll"]
-            refused = (await http.post(url, **request("events/stream", params))).json()
-            assert refused["error"]["code"] == -32026
-        async with boards(port, "/mcp").events.subscribe(
-            "board.changed", {"board": "b1"}
-        ) as changes:
-            assert changes.delivery == "poll"
-            changed.emit(Change(board="b1", text="polled"))
-            assert (await anext(changes)).data["text"] == "polled"
+            first = (await http.post(url, **request("events/poll", params))).json()
+            assert first["error"]["code"] == -32603
+            second = (await http.post(url, **request("events/poll", params))).json()
+            assert "result" in second and calls[0] == calls[1]
         await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))

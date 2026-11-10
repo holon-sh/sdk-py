@@ -489,6 +489,7 @@ class Subscription(Generic[Data]):
     ) -> None:
         self.cursor = cursor
         self.delivery = delivery
+        self._forced = delivery is not None
         self._app = app
         self._name = name
         self._request: dict[str, Any] = {"name": name, "arguments": arguments}
@@ -573,13 +574,22 @@ class Subscription(Generic[Data]):
                 return item
 
     async def _run(self) -> None:
-        push = self.delivery == "push"
         try:
-            async with self._app._session(
-                _TIMEOUT, self._notified if push else None
-            ) as client:
+            async with self._app._session(_TIMEOUT, self._notified) as client:
                 try:
-                    await (self._push(client) if push else self._poll(client))
+                    if self.delivery == "push":
+                        try:
+                            await self._push(client)
+                        except MCPError as error:
+                            # An endpoint that cannot stream refuses push, and the subscription polls instead.
+                            if (
+                                self._forced
+                                or self._active
+                                or error.code != UNSUPPORTED
+                            ):
+                                raise
+                            self.delivery = "poll"
+                    await self._poll(client)
                 except Exception as error:  # noqa: BLE001
                     self._failure = error
         except Exception as error:  # noqa: BLE001

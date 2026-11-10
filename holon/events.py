@@ -22,7 +22,6 @@ from datetime import UTC, datetime
 from typing import Any, Generic, Literal, TypeAlias, TypedDict, TypeVar, cast
 
 import anyio
-from mcp.server._streamable_http_modern import handle_modern_request
 from mcp.server.context import HandlerResult, ServerRequestContext
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.lowlevel.server import Server
@@ -182,7 +181,7 @@ def _occurrence(event: Event[Any], data: Any) -> dict[str, Any]:
         "data": to_jsonable_python(data, by_alias=True),
     }
     if event.meta:
-        occurrence["_meta"] = event.meta
+        occurrence["_meta"] = to_jsonable_python(event.meta, by_alias=True)
     return occurrence
 
 
@@ -241,6 +240,8 @@ class _Hold:
     wake: Callable[[], None]
     """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
+    missed: bool = False
+    """An event emitted to it could not be given to it, which its next read reports as a gap."""
 
 
 @dataclass(eq=False)
@@ -275,7 +276,7 @@ class EventType(Generic[A, D]):
     _subscriptions: dict[str, _Entry] = field(default_factory=dict)
     # Subscriptions being torn down, which one that begins with the same id waits for.
     _closing: dict[str, asyncio.Event] = field(default_factory=dict)
-    # Subscriptions of a type with a check function that an event emitted to them could not reach.
+    # Subscriptions of a type with a check function, held by nothing, that an event emitted to them could not reach.
     _missed: set[str] = field(default_factory=set)
 
     def emit(
@@ -294,8 +295,8 @@ class EventType(Generic[A, D]):
         with a check function serves polls from the check function, so an occurrence emitted to a subscription that
         has no open stream is reported to it as a gap.
 
-        Emitting is synchronous, and happens on the event loop that serves the events: from another thread, call
-        ``loop.call_soon_threadsafe(event_type.emit, data)``. Occurrences emitted one after another in the same
+        Emitting is synchronous, and happens on the event loop that serves the events, from the first emit on: from
+        another thread, call ``loop.call_soon_threadsafe(event_type.emit, data)``. Occurrences emitted one after another in the same
         synchronous run reach each subscription in that order, with no other occurrence of this type between them,
         whether polled or pushed, unless it is told of a gap. A type with a ``key`` promises less: see
         :meth:`Events.event`. Data that cannot be serialised raises here, before anything changes.
@@ -315,10 +316,13 @@ class EventType(Generic[A, D]):
         else:
             entry = self._subscriptions.get(subscription)
             holds = list(entry.holds) if entry else []
-            if self._check is not None and not any(
-                hold.delivery == "push" for hold in holds
-            ):
-                self._missed.add(subscription)
+            # A type with a check function answers polls from it, so neither a poll nor a subscription held by
+            # nothing now can be given this.
+            if self._check is not None:
+                if not holds:
+                    self._missed.add(subscription)
+                for hold in holds:
+                    hold.missed |= hold.delivery == "poll" and hold.request.targetable
         for hold in holds:
             hold.wake()
 
@@ -471,13 +475,17 @@ class EventType(Generic[A, D]):
     # own. Each event is placed at its own cursor when it has one, so a batch can be cut short; otherwise at the
     # cursor before the batch, which is safe to resume from. Delivery starts where the first event delivered does.
     async def _checked(
-        self, request: _Request, cursor: str | None, max_age_ms: int | None, limit: int
+        self,
+        hold: _Hold,
+        request: _Request,
+        cursor: str | None,
+        max_age_ms: int | None,
+        limit: int,
     ) -> _Read:
         assert self._check is not None
         result = await _settle(self._check(request.context, request.arguments, cursor))
         after_all = result.cursor
-        missed = request.id in self._missed
-        self._missed.discard(request.id)
+        missed, hold.missed = hold.missed, False
         # A None cursor asks for the current position and nothing before it, except of a source that has no
         # positions: each check of that is asked with None, and answers with what is new.
         if cursor is None and after_all is not None:
@@ -531,6 +539,34 @@ class EventType(Generic[A, D]):
 Notify: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
+# The manager's own handling of a 2026-07-28 request, answering by stream as it does subscriptions/listen, which is
+# the one method the SDK streams on an endpoint that answers in JSON. The path is private to the SDK, so it is looked
+# for when an endpoint is mounted, and an endpoint without it offers poll only.
+def _streaming(manager: StreamableHTTPSessionManager) -> ASGIApp | None:
+    try:
+        from mcp.server._streamable_http_modern import handle_modern_request
+    except ImportError:
+        return None
+    expected = ["app", "security_settings", "json_response", "lifespan_state"]
+    expected += ["scope", "receive", "send"]
+    taken = list(inspect.signature(handle_modern_request).parameters)
+    if taken != expected or not hasattr(manager, "_lifespan_state"):
+        return None
+
+    async def stream(scope: Scope, receive: Receive, send: Send) -> None:
+        await handle_modern_request(
+            manager.app,
+            manager.security_settings,
+            False,
+            manager._lifespan_state,
+            scope,
+            receive,
+            send,
+        )
+
+    return RequestBodyLimitMiddleware(stream, manager.max_request_body_size)
+
+
 def _streams(ctx: ServerRequestContext[Any, Any]) -> bool:
     # Over stdio every request can stream. Over HTTP only one that came through `Events.asgi` is known to.
     return ctx.request is None or bool(ctx.request.scope.get(_STREAMS))
@@ -551,11 +587,13 @@ class Events(Extension):
     three of the type's intervals unless given.
 
     A stream sends one event at a time and holds nothing else of its own. ``max_sending_bytes`` bounds the events
-    every stream together is sending at once; an event is sent alone when nothing else is, whatever it weighs.
+    every stream together is sending at once, and one caller's streams a quarter of it; an event is sent alone when
+    nothing else is, whatever it weighs. Waiting for room counts toward the two heartbeats.
     ``max_subscriptions`` bounds the subscriptions held at once, streams and poll leases alike, and
     ``max_subscriptions_per_caller`` those of one caller; callers without an identity count together as one.
-    ``page_size`` is how many types ``events/list`` returns at a time. With the defaults, events take about 4 MiB
-    kept for each type and 16 MiB being sent, whatever one caller does.
+    ``page_size`` is how many types ``events/list`` returns at a time. A subscription whose ``on_subscribe`` has not
+    returned after ``subscribe_timeout`` seconds is refused, and may be tried again. With the defaults, events take
+    about 4 MiB kept for each type and 16 MiB being sent, whatever one caller does.
     """
 
     identifier = EVENTS_EXTENSION
@@ -571,6 +609,7 @@ class Events(Extension):
         max_subscriptions: int = 10_000,
         max_subscriptions_per_caller: int = 100,
         page_size: int = 100,
+        subscribe_timeout: float = 30.0,
     ) -> None:
         keep = keep or {}
         self._keep_events = keep.get("events", 10_000)
@@ -583,6 +622,7 @@ class Events(Extension):
         self._max_subscriptions = max_subscriptions
         self._max_per_caller = max_subscriptions_per_caller
         self._page_size = page_size
+        self._subscribe_timeout = subscribe_timeout
         # Cursors of kept events are positions in this process's memory; one from another process names nothing.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
@@ -592,6 +632,7 @@ class Events(Extension):
         self._leases: dict[str, _Lease] = {}
         self._tasks: set[asyncio.Future[Any]] = set()
         self._sending = 0
+        self._sending_by: dict[str, int] = {}
         self._sent = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -710,30 +751,17 @@ class Events(Extension):
         Mount it where ``manager.handle_request`` would be, inside any authentication. A manager set to answer in
         JSON drops the notifications a request sends, so there ``events/stream`` is answered by the SDK's own stream
         of server-sent events, for clients of the 2026-07-28 revision, which name the method in a header. Clients of
-        earlier revisions poll there.
+        earlier revisions poll there, and so does every client if the SDK no longer has that path.
         """
-
-        # The manager's own handling of a 2026-07-28 request, answering by stream as it does subscriptions/listen.
-        async def stream(scope: Scope, receive: Receive, send: Send) -> None:
-            await handle_modern_request(
-                manager.app,
-                manager.security_settings,
-                False,
-                manager._lifespan_state,
-                scope,
-                receive,
-                send,
-            )
-
-        streaming = RequestBodyLimitMiddleware(stream, manager.max_request_body_size)
+        streaming = _streaming(manager)
 
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             method = dict(scope.get("headers", [])).get(MCP_METHOD_HEADER.encode())
-            if scope["type"] == "http" and (
-                not manager.json_response or method is not None
-            ):
+            if scope["type"] == "http" and not manager.json_response:
                 scope = {**scope, _STREAMS: True}
-                if manager.json_response and method == b"events/stream":
+            elif scope["type"] == "http" and streaming and method is not None:
+                scope = {**scope, _STREAMS: True}
+                if method == b"events/stream":
                     return await streaming(scope, receive, send)
             await manager.handle_request(scope, receive, send)
 
@@ -772,11 +800,11 @@ class Events(Extension):
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
         declared, request = await self._subscription(params, "poll", _streams(ctx))
-        await self._lease(declared, request)
+        hold = await self._lease(declared, request)
         limit = params.max_events or _PAGE
         if declared._check is not None:
             read = await declared._checked(
-                request, params.cursor, params.max_age_ms, limit
+                hold, request, params.cursor, params.max_age_ms, limit
             )
         else:
             read = declared._since(request, params.cursor, params.max_age_ms, limit)
@@ -801,15 +829,15 @@ class Events(Extension):
 
         return await self._serve_stream(params, ctx.request_id, notify, _streams(ctx))
 
-    # Emitting must happen on the loop that serves the events, since it wakes their streams.
+    # Emitting must happen on the loop that serves the events, since it changes what they keep and wakes their
+    # streams without a lock: the first emit fixes the loop, and every later one must run on it.
     def _on_loop(self) -> None:
-        if self._loop is None:
-            return
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
-        if running is not self._loop:
+        self._loop = self._loop or running
+        if running is None or running is not self._loop:
             raise RuntimeError(
                 "Events are emitted on the event loop that serves them. From another thread, call "
                 "loop.call_soon_threadsafe(event_type.emit, data)."
@@ -912,6 +940,9 @@ class Events(Extension):
             )
             declared._subscriptions[request.id] = entry
         hold = _Hold(declared, request, delivery, entry, wake)
+        if request.targetable and request.id in declared._missed:
+            declared._missed.discard(request.id)
+            hold.missed = True
         entry.holds.add(hold)
         return hold
 
@@ -920,10 +951,12 @@ class Events(Extension):
     ) -> Teardown | None:
         if declared._on_subscribe is None:
             return None
-        setup = declared._on_subscribe(
-            request.context, request.arguments, request.id, delivery
-        )
-        return cast(Teardown | None, await _settle(setup))
+        # A hook that never returns would hold its id for good: past the deadline the subscription is refused.
+        async with asyncio.timeout(self._subscribe_timeout):
+            setup = declared._on_subscribe(
+                request.context, request.arguments, request.id, delivery
+            )
+            return cast(Teardown | None, await _settle(setup))
 
     async def _ready(self, hold: _Hold) -> None:
         await asyncio.shield(hold.entry.ready)
@@ -976,7 +1009,7 @@ class Events(Extension):
     # Poll subscriptions are leased: the first poll of a subscription begins one, each poll renews it, and it ends
     # when polls stop for the lease's length. The poll after the app ended it is answered with why, and the one after
     # that begins afresh.
-    async def _lease(self, declared: EventType[Any, Any], request: _Request) -> None:
+    async def _lease(self, declared: EventType[Any, Any], request: _Request) -> _Hold:
         await declared._settled(request.id)
         lease = self._leases.get(request.id)
         if lease is not None and lease.hold.type is not declared:
@@ -1003,6 +1036,7 @@ class Events(Extension):
         except Exception:
             self._stop(request.id, lease)
             raise
+        return lease.hold
 
     def _stop(self, id: str, lease: _Lease) -> None:
         if self._leases.get(id) is lease:
@@ -1011,16 +1045,25 @@ class Events(Extension):
             lease.timer.cancel()
         self._close(lease.hold)
 
-    # Waits until every stream together is sending few enough bytes for one more event of `size`.
+    # Waits until every stream together, and the caller's own streams, are sending few enough bytes for one more
+    # event of `size`. A caller may send a quarter of the whole, so that one cannot hold up the rest.
     @asynccontextmanager
-    async def _send_budget(self, size: int) -> AsyncIterator[None]:
-        while self._sending and self._sending + size > self._max_sending:
+    async def _send_budget(self, size: int, caller: str) -> AsyncIterator[None]:
+        while (self._sending and self._sending + size > self._max_sending) or (
+            (mine := self._sending_by.get(caller, 0))
+            and mine + size > self._max_sending // 4
+        ):
             await self._sent.wait()
         self._sending += size
+        self._sending_by[caller] = self._sending_by.get(caller, 0) + size
         try:
             yield
         finally:
             self._sending -= size
+            if self._sending_by[caller] == size:
+                del self._sending_by[caller]
+            else:
+                self._sending_by[caller] -= size
             self._sent.set()
             self._sent = asyncio.Event()
 
@@ -1045,8 +1088,8 @@ class Events(Extension):
                     **body.get("_meta", {}),
                     SUBSCRIPTION_ID_META_KEY: request_id,
                 }
-                async with self._send_budget(size):
-                    with anyio.move_on_after(2 * self._heartbeat) as waited:
+                with anyio.move_on_after(2 * self._heartbeat) as waited:
+                    async with self._send_budget(size, request.caller):
                         await notify(f"notifications/events/{method}", body)
                 if waited.cancelled_caught:
                     raise _Stalled
@@ -1066,7 +1109,7 @@ class Events(Extension):
             # Without a first answer there is no stream to tell, and the request fails.
             if checked:
                 read = await declared._checked(
-                    request, params.cursor, params.max_age_ms, _PAGE
+                    hold, request, params.cursor, params.max_age_ms, _PAGE
                 )
                 cursor = read.cursor
                 await say("active", {"cursor": read.start, "truncated": read.truncated})
@@ -1096,7 +1139,9 @@ class Events(Extension):
                     await say("heartbeat", {"cursor": position()})
                 elif time.monotonic() >= due:
                     try:
-                        read = await declared._checked(request, cursor, None, _PAGE)
+                        read = await declared._checked(
+                            hold, request, cursor, None, _PAGE
+                        )
                     except Exception as error:  # noqa: BLE001
                         await say("error", {"error": _described(error)})
                         due = time.monotonic() + declared._interval

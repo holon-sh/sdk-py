@@ -66,6 +66,49 @@ await apps.huggingface.tools.hub_search(query="llama")
 # error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
+## Events
+
+`holon.events` serves [MCP Events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md), the Triggers & Events Working Group's draft, by poll and push. Declare an event type once and emit:
+
+```python
+from pydantic import BaseModel
+from mcp.server import MCPServer
+from holon.events import Events
+
+
+class Board(BaseModel):
+    board: str
+
+
+class Change(BaseModel):
+    board: str
+    text: str
+
+
+events = Events()
+changed = events.event(
+    "board.changed",
+    input_schema=Board,
+    payload_schema=Change,
+    match=lambda context, event, arguments: event.data.board == arguments.board,
+)
+server = MCPServer("boards", extensions=[events])
+
+changed.emit(Change(board="b1", text="hello"))
+```
+
+Emitted events are kept in memory for polls and reconnecting streams. A type whose source keeps its own history takes a `check(context, arguments, cursor)` function instead. `authorize`, `on_subscribe`, `key`, `end`, `remove` and limits on what is kept and held are there when you need them. On an endpoint whose `StreamableHTTPSessionManager` answers in JSON, mount `events.asgi(manager)` in place of `manager.handle_request` so streams are still streamed.
+
+For a snapshot and then its changes, a tool returns the state with `changed.cursor()`, read in the same synchronous run, and the client subscribes from that cursor. Several kinds of change in one ordered stream are one event type whose payload is a union, and events emitted one after another reach each subscriber in that order.
+
+Every app client lists and subscribes, by push when the app offers it and by poll otherwise, reconnecting from its cursor:
+
+```python
+async with apps.boards.events.subscribe("board.changed", {"board": "b1"}) as changes:
+    async for event in changes:
+        print(event.data, changes.cursor)
+```
+
 ## Community
 
 Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

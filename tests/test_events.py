@@ -4,8 +4,12 @@ import socket
 from typing import Annotated, Literal
 
 import httpx2
+import pytest
 import uvicorn
 from mcp.server import MCPServer, Server
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import CallToolResult
 from pydantic import BaseModel, Field, TypeAdapter
@@ -43,9 +47,38 @@ async def serve(app, port=0):
     return sock.getsockname()[1], stop
 
 
-def boards(port):
-    endpoint = {"endpoint": f"http://127.0.0.1:{port}/mcp"}
-    return Apps(IDENTITY, {}, {"boards": endpoint}).boards
+# Holon admits a caller before the app sees the request; here an `x-user` header stands in for it.
+def mounted(server, events):
+    server.streamable_http_app(stateless_http=True)
+    manager = server.session_manager
+    app = AuthContextMiddleware(
+        Starlette(
+            routes=[Mount("/mcp", app=events.asgi(manager))],
+            lifespan=lambda app: manager.run(),
+        )
+    )
+
+    async def admitted(scope, receive, send):
+        if user := dict(scope.get("headers", [])).get(b"x-user"):
+            claims = {"iss": "https://id.example", "sub": user.decode()}
+            token = AccessToken(
+                token="t",
+                client_id="c",
+                scopes=[],
+                subject=user.decode(),
+                claims=claims,
+            )
+            scope = {**scope, "user": AuthenticatedUser(token)}
+        await app(scope, receive, send)
+
+    return admitted
+
+
+def boards(port, path="/mcp/", user=None):
+    binding = {"endpoint": f"http://127.0.0.1:{port}{path}"}
+    if user:
+        binding["http_client"] = lambda: httpx2.AsyncClient(headers={"x-user": user})
+    return Apps(IDENTITY, {}, {"boards": binding}).boards
 
 
 def declare(events, **hooks):
@@ -62,7 +95,12 @@ async def until(condition):
 def test_push_delivers_what_matches_as_shaped_and_resumes_after_the_connection_drops():
     async def exercise():
         events = Events()
-        ended = []
+        began, ended = [], []
+
+        def on_subscribe(context, arguments, id, delivery):
+            began.append(id)
+            return lambda: ended.append(id)
+
         changed = declare(
             events,
             match=lambda context, event, arguments: event.data.board == arguments.board,
@@ -70,31 +108,39 @@ def test_push_delivers_what_matches_as_shaped_and_resumes_after_the_connection_d
                 "board": event.data.board,
                 "text": event.data.text.upper(),
             },
-            on_subscribe=lambda context, arguments, id: lambda: ended.append(id),
+            on_subscribe=on_subscribe,
         )
         server = MCPServer("boards", extensions=[events])
-        port, stop = await serve(server.streamable_http_app(stateless_http=True))
-        app = boards(port)
+        port, stop = await serve(mounted(server, events))
+        app = boards(port, user="ann")
         async with app.events.subscribe("board.changed", {"board": "b1"}) as changes:
             assert changes.delivery == "push"
             changed.emit(Change(board="b2", text="elsewhere"))
             changed.emit(Change(board="b1", text="first"))
             first = await anext(changes)
-            assert first.data == {"board": "b1", "text": "FIRST"}
+            assert (first.name, first.data) == (
+                "board.changed",
+                {"board": "b1", "text": "FIRST"},
+            )
             assert changes.cursor == first.cursor == changed.cursor()
             await stop()
             await until(lambda: len(ended) == 1)
             # Emitted while the client is away, and owed to it from its cursor.
             changed.emit(Change(board="b1", text="second"))
-            port, stop = await serve(
-                server.streamable_http_app(stateless_http=True), port
-            )
+            port, stop = await serve(mounted(server, events), port)
             second = await anext(changes)
             assert second.data == {"board": "b1", "text": "SECOND"}
             assert second.cursor == changed.cursor()
         await until(lambda: len(ended) == 2)
         # The same caller and arguments are the same subscription across connections.
-        assert ended[0] == ended[1]
+        assert began[0] == began[1] == ended[0] == ended[1]
+        # A caller without an identity is nobody in particular: each stream is a subscription of its own.
+        anonymous = boards(port)
+        async with (
+            anonymous.events.subscribe("board.changed", {"board": "b1"}),
+            anonymous.events.subscribe("board.changed", {"board": "b1"}),
+        ):
+            assert len(set(began[2:])) == 2
         await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
@@ -102,13 +148,10 @@ def test_push_delivers_what_matches_as_shaped_and_resumes_after_the_connection_d
 
 def test_a_reader_that_falls_behind_what_is_kept_is_told_of_a_gap_and_goes_on():
     async def exercise():
-        events = Events(keep={"events": 50})
+        events = Events(keep={"events": 50, "bytes": 2**30})
         changed = declare(events)
-        port, stop = await serve(
-            MCPServer("boards", extensions=[events]).streamable_http_app(
-                stateless_http=True
-            )
-        )
+        server = MCPServer("boards", extensions=[events])
+        port, stop = await serve(mounted(server, events))
         received: list[str] = []
         gaps = []
         app = boards(port)
@@ -131,38 +174,38 @@ def test_a_reader_that_falls_behind_what_is_kept_is_told_of_a_gap_and_goes_on():
     asyncio.run(asyncio.wait_for(exercise(), timeout=30))
 
 
-def test_poll_reports_a_gap_when_the_server_restarted_and_carries_on():
+def test_poll_reports_a_gap_before_the_events_after_it_and_after_a_restart():
     async def exercise():
-        before = Events()
+        before = Events(keep={"events": 2})
         changed = declare(before)
         port, stop = await serve(
-            MCPServer("boards", extensions=[before]).streamable_http_app(
-                stateless_http=True
-            )
+            mounted(MCPServer("boards", extensions=[before]), before)
         )
-        gaps = []
+        order = []
         app = boards(port)
         async with app.events.subscribe(
             "board.changed",
             {"board": "b1"},
             delivery="poll",
-            on_gap=lambda: gaps.append(changes.cursor),
+            on_gap=lambda: order.append("gap"),
         ) as changes:
-            changed.emit(Change(board="b1", text="first"))
-            assert (await anext(changes)).data["text"] == "first"
+            changed.emit(Change(board="b1", text="one"))
+            order.append((await anext(changes)).data["text"])
+            # More than is kept, between two polls.
+            for text in ["a", "b", "c", "d"]:
+                changed.emit(Change(board="b1", text=text))
+            order += [(await anext(changes)).data["text"] for _ in range(2)]
+            assert order == ["one", "gap", "c", "d"]
             await stop()
             after = Events()
             changed = declare(after)
             port, stop = await serve(
-                MCPServer("boards", extensions=[after]).streamable_http_app(
-                    stateless_http=True
-                ),
-                port,
+                mounted(MCPServer("boards", extensions=[after]), after), port
             )
             following = asyncio.ensure_future(anext(changes))
-            await until(lambda: gaps)
-            # The gap is reported with the cursor before it, and delivery goes on from the new process's.
-            assert gaps[0] is not None and changes.cursor == changed.cursor()
+            await until(lambda: len(order) == 5)
+            # The new process's cursors start a gap, and delivery goes on from them.
+            assert order[4] == "gap" and changes.cursor == changed.cursor()
             changed.emit(Change(board="b1", text="second"))
             assert (await following).data["text"] == "second"
         await stop()
@@ -174,8 +217,6 @@ ENVELOPE = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     "io.modelcontextprotocol/clientCapabilities": {},
 }
-
-
 POLL = ["events", "cursor", "truncated", "hasMore", "nextPollMs"]
 
 
@@ -198,7 +239,13 @@ def request(method, params, id=1):
 def test_the_messages_on_the_wire_are_the_sketchs():
     async def exercise():
         events = Events(heartbeat=0.2, max_subscriptions=3)
-        changed = declare(events, description="A board changed")
+
+        def shaped(context, event, arguments):
+            if event.data.text == "bad":
+                raise ValueError("cannot be shaped")
+            return event.data
+
+        changed = declare(events, description="A board changed", transform=shaped)
         events.event(
             "board.locked",
             input_schema=Board,
@@ -206,12 +253,9 @@ def test_the_messages_on_the_wire_are_the_sketchs():
             delivery=["poll"],
             authorize=lambda context, arguments: arguments.board != "secret",
         )
-        port, stop = await serve(
-            MCPServer("boards", extensions=[events]).streamable_http_app(
-                stateless_http=True
-            )
-        )
-        url = f"http://127.0.0.1:{port}/mcp"
+        server = MCPServer("boards", extensions=[events])
+        port, stop = await serve(mounted(server, events))
+        url = f"http://127.0.0.1:{port}/mcp/"
         b1 = {"name": "board.changed", "arguments": {"board": "b1"}}
 
         async def answer(http, method, params):
@@ -236,7 +280,8 @@ def test_the_messages_on_the_wire_are_the_sketchs():
                 "hasMore": False,
                 "nextPollMs": 1000,
             }
-            for text in ["one", "two", "three"]:
+            # One that cannot be shaped is skipped, and the cursor moves past it.
+            for text in ["one", "bad", "two", "three"]:
                 changed.emit(Change(board="b1", text=text), event_id=text)
             page = (
                 await answer(
@@ -318,7 +363,12 @@ def test_the_messages_on_the_wire_are_the_sketchs():
                     "limit": "subscriptions",
                     "max": 3,
                 }
+                changed.emit(Change(board="b1", text="bad"))
                 changed.emit(Change(board="b1", text="four"), event_id="four")
+                # The stream is told once of the one it skipped, and goes on.
+                error = json.loads((await anext(frames)).data)
+                assert error["method"] == "notifications/events/error"
+                assert error["params"]["error"]["code"] == -32603
                 event = json.loads((await anext(frames)).data)["params"]
                 assert event == {
                     "eventId": "four",
@@ -340,6 +390,59 @@ def test_the_messages_on_the_wire_are_the_sketchs():
                 }
                 final = json.loads((await anext(frames)).data)
                 assert final["id"] == 7 and "result" in final
+        await stop()
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=20))
+
+
+def test_a_poll_that_gives_up_while_it_is_set_up_still_lets_its_lease_lapse():
+    async def exercise():
+        events = Events(poll_lease=0.3, max_subscriptions=1)
+        ended = []
+
+        async def on_subscribe(context, arguments, id, delivery):
+            await asyncio.sleep(0.3)
+            return lambda: ended.append(id)
+
+        declare(events, on_subscribe=on_subscribe)
+        server = MCPServer("boards", extensions=[events])
+        port, stop = await serve(mounted(server, events))
+        url = f"http://127.0.0.1:{port}/mcp/"
+        params = {"name": "board.changed", "arguments": {"board": "b1"}}
+        async with httpx2.AsyncClient(timeout=0.1) as http:
+            with pytest.raises(httpx2.ReadTimeout):
+                await http.post(url, **request("events/poll", params))
+        await until(lambda: ended)
+        # Its place is free again.
+        async with httpx2.AsyncClient(timeout=10) as http:
+            params["arguments"] = {"board": "b2"}
+            answer = (await http.post(url, **request("events/poll", params))).json()
+            assert "result" in answer
+        await stop()
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=20))
+
+
+def test_without_the_wrapper_push_is_not_offered_and_a_subscription_polls():
+    async def exercise():
+        events = Events()
+        changed = declare(events)
+        server = MCPServer("boards", extensions=[events])
+        app = server.streamable_http_app(stateless_http=True, json_response=True)
+        port, stop = await serve(app)
+        url = f"http://127.0.0.1:{port}/mcp"
+        params = {"name": "board.changed", "arguments": {"board": "b1"}}
+        async with httpx2.AsyncClient(timeout=10) as http:
+            listed = (await http.post(url, **request("events/list", {}))).json()
+            assert listed["result"]["events"][0]["delivery"] == ["poll"]
+            refused = (await http.post(url, **request("events/stream", params))).json()
+            assert refused["error"]["code"] == -32026
+        async with boards(port, "/mcp").events.subscribe(
+            "board.changed", {"board": "b1"}
+        ) as changes:
+            assert changes.delivery == "poll"
+            changed.emit(Change(board="b1", text="polled"))
+            assert (await anext(changes)).data["text"] == "polled"
         await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))

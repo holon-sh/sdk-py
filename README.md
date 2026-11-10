@@ -73,6 +73,8 @@ await apps.huggingface.tools.hub_search(query="llama")
 ```python
 from pydantic import BaseModel
 from mcp.server import MCPServer
+from starlette.applications import Starlette
+from starlette.routing import Mount
 from holon.events import Events
 
 
@@ -93,15 +95,20 @@ changed = events.event(
     match=lambda context, event, arguments: event.data.board == arguments.board,
 )
 server = MCPServer("boards", extensions=[events])
+server.streamable_http_app(stateless_http=True)
+app = Starlette(
+    routes=[Mount("/mcp", app=events.asgi(server.session_manager))],
+    lifespan=lambda app: server.session_manager.run(),
+)
 
 changed.emit(Change(board="b1", text="hello"))
 ```
 
-Emitted events are kept in memory for polls and reconnecting streams. A type whose source keeps its own history takes a `check(context, arguments, cursor)` function instead. `authorize`, `on_subscribe`, `key`, `end`, `remove` and limits on what is kept and held are there when you need them. On an endpoint whose `StreamableHTTPSessionManager` answers in JSON, mount `events.asgi(manager)` in place of `manager.handle_request` so streams are still streamed.
+Push is offered over HTTP only where `events.asgi(manager)` is mounted in place of `manager.handle_request`, whether the manager answers by stream or in JSON; elsewhere clients poll. Emitted events are kept in memory for polls and streams that are behind. A type whose source keeps its own history takes a `check(context, arguments, cursor)` function instead. `authorize`, `on_subscribe`, `key`, `end`, `remove` and limits on what is kept and held are there when you need them.
 
 For a snapshot and then its changes, a tool returns the state with `changed.cursor()`, read in the same synchronous run, and the client subscribes from that cursor. Several kinds of change in one ordered stream are one event type whose payload is a union, and events emitted one after another reach each subscriber in that order.
 
-Every app client lists and subscribes, by push when the app offers it and by poll otherwise, reconnecting from its cursor:
+Every app client lists and subscribes, by push when the app offers it and by poll otherwise, reconnecting from its cursor. Leaving the `async with` block is what ends a subscription; breaking out of `async for` alone does not:
 
 ```python
 async with apps.boards.events.subscribe("board.changed", {"board": "b1"}) as changes:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import json
+import math
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace, TracebackType
 from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
@@ -11,14 +13,15 @@ import anyio
 import httpx2
 import jsonschema
 from mcp import Client
+from mcp.client import Transport
+from mcp.client._transport import TransportStreams
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
-from mcp.shared.inbound import MCP_METHOD_HEADER, MCP_PROTOCOL_VERSION_HEADER
+from mcp.shared.message import SessionMessage
+from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
 from mcp.types import (
-    CLIENT_CAPABILITIES_META_KEY,
-    CLIENT_INFO_META_KEY,
-    PROTOCOL_VERSION_META_KEY,
+    INVALID_PARAMS,
     CallToolRequest,
     CallToolRequestParams,
     CallToolResult,
@@ -26,17 +29,20 @@ from mcp.types import (
     ElicitRequest,
     ElicitRequestParams,
     ElicitResult,
+    ErrorData,
     Implementation,
     InputRequiredResult,
     InputResponses,
+    JSONRPCNotification,
+    Request,
     RequestParamsMeta,
     TextContent,
 )
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 from referencing import Registry
 
 from holon.binding import Binding
-from holon.events import SUBSCRIPTION_ID, Event
+from holon.events import FORBIDDEN, NOT_FOUND, UNSUPPORTED, Event
 
 __all__ = [
     "Apps",
@@ -220,22 +226,12 @@ class _App:
             definition = self._definitions.get(name)
             if definition is None:
                 raise ValueError(f"Unknown tool {self._name}.{name}.")
-        endpoint, http_client = self._connection(options.get("timeout"))
         failure: Exception | None = None
-        async with http_client() as http:
-            transport = streamable_http_client(endpoint, http_client=http)
-            async with Client(
-                transport,
-                client_info=Implementation(
-                    name=self._identity["name"], version=self._identity["version"]
-                ),
-                mode=_VERSION,
-                elicitation_callback=_declare_elicitation,
-            ) as client:
-                try:
-                    result = await _send(client, name, arguments, options)
-                except Exception as error:  # noqa: BLE001
-                    failure = error
+        async with self._session(options.get("timeout")) as client:
+            try:
+                result = await _send(client, name, arguments, options)
+            except Exception as error:  # noqa: BLE001
+                failure = error
         if failure is not None:
             raise failure
         if (
@@ -278,58 +274,26 @@ class _App:
         headers = {"Authorization": f"Bearer {token}"} if token else None
         return endpoint, partial(http_client, headers=headers)
 
-    # MCP Events are requests outside the core protocol, sent here rather than through the MCP client, which hands
-    # a request's notifications over one task each and so out of order. Notifications are passed to `notified` in
-    # the order they arrive; the stream fails after `quiet` seconds with no message.
-    async def _exchange(
-        self,
-        method: str,
-        params: dict[str, Any],
-        notified: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
-        quiet: float | None = None,
-    ) -> dict[str, Any]:
-        endpoint, http_client = self._connection(None)
-        meta = {
-            PROTOCOL_VERSION_META_KEY: _VERSION,
-            CLIENT_INFO_META_KEY: {
-                "name": self._identity["name"],
-                "version": self._identity["version"],
-            },
-            CLIENT_CAPABILITIES_META_KEY: {},
-        }
-        body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": {**params, "_meta": meta},
-        }
-        headers = {
-            "accept": "application/json, text/event-stream",
-            MCP_PROTOCOL_VERSION_HEADER: _VERSION,
-            MCP_METHOD_HEADER: method,
-        }
-        async with (
-            http_client() as http,
-            http.stream("POST", endpoint, json=body, headers=headers) as response,
-        ):
-            if response.headers.get("content-type", "").startswith("text/event-stream"):
-                frames = aiter(httpx2.EventSource(response, max_event_size=None))
-                while True:
-                    with anyio.fail_after(quiet):
-                        frame = await anext(frames, None)
-                    if frame is None:
-                        raise ConnectionError(f"{method} ended without an answer")
-                    message = json.loads(frame.data) if frame.data else {}
-                    if "result" in message or "error" in message:
-                        return _answer(message)
-                    if notified is not None and "method" in message:
-                        await notified(message["method"], message.get("params") or {})
-            await response.aread()
-            if not response.headers.get("content-type", "").startswith(
-                "application/json"
-            ):
-                response.raise_for_status()
-            return _answer(response.json())
+    @asynccontextmanager
+    async def _session(
+        self, timeout: float | None, notified: _Notified | None = None
+    ) -> AsyncIterator[Client]:
+        endpoint, http_client = self._connection(timeout)
+        async with http_client() as http:
+            transport: Transport = streamable_http_client(
+                endpoint, http_client=http, max_sse_event_size=None
+            )
+            if notified is not None:
+                transport = _ordered(transport, notified)
+            async with Client(
+                transport,
+                client_info=Implementation(
+                    name=self._identity["name"], version=self._identity["version"]
+                ),
+                mode=_VERSION,
+                elicitation_callback=_declare_elicitation,
+            ) as client:
+                yield client
 
     def _validate(
         self, name: str, schema: dict[str, Any], value: Any, label: str
@@ -359,35 +323,74 @@ class _App:
         return result.structured_content if "outputSchema" in tool else result
 
 
-def _answer(message: dict[str, Any]) -> dict[str, Any]:
-    if (error := message.get("error")) is not None:
-        raise MCPError(
-            error.get("code", -32603), error.get("message", ""), error.get("data")
-        )
-    return message.get("result") or {}
+_Notified: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[None]]
+# How long a poll or a list waits for its answer, and a connection takes to open, in seconds.
+_TIMEOUT = 30.0
+# A stream that has said nothing for twice the longest heartbeat interval is dead: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#lifecycle
+_QUIET = 60.0
+
+
+class _Answer(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+@asynccontextmanager
+async def _ordered(
+    transport: Transport, notified: _Notified
+) -> AsyncIterator[TransportStreams]:
+    """The transport, with MCP Events' notifications handed to ``notified`` as they arrive.
+
+    The MCP client gives each notification a task of its own, which loses their order, so these are taken out
+    before it sees them. A response comes after its request's notifications, and waits until they are handled.
+    """
+    async with transport as (read, write):
+        forward, forwarded = anyio.create_memory_object_stream[
+            SessionMessage | Exception
+        ]()
+
+        async def pump() -> None:
+            async with forward:
+                async for message in read:
+                    if (
+                        isinstance(message, SessionMessage)
+                        and isinstance(message.message, JSONRPCNotification)
+                        and message.message.method.startswith("notifications/events/")
+                    ):
+                        await notified(
+                            message.message.method, message.message.params or {}
+                        )
+                    else:
+                        await forward.send(message)
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(pump)
+            yield forwarded, write
+            group.cancel_scope.cancel()
+
+
+async def _request(
+    client: Client,
+    method: str,
+    params: dict[str, Any],
+    timeout: float | None = _TIMEOUT,
+) -> dict[str, Any]:
+    answer = await client.session.send_request(
+        Request[dict[str, Any], str](method=method, params=params),
+        _Answer,
+        request_read_timeout_seconds=timeout,
+    )
+    return answer.model_extra or {}
 
 
 # A server's refusal ends a subscription: the event type is gone, access was lost, the request is not valid, or the
 # delivery mode is not offered. Anything else is tried again from the cursor.
 def _refused(error: Exception) -> bool:
-    if isinstance(error, httpx2.HTTPStatusError):
-        return 400 <= error.response.status_code < 500
     return isinstance(error, MCPError) and error.code in (
-        -32602,
-        -32023,
-        -32024,
-        -32026,
+        INVALID_PARAMS,
+        NOT_FOUND,
+        FORBIDDEN,
+        UNSUPPORTED,
     )
-
-
-class _Terminated(Exception):
-    def __init__(self, error: dict[str, Any]) -> None:
-        super().__init__()
-        self.error = error
-
-
-# A stream that has said nothing for twice the longest heartbeat interval is dead: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#lifecycle
-_QUIET = 60.0
 
 
 class _Events:
@@ -399,14 +402,24 @@ class _Events:
     async def list(self) -> list[dict[str, Any]]:
         """The event types the app offers, as ``events/list`` describes them."""
         events: list[dict[str, Any]] = []
-        cursor = None
-        while True:
-            page = await self._app._exchange(
-                "events/list", {} if cursor is None else {"cursor": cursor}
-            )
-            events += page.get("events", [])
-            if not (cursor := page.get("nextCursor")):
-                return events
+        failure: Exception | None = None
+        async with self._app._session(_TIMEOUT) as client:
+            try:
+                cursor = None
+                while True:
+                    page = await _request(
+                        client,
+                        "events/list",
+                        {} if cursor is None else {"cursor": cursor},
+                    )
+                    events += page.get("events", [])
+                    if not (cursor := page.get("nextCursor")):
+                        break
+            except Exception as error:  # noqa: BLE001
+                failure = error
+        if failure is not None:
+            raise failure
+        return events
 
     def subscribe(
         self,
@@ -437,13 +450,24 @@ class _Events:
         )
 
 
+@dataclass(frozen=True)
+class _Gap:
+    pass
+
+
+@dataclass(frozen=True)
+class _Reached:
+    cursor: str | None
+
+
 class Subscription(Generic[Data]):
     """A subscription to one event type, from ``app.events.subscribe``.
 
     Entering it with ``async with`` subscribes, and returns once the app has confirmed the subscription; a refusal
     raises ``MCPError``. Iterating it yields each :class:`~holon.events.Event` once, in order, dropping one whose
-    ``event_id`` was seen. A dropped connection is reconnected, and resumes from the cursor. The subscription ends
-    when the block is left or its task cancelled; iteration raises ``MCPError`` when the app ends it.
+    ``event_id`` was seen. A dropped connection is reconnected, and resumes from the cursor. Leaving the block, or
+    cancelling its task, is what ends the subscription: breaking out of ``async for`` alone does not. Iteration
+    raises ``MCPError`` when the app ends it.
 
     ``cursor`` is the position after the last event iterated, to persist and resume from. ``delivery`` is how
     events arrive, once entered.
@@ -480,29 +504,24 @@ class Subscription(Generic[Data]):
         self._seen: dict[str, None] = {}
         # Nothing waits between the server and the iterator, so a reader that stops reading stops the stream.
         self._send, self._receive = anyio.create_memory_object_stream[
-            tuple[Event[Any] | None, str | None, bool]
+            Event[Any] | _Gap | _Reached
         ]()
         self._group: anyio.abc.TaskGroup | None = None
+        # The open stream request, which a notification ends when the app ended the subscription.
+        self._stream: anyio.CancelScope | None = None
+        self._ended: Exception | None = None
 
     async def __aenter__(self) -> Subscription[Data]:
-        offered = next(
-            (
-                each.get("delivery", [])
-                for each in await self._app.events.list()
-                if each["name"] == self._name
-            ),
-            None,
-        )
-        if offered is None:
-            raise ValueError(f"{self._app._name} has no event {self._name}.")
-        mode = self.delivery or next(
-            (each for each in ("push", "poll") if each in offered), None
-        )
-        if mode not in offered:
-            raise ValueError(
-                f"{self._app._name} does not deliver {self._name} by {mode or 'poll or push'}."
+        if self.delivery is None:
+            offered: list[str] = next(
+                (
+                    each.get("delivery", [])
+                    for each in await self._app.events.list()
+                    if each["name"] == self._name
+                ),
+                [],
             )
-        self.delivery = mode
+            self.delivery = "push" if "push" in offered else "poll"
         self._group = anyio.create_task_group()
         await self._group.__aenter__()
         self._group.start_soon(self._run)
@@ -538,23 +557,33 @@ class Subscription(Generic[Data]):
     async def __anext__(self) -> Event[Data]:
         while True:
             try:
-                event, cursor, gap = await self._receive.receive()
+                item = await self._receive.receive()
             except (anyio.EndOfStream, anyio.ClosedResourceError):
                 if self._failure is not None:
                     raise self._failure from None
                 raise StopAsyncIteration from None
-            if gap and self._on_gap is not None:
-                self._on_gap()
-            if cursor is not None or event is None:
-                self.cursor = cursor
-            if event is not None:
-                return event
+            if isinstance(item, _Gap):
+                if self._on_gap is not None:
+                    self._on_gap()
+            elif isinstance(item, _Reached):
+                self.cursor = item.cursor
+            else:
+                if item.cursor is not None:
+                    self.cursor = item.cursor
+                return item
 
     async def _run(self) -> None:
+        push = self.delivery == "push"
         try:
-            await (self._push() if self.delivery == "push" else self._poll())
+            async with self._app._session(
+                _TIMEOUT, self._notified if push else None
+            ) as client:
+                try:
+                    await (self._push(client) if push else self._poll(client))
+                except Exception as error:  # noqa: BLE001
+                    self._failure = error
         except Exception as error:  # noqa: BLE001
-            self._failure = error
+            self._failure = self._failure or error
         finally:
             self._settled.set()
             self._send.close()
@@ -563,16 +592,18 @@ class Subscription(Generic[Data]):
         self._active = True
         self._settled.set()
 
-    # The cursor of a batch is the position after it, given once the batch has been iterated.
-    async def _reach(self, cursor: str | None, gap: bool = False) -> None:
+    async def _reach(self, cursor: str | None) -> None:
         self._reached = cursor
-        await self._send.send((None, cursor, gap))
+        await self._send.send(_Reached(cursor))
 
-    async def _deliver(self, occurrence: dict[str, Any], cursor: str | None) -> None:
+    async def _deliver(self, occurrence: dict[str, Any]) -> None:
+        cursor = occurrence.get("cursor")
+        if cursor is not None:
+            self._reached = cursor
         event_id = occurrence.get("eventId")
         if event_id in self._seen:
             if cursor is not None:
-                await self._reach(cursor)
+                await self._send.send(_Reached(cursor))
             return
         if event_id is not None:
             self._seen[event_id] = None
@@ -586,69 +617,95 @@ class Subscription(Generic[Data]):
                 data,
                 f"data of {self._app._name} {self._name}",
             )
-        if cursor is not None:
-            self._reached = cursor
         # A pushed event's `_meta` also routes it to its stream, which is not the event's own.
         meta = {
             key: value
             for key, value in (occurrence.get("_meta") or {}).items()
-            if key != SUBSCRIPTION_ID
+            if key != SUBSCRIPTION_ID_META_KEY
         }
-        event = Event(data, event_id, occurrence.get("timestamp"), cursor, meta or None)
-        await self._send.send((event, cursor, False))
+        await self._send.send(
+            Event(
+                data,
+                event_id,
+                occurrence.get("timestamp"),
+                cursor,
+                meta or None,
+                occurrence.get("name"),
+            )
+        )
 
-    async def _poll(self) -> None:
+    async def _poll(self, client: Client) -> None:
         while True:
             wait = 1.0
             try:
-                result = await self._app._exchange(
-                    "events/poll", {**self._request, "cursor": self._reached}
+                result = await _request(
+                    client, "events/poll", {**self._request, "cursor": self._reached}
                 )
             except Exception as error:
                 if not self._active or _refused(error):
                     raise
             else:
                 self._confirm()
+                # The gap comes before the events after it.
+                if result.get("truncated"):
+                    await self._send.send(_Gap())
                 for occurrence in result.get("events", []):
-                    await self._deliver(occurrence, None)
-                await self._reach(result.get("cursor"), bool(result.get("truncated")))
+                    await self._deliver(occurrence)
+                await self._reach(result.get("cursor"))
                 # A server that asks for a tight loop is not obeyed.
                 next_poll = (result.get("nextPollMs") or 0) / 1000
                 wait = 0 if result.get("hasMore") else max(1.0, next_poll)
             await anyio.sleep(wait)
 
-    async def _push(self) -> None:
-        async def notified(method: str, params: dict[str, Any]) -> None:
+    async def _push(self, client: Client) -> None:
+        while True:
+            with anyio.CancelScope() as self._stream:
+                self._stream.deadline = anyio.current_time() + _QUIET
+                try:
+                    await _request(
+                        client,
+                        "events/stream",
+                        {**self._request, "cursor": self._reached},
+                        None,
+                    )
+                except Exception as error:
+                    if not self._active or _refused(error):
+                        raise
+            if self._ended is not None:
+                raise self._ended
+            if self._stream.cancelled_caught and not self._active:
+                raise TimeoutError(
+                    f"{self._app._name} did not confirm the subscription to {self._name}."
+                )
+            await anyio.sleep(1)
+
+    # Told each notification of the open stream, in order. The stream is not quiet while one is being handled,
+    # since a reader that has not taken the last event holds it up.
+    async def _notified(self, method: str, params: dict[str, Any]) -> None:
+        stream = self._stream
+        if stream is not None:
+            stream.deadline = math.inf
+        try:
             if method == "notifications/events/active":
                 self._confirm()
-                await self._reach(params.get("cursor"), bool(params.get("truncated")))
+                if params.get("truncated"):
+                    await self._send.send(_Gap())
+                await self._reach(params.get("cursor"))
             elif method == "notifications/events/event":
-                await self._deliver(params, params.get("cursor"))
+                await self._deliver(params)
             elif method == "notifications/events/heartbeat":
                 await self._reach(params.get("cursor"))
             elif method == "notifications/events/terminated":
-                raise _Terminated(params.get("error") or {})
+                error = ErrorData.model_validate(params.get("error") or {})
+                raise MCPError.from_error_data(error)
             # notifications/events/error: the server recovers by itself, and the stream stays open.
-
-        while True:
-            try:
-                await self._app._exchange(
-                    "events/stream",
-                    {**self._request, "cursor": self._reached},
-                    notified,
-                    _QUIET,
-                )
-            except _Terminated as ended:
-                error = ended.error
-                raise MCPError(
-                    error.get("code", -32603),
-                    error.get("message", ""),
-                    error.get("data"),
-                ) from None
-            except Exception as error:
-                if not self._active or _refused(error):
-                    raise
-            await anyio.sleep(1)
+        except Exception as error:  # noqa: BLE001
+            self._ended = error
+            if stream is not None:
+                stream.cancel()
+        else:
+            if stream is not None:
+                stream.deadline = anyio.current_time() + _QUIET
 
 
 class Apps:

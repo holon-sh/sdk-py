@@ -27,11 +27,18 @@ from mcp.types import (
     RequestParamsMeta,
     TextContent,
 )
-from pydantic import TypeAdapter
 from referencing import Registry
 
 from holon.binding import Binding
 from holon.ext.events import AppEvents
+from holon.ext.files._client import (
+    FILES,
+    OutcomeUnknownError,
+    Transfers,
+    holds_file,
+    remember,
+)
+from holon.ext.files._wire import CALL_RESULT, UploadRequiredResult
 
 __all__ = [
     "Apps",
@@ -67,8 +74,6 @@ class ErrorResult(Protocol):
 
 
 ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResult
-
-_result = TypeAdapter(CallToolResult | InputRequiredResult)
 
 
 class CallOptions(TypedDict, total=False):
@@ -118,25 +123,39 @@ async def _declare_elicitation(
 
 
 async def _send(
-    client: Client, name: str, arguments: dict[str, Any], options: CallOptions
+    client: Client,
+    name: str,
+    arguments: dict[str, Any],
+    options: CallOptions,
+    transfers: Transfers,
 ) -> CallToolResult | InputRequiredResult:
     elicit = options.get("elicit")
     responses, state = options.get("input_responses"), options.get("request_state")
     answered = 0
     while True:
-        result = await client.session.send_request(
-            CallToolRequest(
-                params=CallToolRequestParams(
-                    name=name,
-                    arguments=arguments,
-                    input_responses=responses,
-                    request_state=state,
-                    _meta=options.get("meta"),
-                )
-            ),
-            _result,
-            request_read_timeout_seconds=options.get("timeout"),
-        )
+        try:
+            result = await client.session.send_request(
+                CallToolRequest(
+                    params=CallToolRequestParams(
+                        name=name,
+                        arguments=arguments,
+                        input_responses=responses,
+                        request_state=state,
+                        _meta=options.get("meta"),
+                    )
+                ),
+                CALL_RESULT,
+                request_read_timeout_seconds=options.get("timeout"),
+            )
+        except Exception as error:
+            if transfers.uploaded:
+                raise OutcomeUnknownError(
+                    f"{transfers.label}: the outcome is unknown; the call failed after its files were sent"
+                ) from error
+            raise
+        if isinstance(result, UploadRequiredResult):
+            responses, state = None, await transfers.send(result)
+            continue
         if not (elicit and answered < 10 and isinstance(result, InputRequiredResult)):
             return result
         answered += 1
@@ -188,7 +207,8 @@ class _App:
             options: Request timeout in seconds, input responses, continuation
                 state, metadata, and ``elicit`` to answer the server's questions in
                 place. Passed positionally, separate from tool input.
-            **arguments: Tool input, which the server validates.
+            **arguments: Tool input, which the server validates. Pass a
+                ``holon.ext.files.File`` where the tool takes a file.
 
         Returns:
             A complete result, or an input-required result for a question left
@@ -198,6 +218,10 @@ class _App:
         Raises:
             ValueError: Unknown tool, invalid output, or undeclared dependency.
             RuntimeError: Endpoint resolution failed.
+            holon.ext.files.FileTransferError: A file was not sent; the tool did
+                not run.
+            holon.ext.files.OutcomeUnknownError: The call failed after its files
+                were sent; the tool may have run.
 
         Transport and protocol exceptions propagate. Each call closes its HTTP
         client and MCP session, including when an exception occurs.
@@ -209,13 +233,22 @@ class _App:
             if definition is None:
                 raise ValueError(f"Unknown tool {self._name}.{name}.")
         failure: Exception | None = None
-        async with self._session(options.get("timeout")) as client:
+        transfers = Transfers(
+            f"{self._name}.{name}",
+            self._binding.get("file_origins") if self._binding else None,
+        )
+        async with self._session(options.get("timeout"), transfers=transfers) as client:
             try:
-                result = await _send(client, name, arguments, options)
+                if holds_file(arguments):
+                    schema = definition.get("inputSchema") if definition else None
+                    arguments = await transfers.prepare(client, name, schema, arguments)
+                result = await _send(client, name, arguments, options, transfers)
             except Exception as error:  # noqa: BLE001
                 failure = error
         if failure is not None:
             raise failure
+        if isinstance(result, CallToolResult):
+            remember(result, transfers)
         if (
             definition is not None
             and isinstance(result, CallToolResult)
@@ -261,9 +294,12 @@ class _App:
         self,
         timeout: float | None,
         wrap: Callable[[Transport], Transport] | None = None,
+        transfers: Transfers | None = None,
     ) -> AsyncIterator[Client]:
         endpoint, http_client = self._connection(timeout)
         async with http_client() as http:
+            if transfers is not None:
+                transfers.bind(endpoint, http_client, http)
             transport: Transport = streamable_http_client(
                 endpoint, http_client=http, max_sse_event_size=None
             )
@@ -276,6 +312,7 @@ class _App:
                 ),
                 mode=_VERSION,
                 elicitation_callback=_declare_elicitation,
+                extensions=[FILES],
             ) as client:
                 yield client
 

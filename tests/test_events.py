@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 import sys
+from functools import partial
 from typing import Annotated, Literal
 
 import httpx2
@@ -507,11 +508,23 @@ def test_what_a_subscribe_hook_emits_to_its_subscription_reaches_it_by_push_and_
         changed = declare(events, on_subscribe=welcome)
         server = MCPServer("boards", extensions=[events])
         port, stop = await serve(mounted(server, events))
-        for delivery in ["push", "poll"]:
+        gaps = []
+        # Without a cursor, and with one from a process that restarted since.
+        for board, delivery, cursor in [
+            ("b1", "push", None),
+            ("b2", "poll", None),
+            ("b3", "push", "restarted.7"),
+            ("b4", "poll", "restarted.7"),
+        ]:
             async with boards(port, user="ann").ext.events.subscribe(
-                "board.changed", {"board": "b1"}, delivery=delivery
+                "board.changed",
+                {"board": board},
+                delivery=delivery,
+                cursor=cursor,
+                on_gap=partial(gaps.append, board),
             ) as changes:
                 assert (await anext(changes)).data["text"] == "welcome"
+        assert gaps == ["b3", "b4"]
         await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))

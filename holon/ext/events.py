@@ -459,18 +459,20 @@ class EventType(Generic[A, D]):
         )
         return self._kept[index] if index < len(self._kept) else None
 
-    # Where a cursor resumes reading what is kept, and whether events between were let go. A None cursor starts from
-    # now, and so does one from another process.
-    def _resume(self, cursor: str | None, max_age_ms: int | None) -> tuple[int, bool]:
+    # Where a cursor resumes reading what is kept, and whether events between were let go. A None cursor starts where
+    # the subscription was opened, so it has what its on_subscribe emitted, and so does one from another process.
+    def _resume(
+        self, cursor: str | None, max_age_ms: int | None, opened: int
+    ) -> tuple[int, bool]:
         if cursor is None:
-            return self._sequence, False
+            return opened, False
         epoch, _, text = cursor.partition(".")
         if (
             epoch != self._events._epoch
             or not text.isdigit()
             or int(text) > self._sequence
         ):
-            return self._sequence, True
+            return opened, True
         sequence, truncated = max(int(text), self._dropped), int(text) < self._dropped
         if max_age_ms is not None:
             floor = time.monotonic() - max_age_ms / 1000
@@ -504,9 +506,14 @@ class EventType(Generic[A, D]):
     # What a poll is owed after a cursor from what is kept. An event that cannot be shaped for this subscription is
     # skipped for it, and the failure logged.
     def _since(
-        self, request: _Request, cursor: str | None, max_age_ms: int | None, limit: int
+        self,
+        request: _Request,
+        cursor: str | None,
+        max_age_ms: int | None,
+        limit: int,
+        opened: int,
     ) -> _Read:
-        reached, truncated = self._resume(cursor, max_age_ms)
+        reached, truncated = self._resume(cursor, max_age_ms, opened)
         events: list[tuple[dict[str, Any], str | None]] = []
         while (kept := self._next(reached)) is not None:
             if len(events) == limit:
@@ -842,8 +849,7 @@ class Events(Extension):
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
         declared, request = await self._subscription(params, "poll", _streams(ctx))
-        # A poll without a cursor is owed what was emitted while its subscription was set up.
-        start = declared._position()
+        opened = declared._sequence
         hold = await self._lease(declared, request)
         limit = params.max_events or _PAGE
         if declared._check is not None:
@@ -852,10 +858,7 @@ class Events(Extension):
             )
         else:
             read = declared._since(
-                request,
-                start if params.cursor is None else params.cursor,
-                params.max_age_ms,
-                limit,
+                request, params.cursor, params.max_age_ms, limit, opened
             )
         # A poll carries its cursor once, for the whole answer.
         return {
@@ -1165,10 +1168,9 @@ class Events(Extension):
                     await deliver(occurrence, after)
                 due = time.monotonic() + (0 if read.has_more else _INTERVAL)
             else:
-                # Without a cursor, the stream starts where it was opened, so it has what its on_subscribe emitted.
-                truncated = False
-                if params.cursor is not None:
-                    seen, truncated = declared._resume(params.cursor, params.max_age_ms)
+                seen, truncated = declared._resume(
+                    params.cursor, params.max_age_ms, seen
+                )
                 await say("active", {"cursor": position(), "truncated": truncated})
                 due = math.inf
             beat = time.monotonic() + _HEARTBEAT

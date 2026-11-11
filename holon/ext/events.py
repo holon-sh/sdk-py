@@ -282,7 +282,6 @@ class _Hold:
     """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
     until: int = 0
-    """The last event emitted before the app ended it, which a stream still sends."""
     missed: bool = False
     """An event emitted to it could not be given to it, which its next read reports as a gap."""
 
@@ -391,12 +390,10 @@ class EventType(Generic[A, D]):
     ) -> None:
         """Terminate one subscription, or all of this type's: a stream is sent what was emitted to it before, then
         ``notifications/events/terminated`` with ``error``, and closed. The next poll is answered with the error.
-        Forbidden unless given."""
-        self._end(subscription_id, error or _FORBIDDEN, self._sequence)
-
-    def _end(
-        self, subscription_id: str | None, error: ErrorData, until: int = 0
-    ) -> None:
+        Forbidden unless given, which ends delivery at once, since access is lost.
+        """
+        error = error or _FORBIDDEN
+        until = 0 if error.code == _FORBIDDEN.code else self._sequence
         if subscription_id is None:
             entries = list(self._subscriptions.values())
         else:
@@ -856,6 +853,9 @@ class Events(Extension):
             read = await declared._checked(
                 hold, request, params.cursor, params.max_age_ms, limit
             )
+        elif params.cursor is None:
+            # The sketch: a poll from null "returns no events and provides a fresh cursor".
+            read = _Read([], None, declared._position(opened))
         else:
             read = declared._since(
                 request, params.cursor, params.max_age_ms, limit, opened
@@ -953,7 +953,7 @@ class Events(Extension):
             targetable=principal is not None or delivery == "push",
         )
         if not await declared._allows(context, arguments):
-            declared._end(id, _FORBIDDEN)
+            declared.terminate(id, _FORBIDDEN)
             if lease := self._leases.get(id):
                 self._stop(id, lease)
             raise MCPError.from_error_data(_FORBIDDEN)
@@ -1157,6 +1157,15 @@ class Events(Extension):
             def position() -> str | None:
                 return cursor if checked else declared._position(seen)
 
+            async def send(kept: _Kept) -> None:
+                try:
+                    shaped = declared._shape(kept, request)
+                except Exception as error:  # noqa: BLE001
+                    await say("error", {"error": _described(error)})
+                    return
+                if shaped is not None:
+                    await deliver(shaped, position(), kept.size)
+
             # Without a first answer there is no stream to tell, and the request fails.
             if checked:
                 read = await declared._checked(
@@ -1174,11 +1183,8 @@ class Events(Extension):
                 await say("active", {"cursor": position(), "truncated": truncated})
                 due = math.inf
             beat = time.monotonic() + _HEARTBEAT
-            # Ended by the app, the stream first sends what was emitted before.
-            while hold.ended is None or seen < hold.until:
+            while hold.ended is None:
                 wake.clear()
-                if hold.ended is not None:
-                    beat = due = math.inf
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
                     # Access is checked again while the subscription lasts, and one that is lost ends it.
@@ -1214,22 +1220,17 @@ class Events(Extension):
                     seen = declared._dropped
                     if position() is not None:
                         await say("active", {"cursor": position(), "truncated": True})
-                elif (kept := declared._next(seen)) is not None and (
-                    hold.ended is None or kept.sequence <= hold.until
-                ):
+                elif (kept := declared._next(seen)) is not None:
                     seen = kept.sequence
-                    try:
-                        shaped = declared._shape(kept, request)
-                    except Exception as error:  # noqa: BLE001
-                        await say("error", {"error": _described(error)})
-                        continue
-                    if shaped is not None:
-                        await deliver(shaped, position(), kept.size)
-                elif hold.ended is not None:
-                    break
+                    await send(kept)
                 else:
                     with anyio.move_on_after(min(beat, due) - time.monotonic()):
                         await wake.wait()
+            while (
+                kept := declared._next(seen)
+            ) is not None and kept.sequence <= hold.until:
+                seen = kept.sequence
+                await send(kept)
             if hold.ended is not None:
                 await say(
                     "terminated",

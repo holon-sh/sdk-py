@@ -539,18 +539,23 @@ def test_a_stream_the_app_terminates_is_first_sent_what_was_emitted_to_it():
         )
         server = MCPServer("boards", extensions=[events])
         port, stop = await serve(mounted(server, events))
-        async with boards(port).ext.events.subscribe(
-            "board.changed", {"board": "b1"}
-        ) as changes:
-            for text in ["one", "two", "three"]:
-                changed.emit(Change(board="b1", text=text), subscription_id=ids[0])
-            changed.terminate(ids[0], ErrorData(code=-32000, message="Closed"))
-            changed.emit(Change(board="b1", text="after"))
-            received = [(await anext(changes)).data["text"] for _ in range(3)]
-            with pytest.raises(MCPError) as ended:
-                await anext(changes)
-        assert received == ["one", "two", "three"]
-        assert ended.value.error.message == "Closed"
+        # Unless it lost access: then nothing more is sent.
+        for error, sent, reason in [
+            (ErrorData(code=-32000, message="Closed"), ["one", "two"], "Closed"),
+            (None, [], "Forbidden"),
+        ]:
+            async with boards(port).ext.events.subscribe(
+                "board.changed", {"board": "b1"}
+            ) as changes:
+                for text in ["one", "two"]:
+                    changed.emit(Change(board="b1", text=text), subscription_id=ids[-1])
+                changed.terminate(ids[-1], error)
+                changed.emit(Change(board="b1", text="after"))
+                received = [(await anext(changes)).data["text"] for _ in sent]
+                with pytest.raises(MCPError) as ended:
+                    await anext(changes)
+            assert received == sent
+            assert ended.value.error.message == reason
         await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))

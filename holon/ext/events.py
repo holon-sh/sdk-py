@@ -281,6 +281,7 @@ class _Hold:
     wake: Callable[[], None]
     """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
+    until: int = 0
     missed: bool = False
     """An event emitted to it could not be given to it, which its next read reports as a gap."""
 
@@ -387,8 +388,12 @@ class EventType(Generic[A, D]):
     def terminate(
         self, subscription_id: str | None = None, error: ErrorData | None = None
     ) -> None:
-        """Terminate one subscription, or all of this type's: a stream is sent ``notifications/events/terminated``
-        with ``error`` and closed, and the next poll is answered with it. Forbidden unless given."""
+        """Terminate one subscription, or all of this type's: a stream is sent what was emitted to it before, then
+        ``notifications/events/terminated`` with ``error``, and closed. The next poll is answered with the error.
+        Forbidden unless given, which ends delivery at once, since access is lost.
+        """
+        error = error or _FORBIDDEN
+        until = 0 if error.code == _FORBIDDEN.code else self._sequence
         if subscription_id is None:
             entries = list(self._subscriptions.values())
         else:
@@ -397,7 +402,7 @@ class EventType(Generic[A, D]):
             )
         for hold in [hold for entry in entries for hold in entry.holds]:
             if hold.ended is None:
-                hold.ended = error or _FORBIDDEN
+                hold.ended, hold.until = error, until
                 hold.wake()
 
     def remove(self) -> None:
@@ -451,18 +456,20 @@ class EventType(Generic[A, D]):
         )
         return self._kept[index] if index < len(self._kept) else None
 
-    # Where a cursor resumes reading what is kept, and whether events between were let go. A None cursor starts from
-    # now, and so does one from another process.
-    def _resume(self, cursor: str | None, max_age_ms: int | None) -> tuple[int, bool]:
+    # Where a cursor resumes reading what is kept, and whether events between were let go. A None cursor starts where
+    # the subscription was opened, so it has what its on_subscribe emitted, and so does one from another process.
+    def _resume(
+        self, cursor: str | None, max_age_ms: int | None, opened: int
+    ) -> tuple[int, bool]:
         if cursor is None:
-            return self._sequence, False
+            return opened, False
         epoch, _, text = cursor.partition(".")
         if (
             epoch != self._events._epoch
             or not text.isdigit()
             or int(text) > self._sequence
         ):
-            return self._sequence, True
+            return opened, True
         sequence, truncated = max(int(text), self._dropped), int(text) < self._dropped
         if max_age_ms is not None:
             floor = time.monotonic() - max_age_ms / 1000
@@ -496,9 +503,14 @@ class EventType(Generic[A, D]):
     # What a poll is owed after a cursor from what is kept. An event that cannot be shaped for this subscription is
     # skipped for it, and the failure logged.
     def _since(
-        self, request: _Request, cursor: str | None, max_age_ms: int | None, limit: int
+        self,
+        request: _Request,
+        cursor: str | None,
+        max_age_ms: int | None,
+        limit: int,
+        opened: int,
     ) -> _Read:
-        reached, truncated = self._resume(cursor, max_age_ms)
+        reached, truncated = self._resume(cursor, max_age_ms, opened)
         events: list[tuple[dict[str, Any], str | None]] = []
         while (kept := self._next(reached)) is not None:
             if len(events) == limit:
@@ -834,14 +846,20 @@ class Events(Extension):
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
         declared, request = await self._subscription(params, "poll", _streams(ctx))
+        opened = declared._sequence
         hold = await self._lease(declared, request)
         limit = params.max_events or _PAGE
         if declared._check is not None:
             read = await declared._checked(
                 hold, request, params.cursor, params.max_age_ms, limit
             )
+        elif params.cursor is None:
+            # The sketch: a poll from null "returns no events and provides a fresh cursor".
+            read = _Read([], None, declared._position(opened))
         else:
-            read = declared._since(request, params.cursor, params.max_age_ms, limit)
+            read = declared._since(
+                request, params.cursor, params.max_age_ms, limit, opened
+            )
         # A poll carries its cursor once, for the whole answer.
         return {
             "events": [occurrence for occurrence, _ in read.events],
@@ -1139,6 +1157,15 @@ class Events(Extension):
             def position() -> str | None:
                 return cursor if checked else declared._position(seen)
 
+            async def send(kept: _Kept) -> None:
+                try:
+                    shaped = declared._shape(kept, request)
+                except Exception as error:  # noqa: BLE001
+                    await say("error", {"error": _described(error)})
+                    return
+                if shaped is not None:
+                    await deliver(shaped, position(), kept.size)
+
             # Without a first answer there is no stream to tell, and the request fails.
             if checked:
                 read = await declared._checked(
@@ -1150,7 +1177,9 @@ class Events(Extension):
                     await deliver(occurrence, after)
                 due = time.monotonic() + (0 if read.has_more else _INTERVAL)
             else:
-                seen, truncated = declared._resume(params.cursor, params.max_age_ms)
+                seen, truncated = declared._resume(
+                    params.cursor, params.max_age_ms, seen
+                )
                 await say("active", {"cursor": position(), "truncated": truncated})
                 due = math.inf
             beat = time.monotonic() + _HEARTBEAT
@@ -1193,16 +1222,15 @@ class Events(Extension):
                         await say("active", {"cursor": position(), "truncated": True})
                 elif (kept := declared._next(seen)) is not None:
                     seen = kept.sequence
-                    try:
-                        shaped = declared._shape(kept, request)
-                    except Exception as error:  # noqa: BLE001
-                        await say("error", {"error": _described(error)})
-                        continue
-                    if shaped is not None:
-                        await deliver(shaped, position(), kept.size)
+                    await send(kept)
                 else:
                     with anyio.move_on_after(min(beat, due) - time.monotonic()):
                         await wake.wait()
+            while (
+                kept := declared._next(seen)
+            ) is not None and kept.sequence <= hold.until:
+                seen = kept.sequence
+                await send(kept)
             if hold.ended is not None:
                 await say(
                     "terminated",

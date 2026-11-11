@@ -12,7 +12,8 @@ from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import CallToolResult
+from mcp.shared.exceptions import MCPError
+from mcp.types import CallToolResult, ErrorData
 from pydantic import BaseModel, Field, TypeAdapter
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -490,6 +491,54 @@ def test_where_push_cannot_be_served_it_is_not_offered_and_a_subscription_polls(
                 ):
                     pass
             await stop()
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=20))
+
+
+def test_what_a_subscribe_hook_emits_to_its_subscription_reaches_it_by_push_and_poll():
+    async def exercise():
+        events = Events()
+
+        def welcome(context, arguments, id):
+            changed.emit(
+                Change(board=arguments.board, text="welcome"), subscription_id=id
+            )
+
+        changed = declare(events, on_subscribe=welcome)
+        server = MCPServer("boards", extensions=[events])
+        port, stop = await serve(mounted(server, events))
+        for delivery in ["push", "poll"]:
+            async with boards(port, user="ann").ext.events.subscribe(
+                "board.changed", {"board": "b1"}, delivery=delivery
+            ) as changes:
+                assert (await anext(changes)).data["text"] == "welcome"
+        await stop()
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=20))
+
+
+def test_a_stream_the_app_terminates_is_first_sent_what_was_emitted_to_it():
+    async def exercise():
+        events = Events()
+        ids = []
+        changed = declare(
+            events, on_subscribe=lambda context, arguments, id: ids.append(id)
+        )
+        server = MCPServer("boards", extensions=[events])
+        port, stop = await serve(mounted(server, events))
+        async with boards(port).ext.events.subscribe(
+            "board.changed", {"board": "b1"}
+        ) as changes:
+            for text in ["one", "two", "three"]:
+                changed.emit(Change(board="b1", text=text), subscription_id=ids[0])
+            changed.terminate(ids[0], ErrorData(code=-32000, message="Closed"))
+            changed.emit(Change(board="b1", text="after"))
+            received = [(await anext(changes)).data["text"] for _ in range(3)]
+            with pytest.raises(MCPError) as ended:
+                await anext(changes)
+        assert received == ["one", "two", "three"]
+        assert ended.value.error.message == "Closed"
+        await stop()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=20))
 

@@ -34,7 +34,7 @@ __all__ = ["App", "load", "serve"]
 
 _MCP = re.compile(r"/mcp(/[^/]+)?")
 _CONTEXT = re.compile(r"[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+")
-_CALLER = re.compile(r"spiffe://cluster\.local/ns/([^/]+)/sa/([^/]+)")
+_CALLER = re.compile(r"([^/]+)/([^/]+)")
 _MALFORMED = PlainTextResponse(
     "Malformed Holon context\n",
     status_code=400,

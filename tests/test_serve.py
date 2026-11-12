@@ -26,7 +26,7 @@ from holon.serve import App, _asgi
 
 PERSON = {"iss": "https://id.example", "sub": "ann", "client_id": "web"}
 PROFILE = {"email": "ann@example.com", "email_verified": True}
-REPORTER = "spiffe://cluster.local/ns/session/sa/reporter"
+REPORTER = "session/reporter"
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 IDENTITY = {"name": "caller", "version": "1", "requires": {"peer": {}}}
 
@@ -154,7 +154,7 @@ async def test_a_malformed_context_is_a_bad_request(monkeypatch):
         for headers in [
             [("x-holon-context", context()), ("x-holon-context", context())],
             [("x-holon-caller", REPORTER), ("x-holon-caller", REPORTER)],
-            [("x-holon-caller", "spiffe://holon.example/sa/reporter")],
+            [("x-holon-caller", "reporter")],
             [("x-holon-context", "header.claims")],
             [("x-holon-context", "e30.e30=.signature")],
             [("x-holon-context", token("person"))],

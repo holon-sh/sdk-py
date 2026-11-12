@@ -32,8 +32,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext import events as events_module
-from holon.ext.events import Events, NoCompatibleDeliveryMode
+from holon.ext.events import Events, NoCompatibleDeliveryMode, _server
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 
@@ -219,7 +218,7 @@ async def test_a_signed_in_caller_has_one_subscription_per_arguments_and_a_calle
 async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries_on(
     monkeypatch, delivery
 ):
-    monkeypatch.setattr(events_module, "_KEEP_EVENTS", 2)
+    monkeypatch.setattr(_server, "_KEEP_EVENTS", 2)
     events, changed = declare()
     heard = []
     async with (
@@ -413,8 +412,8 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its_lease_lapses(
     monkeypatch,
 ):
-    monkeypatch.setattr(events_module, "_POLL_SUBSCRIPTION_TTL", 0.1)
-    monkeypatch.setattr(events_module, "_MAX_SUBSCRIPTIONS", 1)
+    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.1)
+    monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
     setting_up, release, ended = asyncio.Event(), asyncio.Event(), []
 
     async def on_subscribe(context, arguments, id):
@@ -460,7 +459,7 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its
 async def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_releases_the_id(
     monkeypatch,
 ):
-    monkeypatch.setattr(events_module, "_SUBSCRIBE_TIMEOUT", 0.1)
+    monkeypatch.setattr(_server, "_SUBSCRIBE_TIMEOUT", 0.1)
     calls = []
 
     async def on_subscribe(context, arguments, id):

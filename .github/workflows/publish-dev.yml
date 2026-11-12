@@ -1,17 +1,24 @@
+# Every merge to main publishes a dev build, 0.0.1.dev<run number>. PyPI trusts this workflow by
+# name to publish. While every holon-sh release is a dev build, installers take the newest one
+# without asking for pre-releases.
 name: Publish dev release
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      channel:
-        description: Release channel (only "dev" is supported)
-        type: string
-        default: dev
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
   publish:
+    needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -20,44 +27,11 @@ jobs:
     env:
       VERSION: 0.0.1.dev${{ github.run_number }}
     steps:
-      - name: Validate channel
-        env:
-          CHANNEL: ${{ inputs.channel }}
-        run: |
-          if [ "$CHANNEL" != dev ]; then
-            echo "::error::Unsupported channel '$CHANNEL'; only 'dev' can be published from this workflow."
-            exit 1
-          fi
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-      - run: uv sync
-      - run: uv run --no-sync pytest
-      - run: uv run --no-sync mypy --strict -p holon
       - name: Set the dev version (not committed)
-        run: |
-          uv version --frozen "$VERSION"
-          grep -q "^version = \"$VERSION\"$" pyproject.toml
+        run: uv version --frozen "$VERSION"
       - run: uv build
-      - name: Verify installed wheel and sdist consumers
-        run: uv run --no-sync python scripts/verify_distribution.py
-      - name: Publish to PyPI
-        env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          if [ -n "$PYPI_TOKEN" ]; then
-            export UV_PUBLISH_TOKEN="$PYPI_TOKEN"
-          fi
-          uv publish --trusted-publishing automatic dist/*
-      - name: Summarize
-        run: |
-          {
-            echo "## holon-sh $VERSION (dev)"
-            echo
-            echo '```sh'
-            echo "pip install holon-sh==$VERSION"
-            echo "uv add 'holon-sh==$VERSION'"
-            echo "pip install --pre holon-sh"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+      - run: uv publish --trusted-publishing always dist/*

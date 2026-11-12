@@ -1,5 +1,9 @@
 name: CI
-on: [push, pull_request]
+on:
+  pull_request:
+  workflow_dispatch:
+  # publish-dev.yml runs this first on every merge to main.
+  workflow_call:
 
 permissions:
   contents: read

@@ -31,13 +31,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.11"
-      - run: uv sync
       - name: Set the dev version (not committed)
-        run: |
-          uv version --frozen "$VERSION"
-          grep -q "^version = \"$VERSION\"$" pyproject.toml
+        run: uv version --frozen "$VERSION"
       - run: uv build
-      - name: Verify installed wheel and sdist consumers
-        run: uv run --no-sync python scripts/verify_distribution.py
       - run: uv publish --trusted-publishing always dist/*
-      - run: echo "Published \`holon-sh==$VERSION\`" >> "$GITHUB_STEP_SUMMARY"

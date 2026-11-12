@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
-from typing import Any, Generic, Literal, Protocol, TypeAlias, TypedDict, TypeVar
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    NotRequired,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+)
 
 import httpx2
 import jsonschema
+from jsonschema.protocols import Validator
 from mcp import Client
 from mcp.client import Transport
 from mcp.client.session import ClientRequestContext
@@ -29,7 +39,6 @@ from mcp.types import (
 )
 from referencing import Registry
 
-from holon.binding import Binding
 from holon.ext.events import AppEvents
 from holon.ext.files._client import (
     FILES,
@@ -51,6 +60,25 @@ __all__ = [
 
 Output = TypeVar("Output")
 _VERSION = "2026-07-28"
+
+
+class Binding(TypedDict):
+    """Connection settings for an MCP dependency.
+
+    Attributes:
+        endpoint: Streamable HTTP MCP URL.
+        http_client: Factory returning a fresh ``httpx2.AsyncClient`` for each
+            call. Configure authentication headers or a custom transport here.
+            The SDK closes the returned client when the call finishes.
+        file_origins: Origins (``https://host[:port]``) the server may send
+            file transfers to. When set, no other origin is used, and a listed
+            origin may also be plain-http loopback or a private address. When
+            unset, any https origin on a public address.
+    """
+
+    endpoint: str
+    http_client: NotRequired[Callable[[], httpx2.AsyncClient]]
+    file_origins: NotRequired[Sequence[str]]
 
 
 class CompleteResult(Protocol, Generic[Output]):
@@ -173,21 +201,21 @@ class _App:
         name: str,
         identity: dict[str, Any],
         contract: dict[str, Any] | None,
-        binding: Binding | None = None,
+        binding: Binding | None,
     ) -> None:
         self._name = name
         self._identity = identity
         self._binding = binding
-        self._validators: dict[str, Any] = {}
-        self._definitions = (
-            None
+        self._validators: dict[str, Validator] = {}
+        self._definitions: dict[str, dict[str, Any]] = (
+            {}
             if contract is None
             else {tool["name"]: tool for tool in contract["tools"]}
         )
         self.tools = SimpleNamespace(
             **{
                 name: partial(self._call_tool, tool)
-                for name, tool in (self._definitions or {}).items()
+                for name, tool in self._definitions.items()
                 if not name.startswith("_")
             }
         )
@@ -204,7 +232,7 @@ class _App:
         """Call a dependency tool and return its full MCP result.
 
         Args:
-            name: Tool name. Contracted dependencies reject unknown tools.
+            name: Tool name.
             options: Request timeout in seconds, input responses, continuation
                 state, metadata, and ``elicit`` to answer the server's questions in
                 place. Passed positionally, separate from tool input.
@@ -217,7 +245,7 @@ class _App:
             structured output is contract-validated.
 
         Raises:
-            ValueError: Unknown tool, invalid output, or undeclared dependency.
+            ValueError: Invalid output, or undeclared dependency.
             RuntimeError: Endpoint resolution failed.
             holon.ext.files.FileTransferError: A file was not sent; the tool did
                 not run.
@@ -228,40 +256,25 @@ class _App:
         client and MCP session, including when an exception occurs.
         """
         options = options or {}
-        definition = None
-        if self._definitions is not None:
-            definition = self._definitions.get(name)
-            if definition is None:
-                raise ValueError(f"Unknown tool {self._name}.{name}.")
-        failure: Exception | None = None
+        definition = self._definitions.get(name, {})
         transfers = Transfers(
             f"{self._name}.{name}",
             self._binding.get("file_origins") if self._binding else None,
         )
         async with self._session(options.get("timeout"), transfers=transfers) as client:
-            try:
-                if holds_file(arguments):
-                    schema = definition.get("inputSchema") if definition else None
-                    arguments = await transfers.prepare(client, name, schema, arguments)
-                result = await _send(client, name, arguments, options, transfers)
-            except Exception as error:  # noqa: BLE001
-                failure = error
-        if failure is not None:
-            raise failure
+            if holds_file(arguments):
+                schema = definition.get("inputSchema")
+                arguments = await transfers.prepare(client, name, schema, arguments)
+            result = await _send(client, name, arguments, options, transfers)
         if isinstance(result, CallToolResult):
             remember(result, transfers)
-        if (
-            definition is not None
-            and isinstance(result, CallToolResult)
-            and not result.is_error
-            and "outputSchema" in definition
-        ):
-            self._validate(
-                name,
-                definition["outputSchema"],
-                result.structured_content,
-                f"structured output from {self._name}.{name}",
-            )
+            if not result.is_error and "outputSchema" in definition:
+                self._validate(
+                    name,
+                    definition["outputSchema"],
+                    result.structured_content,
+                    f"structured output from {self._name}.{name}",
+                )
         return result
 
     def _connection(
@@ -290,6 +303,8 @@ class _App:
         headers = {"Authorization": f"Bearer {token}"} if token else None
         return endpoint, partial(http_client, headers=headers)
 
+    # An error in the block is raised as itself, not in the ExceptionGroup of the session's task group, once the
+    # session has closed. It wins over an error in closing.
     @asynccontextmanager
     async def _session(
         self,
@@ -298,30 +313,40 @@ class _App:
         transfers: Transfers | None = None,
     ) -> AsyncIterator[Client]:
         endpoint, http_client = self._connection(timeout)
-        async with http_client() as http:
-            if transfers is not None:
-                transfers.bind(endpoint, http_client, http)
-            transport: Transport = streamable_http_client(
-                endpoint, http_client=http, max_sse_event_size=None
-            )
-            if wrap is not None:
-                transport = wrap(transport)
-            async with Client(
-                transport,
-                client_info=Implementation(
-                    name=self._identity["name"], version=self._identity["version"]
-                ),
-                mode=_VERSION,
-                elicitation_callback=_declare_elicitation,
-                extensions=[FILES],
-            ) as client:
-                yield client
+        failure: Exception | None = None
+        try:
+            async with http_client() as http:
+                if transfers is not None:
+                    transfers.bind(endpoint, http_client, http)
+                transport: Transport = streamable_http_client(
+                    endpoint, http_client=http, max_sse_event_size=None
+                )
+                if wrap is not None:
+                    transport = wrap(transport)
+                async with Client(
+                    transport,
+                    client_info=Implementation(
+                        name=self._identity["name"], version=self._identity["version"]
+                    ),
+                    mode=_VERSION,
+                    elicitation_callback=_declare_elicitation,
+                    extensions=[FILES],
+                ) as client:
+                    try:
+                        yield client
+                    except Exception as error:  # noqa: BLE001
+                        failure = error
+        except Exception:
+            if failure is None:
+                raise
+        if failure is not None:
+            raise failure
 
     def _validate(
         self, name: str, schema: dict[str, Any], value: Any, label: str
     ) -> None:
         validator = self._validators.get(name)
-        if validator is None or validator.schema is not schema:
+        if validator is None:
             cls = jsonschema.validators.validator_for(schema)
             cls.check_schema(schema)
             validator = self._validators[name] = cls(

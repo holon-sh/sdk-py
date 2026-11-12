@@ -56,6 +56,8 @@ from holon.ext.files._wire import (
 )
 
 _STATE = "files."
+# Seconds an upload stays valid, through every retry, and a returned file stays available.
+_TTL = 900.0
 
 
 @dataclass(frozen=True)
@@ -74,13 +76,12 @@ class ReceivedFile:
     mime_type: str
     size: int
     digest: str | None
-    _path: Path | None = None
-    _data: bytes = b""
+    _source: Path | bytes
 
     async def read(self) -> bytes:
-        if self._path is None:
-            return self._data
-        return await anyio.Path(self._path).read_bytes()
+        if isinstance(self._source, bytes):
+            return self._source
+        return await anyio.Path(self._source).read_bytes()
 
     async def save(
         self, destination: str | os.PathLike[str], *, overwrite: bool = False
@@ -92,13 +93,15 @@ class ReceivedFile:
         """
         target = Path(destination)
         async with writing(target, overwrite) as partial:
-            if self._path is None:
-                await anyio.Path(partial).write_bytes(self._data)
+            if isinstance(self._source, bytes):
+                await anyio.Path(partial).write_bytes(self._source)
             else:
                 try:
-                    os.link(self._path, partial)
+                    os.link(self._source, partial)
                 except OSError:
-                    await anyio.to_thread.run_sync(shutil.copyfile, self._path, partial)
+                    await anyio.to_thread.run_sync(
+                        shutil.copyfile, self._source, partial
+                    )
         return target
 
 
@@ -174,9 +177,10 @@ class FileServer:
             annotations set ``idempotentHint``.
         max_inline_bytes: Largest total of inline file bytes in one request;
             0 takes every file out of band.
-        principal: Who a request acts for; defaults to the authenticated user.
         codec: Seals ``requestState``. Defaults to a key held by this process.
-        ttl: Seconds an upload stays valid, through every retry.
+
+    An upload is bound to the authenticated user, and stays valid for 15
+    minutes through every retry; a returned file stays available as long.
     """
 
     def __init__(
@@ -185,18 +189,12 @@ class FileServer:
         *,
         tools: Callable[[str], Mapping[str, Any] | None],
         max_inline_bytes: int = 0,
-        principal: Callable[
-            [ServerRequestContext[Any, Any]], str | None
-        ] = authenticated_principal,
         codec: RequestStateCodec | None = None,
-        ttl: float = 900.0,
     ) -> None:
         self._storage = storage
         self._tools = tools
         self._max_inline_bytes = max_inline_bytes
-        self._principal = principal
         self._codec = codec or AESGCMRequestStateCodec([os.urandom(32)])
-        self._ttl = ttl
 
     def settings(self) -> dict[str, Any]:
         """The extension's settings for ``server/discover``."""
@@ -244,7 +242,7 @@ class FileServer:
                 source if isinstance(source, bytes) else Path(source),
                 name,
                 mime_type,
-                time.time() + self._ttl,
+                time.time() + _TTL,
             )
             return CallToolResult(
                 content=[said], _meta={EXTENSION: {"downloads": [target]}}
@@ -323,7 +321,7 @@ class FileServer:
                 )
             record = {
                 "b": self._binding(ctx, name, arguments),
-                "e": time.time() + self._ttl,
+                "e": time.time() + _TTL,
                 "f": {},
             }
             uploads = []
@@ -379,7 +377,7 @@ class FileServer:
     def _binding(
         self, ctx: ServerRequestContext[Any, Any], name: str, arguments: Any
     ) -> str:
-        bound = [name, _canonical(arguments), self._principal(ctx)]
+        bound = [name, _canonical(arguments), authenticated_principal(ctx)]
         return sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode())
 
     def _seal(self, record: dict[str, Any], inner: object) -> str:
@@ -456,7 +454,7 @@ def _inspect(
             raise _Refused(f"File {label} does not match its digest.")
         inline += file.size
         received[file.id] = ReceivedFile(
-            file.name, file.mimeType, file.size, digest, None, raw
+            file.name, file.mimeType, file.size, digest, raw
         )
     if inline > max_inline_bytes:
         raise _Refused("The inline file data is larger than this server accepts.")

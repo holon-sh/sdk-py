@@ -122,6 +122,7 @@ _SUBSCRIBE_TIMEOUT = 30.0
 
 A = TypeVar("A")
 D = TypeVar("D")
+T = TypeVar("T")
 Delivery: TypeAlias = Literal["poll", "push"]
 
 
@@ -135,8 +136,8 @@ class Event(Generic[D]):
     data: D
     event_id: str | None = None
     """The source's own id, so that a client drops an event it has seen. Made up when not given."""
-    timestamp: datetime | str | None = None
-    """When it happened. Now when not given."""
+    timestamp: str | None = None
+    """When it happened, in RFC 3339."""
     cursor: str | None = None
     """The position just after this event, where a client resumes."""
     meta: dict[str, Any] | None = None
@@ -174,7 +175,7 @@ def _described(error: BaseException) -> dict[str, Any]:
     return {"code": INTERNAL_ERROR, "message": "InternalError"}
 
 
-async def _settle(value: Any) -> Any:
+async def _settle(value: T | Awaitable[T]) -> T:
     return await value if inspect.isawaitable(value) else value
 
 
@@ -206,8 +207,8 @@ class _Kept:
     event: Event[Any]
     size: int
     target: str | None
-    sequence: int = 0
-    at: float = 0.0
+    sequence: int
+    at: float
 
 
 @dataclass(eq=False)
@@ -288,7 +289,7 @@ class EventType(Generic[A, D]):
         event = Event(
             data, event_id or str(uuid.uuid4()), _iso(timestamp), name=self.name
         )
-        self._keep(_Kept(event, size, subscription_id))
+        self._keep(event, size, subscription_id)
         for hold in self._holds(subscription_id):
             hold.wake()
 
@@ -327,9 +328,9 @@ class EventType(Generic[A, D]):
             f"{self._events._epoch}.{self._sequence if sequence is None else sequence}"
         )
 
-    def _keep(self, kept: _Kept) -> None:
+    def _keep(self, event: Event[Any], size: int, target: str | None) -> None:
         self._sequence += 1
-        kept.sequence, kept.at = self._sequence, time.monotonic()
+        kept = _Kept(event, size, target, self._sequence, time.monotonic())
         self._kept.append(kept)
         self._bytes += kept.size
         # The newest is kept whatever it weighs, since streams read it from here.
@@ -428,8 +429,8 @@ class EventType(Generic[A, D]):
         }
 
     async def _allows(self, context: RequestContext, arguments: Any) -> bool:
-        return self._authorize is None or bool(
-            await _settle(self._authorize(context, arguments))
+        return self._authorize is None or await _settle(
+            self._authorize(context, arguments)
         )
 
     async def _settled(self, id: str) -> None:
@@ -547,10 +548,8 @@ class Events(Extension):
         """
         if name in self._types:
             raise ValueError(f"Event {name} is already declared.")
-        if not delivery or any(mode not in ("poll", "push") for mode in delivery):
-            raise ValueError(
-                f"Event {name} must be delivered by poll, push or both, not {list(delivery)}."
-            )
+        if not delivery:
+            raise ValueError(f"Event {name} must be delivered by poll, push or both.")
         arguments = (
             input_schema
             if isinstance(input_schema, TypeAdapter)
@@ -1017,7 +1016,6 @@ class Events(Extension):
         return {"_meta": {}}
 
 
-_Notified: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[None]]
 # How long a poll or a list waits for its answer, and a connection takes to open, in seconds.
 _TIMEOUT = 30.0
 # A stream that has said nothing for twice the longest heartbeat interval is dead: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#lifecycle
@@ -1030,7 +1028,7 @@ class _Answer(BaseModel):
 
 @asynccontextmanager
 async def _ordered(
-    transport: Transport, notified: _Notified
+    transport: Transport, notified: Notify
 ) -> AsyncIterator[TransportStreams]:
     """The transport, with MCP Events' notifications handed to ``notified`` as they arrive.
 
@@ -1106,23 +1104,15 @@ class AppEvents:
     async def list(self) -> list[dict[str, Any]]:
         """The event types the app offers, as ``events/list`` describes them."""
         events: list[dict[str, Any]] = []
-        failure: Exception | None = None
         async with self._app._session(_TIMEOUT) as client:
-            try:
-                cursor = None
-                while True:
-                    page = await _request(
-                        client,
-                        "events/list",
-                        {} if cursor is None else {"cursor": cursor},
-                    )
-                    events += page.get("events", [])
-                    if not (cursor := page.get("nextCursor")):
-                        break
-            except Exception as error:  # noqa: BLE001
-                failure = error
-        if failure is not None:
-            raise failure
+            cursor = None
+            while True:
+                page = await _request(
+                    client, "events/list", {} if cursor is None else {"cursor": cursor}
+                )
+                events += page.get("events", [])
+                if not (cursor := page.get("nextCursor")):
+                    break
         return events
 
     def subscribe(
@@ -1133,7 +1123,7 @@ class AppEvents:
         *,
         cursor: str | None = None,
         max_age: float | None = None,
-        delivery: Literal["poll", "push"] | None = None,
+        delivery: Delivery | None = None,
         on_gap: Callable[[], object] | None = None,
     ) -> Subscription[Any]:
         """Subscribe to an event type of the app.
@@ -1189,7 +1179,7 @@ class Subscription(Generic[D]):
         arguments: dict[str, Any],
         cursor: str | None,
         max_age: float | None,
-        delivery: Literal["poll", "push"] | None,
+        delivery: Delivery | None,
         on_gap: Callable[[], object] | None,
     ) -> None:
         self.cursor = cursor
@@ -1225,12 +1215,12 @@ class Subscription(Generic[D]):
         ]
         # A type the app does not list is refused by the app, with NotFound.
         offered: list[str] = listed[0].get("delivery", []) if listed else ["poll"]
-        wanted = [self.delivery] if self.delivery else ["push", "poll"]
+        wanted: list[Delivery] = [self.delivery] if self.delivery else ["push", "poll"]
         if not (usable := [mode for mode in wanted if mode in offered]):
             raise NoCompatibleDeliveryMode(
                 f"{self._app._name} does not deliver {self._name} by {' or '.join(wanted)}."
             )
-        self.delivery = cast(Delivery, usable[0])
+        self.delivery = usable[0]
         self._group = anyio.create_task_group()
         await self._group.__aenter__()
         self._group.start_soon(self._run)
@@ -1293,24 +1283,21 @@ class Subscription(Generic[D]):
                 async with self._app._session(
                     _TIMEOUT, partial(_ordered, notified=self._notified)
                 ) as client:
-                    try:
-                        if self.delivery == "push":
-                            try:
-                                await self._push(client)
-                            except MCPError as error:
-                                # An endpoint that cannot stream refuses push, and the subscription polls instead.
-                                if (
-                                    self._forced
-                                    or self._active
-                                    or error.code != UNSUPPORTED
-                                ):
-                                    raise
-                                self.delivery = "poll"
-                        await self._poll(client)
-                    except Exception as error:  # noqa: BLE001
-                        self._failure = error
+                    if self.delivery == "push":
+                        try:
+                            await self._push(client)
+                        except MCPError as error:
+                            # An endpoint that cannot stream refuses push, and the subscription polls instead.
+                            if (
+                                self._forced
+                                or self._active
+                                or error.code != UNSUPPORTED
+                            ):
+                                raise
+                            self.delivery = "poll"
+                    await self._poll(client)
             except Exception as error:  # noqa: BLE001
-                self._failure = self._failure or error
+                self._failure = error
             finally:
                 self._settled.set()
                 self._send.close()

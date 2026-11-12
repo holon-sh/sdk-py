@@ -90,7 +90,7 @@ async def serve(app, port=0):
     return sock.getsockname()[1], stop
 
 
-# Holon admits a caller before the app sees the request; here an `x-user` header stands in for it.
+# An `x-user` header stands in for the caller Holon admits.
 def mounted(events):
     server = MCPServer("boards", extensions=[events], middleware=[events])
     server.streamable_http_app(stateless_http=True)
@@ -479,7 +479,7 @@ async def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_release
 async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
     events, changed = declare()
     bare = MCPServer("boards", extensions=[events])
-    # An SDK release without the private stream path the wrapper borrows on a JSON endpoint.
+    # An SDK without the private stream path `Events.asgi` uses on a JSON endpoint.
     monkeypatch.setitem(sys.modules, "mcp.server._streamable_http_modern", None)
     wrapped = MCPServer("boards", extensions=[events])
     wrapped.streamable_http_app(stateless_http=True, json_response=True)

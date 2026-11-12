@@ -124,7 +124,6 @@ def test_a_server_that_keeps_asking_stops_after_ten_answers():
     async def body(orders):
         with pytest.raises(ToolCallError) as error:
             await orders.tools.nag({"elicit": elicit}, id="A-1")
-        # The questions left unanswered reach the caller, a URL one with its URL.
         assert QUESTION in str(error.value) and LINK in str(error.value)
 
     exercise(body)

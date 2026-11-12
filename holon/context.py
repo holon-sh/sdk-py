@@ -18,7 +18,7 @@ class AddressClaims(TypedDict, total=False):
 class IdentityClaims(TypedDict, total=False):
     """Standard OpenID Connect claims.
 
-    Holon drops one whose value has the wrong type; other claims pass through.
+    https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims
     """
 
     name: str
@@ -44,7 +44,7 @@ class IdentityClaims(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class Principal:
-    """The user a request acts for, as Holon admitted it."""
+    """The user a request acts for."""
 
     issuer: str
     subject: str
@@ -60,17 +60,7 @@ class RequestContext:
 
 
 def get_context() -> RequestContext:
-    """Read the caller of the current MCP request.
-
-    Holon validates the request before it reaches the application and hands the
-    caller over as MCP's access token, so this reads ``get_access_token()``.
-
-    Returns:
-        A ``RequestContext`` whose ``principal`` is ``None`` for anonymous requests.
-
-    Example:
-        ``principal = get_context().principal``
-    """
+    """The caller of the current MCP request; ``principal`` is ``None`` when anonymous."""
     admitted = get_access_token()
     extra = (admitted.claims or {}) if admitted else {}
     if admitted is None or admitted.subject is None or "iss" not in extra:

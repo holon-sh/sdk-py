@@ -25,9 +25,8 @@ from holon.ext.events._wire import FORBIDDEN, NOT_FOUND, UNSUPPORTED, D, Deliver
 if TYPE_CHECKING:
     from holon.client import _App
 
-# How long a poll or a list waits for its answer, and a connection takes to open, in seconds.
 _TIMEOUT = 30.0
-# A stream that has said nothing for twice the longest heartbeat interval is dead: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#lifecycle
+# Twice the longest heartbeat interval: https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#lifecycle
 _QUIET = 60.0
 
 
@@ -39,10 +38,9 @@ class _Answer(BaseModel):
 async def _ordered(
     transport: Transport, notified: Callable[[str, dict[str, Any]], Awaitable[None]]
 ) -> AsyncIterator[TransportStreams]:
-    """The transport, with MCP Events' notifications handed to ``notified`` as they arrive.
+    """The transport, handing Events notifications to ``notified`` in the order they arrive.
 
-    The MCP client gives each notification a task of its own, which loses their order, so these are taken out
-    before it sees them. A response comes after its request's notifications, and waits until they are handled.
+    The MCP client handles each notification in a task of its own, which loses their order.
     """
     async with transport as (read, write):
         forward, forwarded = anyio.create_memory_object_stream[
@@ -95,8 +93,7 @@ async def _list(client: Client) -> list[dict[str, Any]]:
             return events
 
 
-# A server's refusal ends a subscription: the event type is gone, access was lost, the request is not valid, or the
-# delivery mode is not offered. Anything else is tried again from the cursor.
+# Errors that end a subscription; anything else is retried from the cursor.
 def _refused(error: Exception) -> bool:
     return isinstance(error, MCPError) and error.code in (
         INVALID_PARAMS,
@@ -107,15 +104,14 @@ def _refused(error: Exception) -> bool:
 
 
 class NoCompatibleDeliveryMode(Exception):
-    """The sketch's: none of the delivery modes the app offers for an event type is one this subscription uses."""
+    """The app offers no delivery mode this subscription can use."""
 
 
 class AppEvents:
-    """The events of one app, as its client lists and subscribes to them: ``app.ext.events``."""
+    """An app's events, as ``app.ext.events``."""
 
     def __init__(self, app: _App, contract: dict[str, Any] | None) -> None:
         self._app = app
-        # The client checks an event's data against the contract it was built against, as it does a tool's output.
         self._payloads: dict[str, dict[str, Any]] = {
             event["name"]: event["payloadSchema"]
             for event in (contract or {}).get("events", [])
@@ -123,7 +119,7 @@ class AppEvents:
         }
 
     async def list(self) -> list[dict[str, Any]]:
-        """The event types the app offers, as ``events/list`` describes them."""
+        """The event types the app offers."""
         async with self._app._session(_TIMEOUT) as client:
             return await _list(client)
 
@@ -138,16 +134,15 @@ class AppEvents:
         delivery: Delivery | None = None,
         on_gap: Callable[[], object] | None = None,
     ) -> Subscription[Any]:
-        """Subscribe to an event type of the app.
+        """Subscribe to an event type.
 
         Args:
             name: The event type.
-            arguments: The subscription's arguments, as the type's ``inputSchema`` describes them.
-            cursor: Where to resume from, as a subscription's ``cursor`` was. From now unless given.
-            max_age: Seconds: events older than this are not replayed from ``cursor``.
-            delivery: ``"push"`` or ``"poll"``. Push when the app offers it, else poll, unless given. One the app
-                does not offer raises :class:`NoCompatibleDeliveryMode`.
-            on_gap: Called when events were skipped, before the events after the gap.
+            arguments: The subscription's arguments.
+            cursor: Where to resume from. Defaults to now.
+            max_age: Seconds; older events are not replayed.
+            delivery: ``"push"`` or ``"poll"``. Defaults to push when offered.
+            on_gap: Called when events were skipped.
 
         Returns:
             A :class:`Subscription` to enter with ``async with`` and iterate.
@@ -168,16 +163,11 @@ class _Reached:
 
 
 class Subscription(Generic[D]):
-    """A subscription to one event type, from ``app.ext.events.subscribe``.
+    """A subscription to one event type.
 
-    Entering it with ``async with`` subscribes, and returns once the app has confirmed the subscription; a refusal
-    raises ``MCPError``. Iterating it yields each :class:`Event` once, in order, dropping one whose
-    ``event_id`` was seen. A dropped connection is reconnected, and resumes from the cursor. :meth:`cancel`, leaving
-    the block, or cancelling its task ends the subscription: breaking out of ``async for`` alone does not. Iteration
-    raises ``MCPError`` when the app terminates it.
-
-    ``cursor`` is the position after the last event iterated, to persist and resume from. ``delivery`` is how
-    events arrive, once entered.
+    Entering it subscribes. Iterating it yields each :class:`Event` once, in order, reconnecting as needed.
+    Leaving the block or calling :meth:`cancel` ends it. ``cursor`` is the position after the last event
+    iterated.
 
     Example:
         ``async with app.ext.events.subscribe("board.changed", {"board": "b1"}) as events:``
@@ -203,20 +193,18 @@ class Subscription(Generic[D]):
         if max_age is not None:
             self._request["maxAgeMs"] = round(max_age * 1000)
         self._on_gap = on_gap
-        # Where the next request resumes from, ahead of `cursor` by what waits to be iterated.
+        # Where the next request resumes, ahead of `cursor`.
         self._reached = cursor
-        # Set once the app has confirmed the subscription, or it has failed first.
         self._settled = anyio.Event()
         self._active = False
         self._failure: Exception | None = None
         self._seen: dict[str, None] = {}
-        # Nothing waits between the server and the iterator, so a reader that stops reading stops the stream.
+        # Unbuffered, so a reader that stops reading stops the stream.
         self._send, self._receive = anyio.create_memory_object_stream[
             Event[Any] | _Gap | _Reached
         ]()
         self._group: anyio.abc.TaskGroup | None = None
         self._running = anyio.CancelScope()
-        # The open stream request, which a notification ends when the app ended the subscription.
         self._stream: anyio.CancelScope | None = None
         self._ended: Exception | None = None
 
@@ -244,8 +232,8 @@ class Subscription(Generic[D]):
         await self._close()
 
     async def cancel(self) -> None:
-        """The sketch's ``sub.cancel()``: ends the subscription, and iteration stops. Leaving the block does too."""
-        # The block's own code runs inside the task group, so only the work behind the iterator is cancelled here.
+        """End the subscription."""
+        # The caller's block runs in the task group, so cancel only the background work.
         self._running.cancel()
         self._receive.close()
 
@@ -292,7 +280,7 @@ class Subscription(Generic[D]):
 
     async def _follow(self, client: Client) -> None:
         listed = [each for each in await _list(client) if each["name"] == self._name]
-        # A type the app does not list is refused by the app, with NotFound.
+        # An unlisted type is left for the app to refuse.
         offered = listed[0].get("delivery", []) if listed else ["poll"]
         wanted: list[Delivery] = [self.delivery] if self.delivery else ["push", "poll"]
         modes = [mode for mode in wanted if mode in offered]
@@ -340,7 +328,7 @@ class Subscription(Generic[D]):
                 data,
                 f"data of {self._app._name} {self._name}",
             )
-        # A pushed event's `_meta` also routes it to its stream, which is not the event's own.
+        # Drop the stream's routing key from the event's `_meta`.
         meta = {
             key: value
             for key, value in (occurrence.get("_meta") or {}).items()
@@ -369,13 +357,11 @@ class Subscription(Generic[D]):
                     raise
             else:
                 self._confirm()
-                # The gap comes before the events after it.
                 if result.get("truncated"):
                     await self._send.send(_Gap())
                 for occurrence in result.get("events", []):
                     await self._deliver(occurrence)
                 await self._reach(result.get("cursor"))
-                # A server that asks for a tight loop is not obeyed.
                 next_poll = (result.get("nextPollMs") or 0) / 1000
                 wait = 0 if result.get("hasMore") else max(1.0, next_poll)
             await anyio.sleep(wait)
@@ -402,8 +388,7 @@ class Subscription(Generic[D]):
                 )
             await anyio.sleep(1)
 
-    # Told each notification of the open stream, in order. The stream is not quiet while one is being handled,
-    # since a reader that has not taken the last event holds it up.
+    # The stream is not quiet while a notification waits for the reader.
     async def _notified(self, method: str, params: dict[str, Any]) -> None:
         stream = self._stream
         if stream is not None:
@@ -421,7 +406,7 @@ class Subscription(Generic[D]):
             elif method == "notifications/events/terminated":
                 error = ErrorData.model_validate(params.get("error") or {})
                 raise MCPError.from_error_data(error)
-            # notifications/events/error: the server recovers by itself, and the stream stays open.
+            # notifications/events/error leaves the stream open.
         except Exception as error:  # noqa: BLE001
             self._ended = error
             if stream is not None:

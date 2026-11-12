@@ -1,4 +1,4 @@
-"""Server side: declare and emit event types, and serve them by poll and push."""
+"""Server side: declare, emit, and serve event types."""
 
 from __future__ import annotations
 
@@ -54,30 +54,20 @@ from holon.ext.events._wire import (
 
 logger = logging.getLogger(__package__)
 
-# What one poll answers at most, unless the request asks for fewer.
-_PAGE = 1000
-# Marks a request that came through `Events.asgi`, whose answer can be a stream.
+_MAX_POLL_EVENTS = 1000
+# Set on a request that came through `Events.asgi`, whose answer can be a stream.
 _STREAMS = "holon.ext.events.streams"
-# What each event type keeps of what it emits, for polls and for streams that are behind or reconnect: the sketch's
-# emit buffer. For how long in seconds, how many events, and how many bytes their data takes as JSON. The newest is
-# kept whatever it takes.
+# What each event type keeps of what it emits: seconds, events, and bytes of JSON data.
 _KEEP_AGE = 600.0
 _KEEP_EVENTS = 10_000
 _KEEP_BYTES = 4 * 2**20
-# Seconds a poll is told to wait.
-_INTERVAL = 1.0
-# Seconds between a stream's heartbeats. One whose reader takes nothing for two is closed, to reconnect from its cursor.
+_POLL_INTERVAL = 1.0
 _HEARTBEAT = 30.0
-# Seconds a poll subscription lasts after its last poll.
 _POLL_SUBSCRIPTION_TTL = 60.0
-# The bytes of events every stream together is sending at once, of which one caller's streams may send a quarter.
 _MAX_SENDING_BYTES = 16 * 2**20
-# The subscriptions held at once, streams and poll leases alike, and those of one caller.
 _MAX_SUBSCRIPTIONS = 10_000
 _MAX_SUBSCRIPTIONS_PER_CALLER = 100
-# How many types events/list returns at a time.
 _LIST_PAGE_SIZE = 100
-# Seconds a type's on_subscribe has to return before the subscription is refused.
 _SUBSCRIBE_TIMEOUT = 30.0
 
 A = TypeVar("A")
@@ -106,7 +96,6 @@ class _Stalled(Exception):
     """A stream's reader took nothing for two heartbeats."""
 
 
-# What a client is told of a failure: its own error when it raised an MCP one. Anything else is the app's to log.
 def _described(error: BaseException) -> dict[str, Any]:
     if isinstance(error, MCPError):
         return error.error.model_dump(by_alias=True, exclude_none=True, mode="json")
@@ -126,12 +115,7 @@ def _release(counts: Counter[str], key: str, amount: int) -> None:
 
 @dataclass(frozen=True, eq=False)
 class _Request:
-    """A subscription as one request names it, with that request's caller.
-
-    A caller with an identity has one id for the same event type and arguments, so it survives reconnects and poll
-    leases. A caller without one is nobody in particular: each of its streams is a subscription of its own, and its
-    polls share one lease per arguments, which no targeted event reaches.
-    """
+    """A subscription as one request names it, with that request's caller."""
 
     type: EventType[Any, Any]
     id: str
@@ -152,10 +136,10 @@ class _Kept:
 
 @dataclass(eq=False)
 class _Entry:
-    """A subscription held by one or more streams or poll leases, set up once by the type's on_subscribe."""
+    """A subscription, held by one or more streams or poll leases."""
 
     request: _Request
-    """The request that began it, whose context and arguments on_unsubscribe is given."""
+    """The request that began it."""
     setup: asyncio.Future[None]
     holds: set[_Hold] = field(default_factory=set)
     teardown: asyncio.Future[None] | None = None
@@ -168,7 +152,6 @@ class _Hold:
     request: _Request
     entry: _Entry
     wake: asyncio.Event = field(default_factory=asyncio.Event)
-    """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
     until: int = 0
     lease: asyncio.TimerHandle | None = None
@@ -176,7 +159,7 @@ class _Hold:
 
 @dataclass(eq=False, repr=False)
 class EventType(Generic[A, D]):
-    """An event type an app declared with :meth:`Events.event`. Emit its occurrences with :meth:`emit`."""
+    """An event type declared with :meth:`Events.event`."""
 
     name: str
     _events: Events
@@ -188,7 +171,7 @@ class EventType(Generic[A, D]):
     _authorize: Authorize[A] | None
     _on_subscribe: SubscriptionHook[A] | None
     _on_unsubscribe: SubscriptionHook[A] | None
-    # What was emitted, oldest first. `_dropped` is the last sequence let go for room or age.
+    # Emitted events, oldest first; `_dropped` is the last sequence evicted.
     _kept: list[_Kept] = field(default_factory=list)
     _sequence: int = 0
     _dropped: int = 0
@@ -205,16 +188,12 @@ class EventType(Generic[A, D]):
     ) -> None:
         """Emit an occurrence to the subscriptions it matches.
 
-        Give the source's own ``event_id`` when it has one, so that a client drops an occurrence it has seen. With
-        ``subscription_id``, the sketch's targeted emit, the occurrence goes to that subscription alone, whatever its
-        arguments. It is kept like any other, so a subscription that reconnects or polls from its cursor still has
-        it, or is told of a gap.
+        Args:
+            event_id: The source's own id, so a client drops duplicates.
+            timestamp: When it happened. Defaults to now.
+            subscription_id: Send it to this subscription alone.
 
-        Emitting is synchronous, and happens on the event loop that serves the events, from the first emit on: from
-        another thread, call ``loop.call_soon_threadsafe(event_type.emit, data)``. Occurrences emitted one after
-        another in the same synchronous run reach each subscription in that order, with no other occurrence of this
-        type between them, whether polled or pushed, unless it is told of a gap. Data that cannot be serialised
-        raises here, before anything changes.
+        Call it on the event loop that serves the events; from another thread, use ``loop.call_soon_threadsafe``.
         """
         self._events._on_loop()
         size = len(to_json(data, by_alias=True))
@@ -232,17 +211,16 @@ class EventType(Generic[A, D]):
     def cursor(self) -> str:
         """The position after the last occurrence emitted.
 
-        Return it with the state a tool reads, in the same synchronous run, and a client that subscribes from it
-        hears every change after that state and none before.
+        Return it with a snapshot, and a client that subscribes from it hears every change after that snapshot.
         """
         return self._position()
 
     def terminate(
         self, subscription_id: str | None = None, error: ErrorData | None = None
     ) -> None:
-        """Terminate one subscription, or all of this type's: a stream is sent what was emitted to it before, then
-        ``notifications/events/terminated`` with ``error``, and closed. The next poll is answered with the error.
-        Forbidden unless given, which ends delivery at once, since access is lost.
+        """End one subscription, or all of this type's, with ``error``: Forbidden by default.
+
+        A stream first receives what was already emitted to it, unless the error is Forbidden.
         """
         error = error or _FORBIDDEN
         until = 0 if error.code == _FORBIDDEN.code else self._sequence
@@ -271,7 +249,7 @@ class EventType(Generic[A, D]):
         kept = _Kept(event, size, target, self._sequence, time.monotonic())
         self._kept.append(kept)
         self._bytes += kept.size
-        # The newest is kept whatever it weighs, since streams read it from here.
+        # The newest is always kept, since streams read it from here.
         dropped = 0
         while len(self._kept) - dropped > 1 and (
             len(self._kept) - dropped > _KEEP_EVENTS
@@ -289,8 +267,7 @@ class EventType(Generic[A, D]):
         )
         return self._kept[index] if index < len(self._kept) else None
 
-    # Where a cursor resumes reading what is kept, and whether events between were let go. A None cursor starts where
-    # the subscription was opened, so it has what its on_subscribe emitted, and so does one from another process.
+    # Where a cursor resumes, and whether events since were evicted. A null or foreign cursor starts at `opened`.
     def _resume(
         self, cursor: str | None, max_age_ms: int | None, opened: int
     ) -> tuple[int, bool]:
@@ -316,8 +293,7 @@ class EventType(Generic[A, D]):
                 sequence, truncated = self._kept[aged - 1].sequence, True
         return sequence, truncated
 
-    # The occurrence a subscription receives, or None when it is not for it. An event emitted to one subscription
-    # is for that one alone, and its arguments are not asked.
+    # The occurrence as `request` receives it, or None when it is not for it.
     def _shape(self, kept: _Kept, request: _Request) -> dict[str, Any] | None:
         if kept.target is not None:
             if not request.targetable or kept.target != request.id:
@@ -338,8 +314,7 @@ class EventType(Generic[A, D]):
             "data": to_jsonable_python(data, by_alias=True),
         }
 
-    # A poll's answer after a cursor from what is kept. An event that cannot be shaped for this subscription is
-    # skipped for it, and the failure logged.
+    # A poll's answer from `cursor`. An event that fails to shape is skipped, and logged by `_described`.
     def _since(
         self,
         request: _Request,
@@ -376,9 +351,7 @@ class EventType(Generic[A, D]):
             await asyncio.shield(entry.teardown)
 
 
-# The manager's own handling of a 2026-07-28 request, answering by stream as it does subscriptions/listen, which is
-# the one method the SDK streams on an endpoint that answers in JSON. The path is private to the SDK, so it is looked
-# for when an endpoint is mounted, and an endpoint without it offers poll only.
+# The SDK's private handler, which streams a 2026-07-28 request even on a JSON endpoint, when this SDK has it.
 def _streaming(manager: StreamableHTTPSessionManager) -> ASGIApp | None:
     try:
         from mcp.server._streamable_http_modern import handle_modern_request
@@ -405,36 +378,21 @@ def _streaming(manager: StreamableHTTPSessionManager) -> ASGIApp | None:
 
 
 def _streams(ctx: ServerRequestContext[Any, Any]) -> bool:
-    # Over stdio every request can stream. Over HTTP only one that came through `Events.asgi` is known to.
+    # Over stdio every request can stream; over HTTP, only one that came through `Events.asgi`.
     return ctx.request is None or bool(ctx.request.scope.get(_STREAMS))
 
 
 class Events(Extension):
-    """The event types an app serves as MCP Events, by poll and push.
+    """The event types an app serves as MCP Events.
 
     Pass it to ``MCPServer(extensions=[events], middleware=[events])``, or call :meth:`serve` on a low-level
-    ``Server``. Over Streamable HTTP, push is offered only on an endpoint mounted through :meth:`asgi`; elsewhere
-    clients poll.
-
-    Each type keeps what it emits, for ten minutes and up to 10,000 events and 4 MiB, for polls and for streams that
-    are behind or reconnect; those cursors last as long as the process, and after a restart a client is told that
-    events were skipped. A poll is told to come back every second. A stream hears from the server every 30 seconds,
-    and one whose reader has taken nothing for two heartbeats is closed, to reconnect from its cursor. A poll
-    subscription lasts a minute after its last poll.
-
-    A stream sends one event at a time and holds nothing else of its own. Every stream together sends at most 16 MiB
-    of events at once, and one caller's streams a quarter of it; an event is sent alone when nothing else is, whatever
-    it weighs. Waiting for room counts toward the two heartbeats. At most 10,000 subscriptions are held at once,
-    streams and poll leases alike, and 100 of one caller; callers without an identity count together as one.
-    ``events/list`` returns 100 types at a time. A subscription whose ``on_subscribe`` has not returned after 30
-    seconds is refused, and may be tried again. Events thus take about 4 MiB kept for each type and 16 MiB being
-    sent, whatever one caller does.
+    ``Server``. Over Streamable HTTP, push is offered only on an endpoint mounted through :meth:`asgi`.
     """
 
     identifier = EVENTS_EXTENSION
 
     def __init__(self) -> None:
-        # Cursors of kept events are positions in this process's memory; one from another process names nothing.
+        # Cursors are valid only in this process.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
         self._held: Counter[str] = Counter()
@@ -460,23 +418,14 @@ class Events(Extension):
         """Declare an event type.
 
         Args:
-            input_schema: The arguments of a subscription, as a type Pydantic validates. A request whose
-                arguments do not match is refused; callbacks receive them validated.
-            payload_schema: The data of each occurrence, listed as JSON Schema. Use a ``TypeAdapter`` for a union.
-            match: ``(context, event, arguments)``: whether a subscription receives an emitted event. Without it,
-                every subscription does. An event it raises for, or that cannot be shaped, is skipped for that
-                subscription and logged, and a stream is told with ``notifications/events/error``.
-            transform: ``(context, event, arguments)``: the data a subscription receives of an emitted event.
-            delivery: The delivery modes this type offers.
-            authorize: ``(context, arguments)``: whether the caller may subscribe. A subscription is refused with
-                Forbidden when it may not, and one already held is ended when it no longer may: each poll asks, and
-                a stream asks at each heartbeat. A refused poll ends its lease at once.
-            on_subscribe: ``(context, arguments, subscription_id)``: called when a subscription begins, to set up
-                what its events come from. A subscription held by two streams at once is set up once. A server that
-                restarts calls it again, with the same id for a caller with an identity.
-            on_unsubscribe: ``(context, arguments, subscription_id)``: called when a subscription that was set up
-                ends: its last stream closes, its poll lease lapses because polls stopped, or the app terminates it.
-                One that begins again with the same id waits for it to return.
+            input_schema: Type of a subscription's arguments.
+            payload_schema: Type of each occurrence's data.
+            match: ``(context, event, arguments)``: whether a subscription receives an event. Defaults to all.
+            transform: ``(context, event, arguments)``: the data a subscription receives.
+            delivery: The delivery modes offered.
+            authorize: ``(context, arguments)``: whether the caller may subscribe, checked again while subscribed.
+            on_subscribe: ``(context, arguments, subscription_id)``: called when a subscription begins.
+            on_unsubscribe: ``(context, arguments, subscription_id)``: called when it ends.
         """
         if name in self._types:
             raise ValueError(f"Event {name} is already declared.")
@@ -514,7 +463,7 @@ class Events(Extension):
         return declared
 
     def settings(self) -> dict[str, Any]:
-        # Event types change only in the process, and the SDK has no channel to tell every client of it.
+        # The SDK cannot tell every client when types change.
         return {"listChanged": False}
 
     def methods(self) -> Sequence[MethodBinding]:
@@ -525,7 +474,7 @@ class Events(Extension):
         ]
 
     def serve(self, server: Server[Any]) -> None:
-        """Serve ``events/list``, ``events/poll`` and ``events/stream`` on a low-level server, and declare them."""
+        """Serve the events on a low-level ``Server``."""
         for binding in self.methods():
             server.add_request_handler(
                 binding.method, binding.params_type, binding.handler
@@ -536,7 +485,7 @@ class Events(Extension):
     async def __call__(
         self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
     ) -> HandlerResult:
-        """Declare ``capabilities.events`` beside ``capabilities.extensions``, as middleware of the server."""
+        """Declare ``capabilities.events``, as server middleware."""
         result = await call_next(ctx)
         if ctx.method in ("initialize", "server/discover") and isinstance(result, dict):
             capabilities = result.get("capabilities")
@@ -548,12 +497,9 @@ class Events(Extension):
         return result
 
     def asgi(self, manager: StreamableHTTPSessionManager) -> ASGIApp:
-        """The endpoint of ``manager``, on which push is offered.
+        """The endpoint of ``manager``, with push.
 
-        Mount it where ``manager.handle_request`` would be, inside any authentication. A manager set to answer in
-        JSON drops the notifications a request sends, so there ``events/stream`` is answered by the SDK's own stream
-        of server-sent events, for clients of the 2026-07-28 revision, which name the method in a header. Clients of
-        earlier revisions poll there, and so does every client if the SDK no longer has that path.
+        Mount it where ``manager.handle_request`` would be, inside any authentication.
         """
         streaming = _streaming(manager)
 
@@ -572,7 +518,7 @@ class Events(Extension):
     async def _list(
         self, ctx: ServerRequestContext[Any, Any], params: PaginatedRequestParams
     ) -> HandlerResult:
-        # Types are only ever added, so a cursor is the index of the next page.
+        # Types are only added, so a cursor is an index.
         cursor = params.cursor or "0"
         if not cursor.isdigit():
             raise MCPError(INVALID_PARAMS, "Invalid cursor for events/list")
@@ -597,7 +543,6 @@ class Events(Extension):
         opened = declared._sequence
         await self._lease(request)
         if params.cursor is None:
-            # The sketch: a poll from null "returns no events and provides a fresh cursor".
             answer = {
                 "events": [],
                 "cursor": declared._position(opened),
@@ -609,13 +554,12 @@ class Events(Extension):
                 request,
                 params.cursor,
                 params.max_age_ms,
-                params.max_events or _PAGE,
+                params.max_events or _MAX_POLL_EVENTS,
                 opened,
             )
-        return {**answer, "nextPollMs": round(_INTERVAL * 1000)}
+        return {**answer, "nextPollMs": round(_POLL_INTERVAL * 1000)}
 
-    # Emitting must happen on the loop that serves the events, since it changes what they keep and wakes their
-    # streams without a lock: the first emit fixes the loop, and every later one must run on it.
+    # Emitting changes state without a lock, so it must run on the loop that serves the events.
     def _on_loop(self) -> None:
         try:
             running = asyncio.get_running_loop()
@@ -628,9 +572,7 @@ class Events(Extension):
                 "loop.call_soon_threadsafe(event_type.emit, data)."
             )
 
-    # The event type and arguments a request names, checked as the sketch's errors require: the type, the delivery
-    # mode, the arguments, and then whether the caller may subscribe. A caller refused loses what it holds of that
-    # subscription at once.
+    # Checked in the order of https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#error-codes
     async def _subscription(
         self, params: _SubscribeParams, delivery: Delivery, streams: bool
     ) -> _Request:
@@ -693,9 +635,7 @@ class Events(Extension):
             raise MCPError.from_error_data(_FORBIDDEN)
         return request
 
-    # Begins holding a subscription, by a stream or a poll lease: counted against the limits first, so a refused one
-    # provisions nothing. The type's on_subscribe runs, apart from the request, when the first hold of an id begins,
-    # and its on_unsubscribe when the last ends. Await `_ready` before serving the hold.
+    # Counted against the limits before anything is set up. Await `_ready` before serving the hold.
     def _open(self, request: _Request) -> _Hold:
         if self._held.total() >= _MAX_SUBSCRIPTIONS:
             raise MCPError(
@@ -725,7 +665,6 @@ class Events(Extension):
     async def _set_up(self, request: _Request) -> None:
         if request.type._on_subscribe is None:
             return
-        # A hook that never returns would hold its id for good: past the deadline the subscription is refused.
         async with asyncio.timeout(_SUBSCRIBE_TIMEOUT):
             await _settle(
                 request.type._on_subscribe(
@@ -735,7 +674,6 @@ class Events(Extension):
 
     async def _ready(self, hold: _Hold) -> None:
         await asyncio.shield(hold.entry.setup)
-        # Ended while it was being set up.
         if hold.ended is not None:
             raise MCPError.from_error_data(hold.ended)
 
@@ -748,8 +686,7 @@ class Events(Extension):
         if not entry.holds:
             entry.teardown = asyncio.ensure_future(self._tear_down(entry))
 
-    # Only a subscription that was set up is told it ended. A hook that fails has nobody to tell but the log, and must
-    # not take the process down.
+    # on_unsubscribe follows only a setup that succeeded; a failing hook is logged.
     async def _tear_down(self, entry: _Entry) -> None:
         request = entry.request
         try:
@@ -767,15 +704,13 @@ class Events(Extension):
         finally:
             del request.type._subscriptions[request.id]
 
-    # Poll subscriptions are leased: the first poll of a subscription begins one, each poll renews it, and it ends
-    # when polls stop for the lease's length. The poll after the app ended it is answered with why, and the one after
-    # that begins afresh.
+    # A poll lease begins with the first poll, is renewed by each, and lapses when polls stop.
     async def _lease(self, request: _Request) -> None:
         await request.type._settled(request.id)
         hold = self._leases.get(request.id)
         if hold is None:
             hold = self._leases[request.id] = self._open(request)
-        # Renewed before waiting, so that a poll which gives up during setup still lets the lease lapse.
+        # Renewed before waiting, so a poll abandoned during setup still lapses.
         if hold.lease is not None:
             hold.lease.cancel()
         hold.lease = asyncio.get_running_loop().call_later(
@@ -794,8 +729,7 @@ class Events(Extension):
             hold.lease.cancel()
         self._close(hold)
 
-    # Waits until every stream together, and the caller's own streams, are sending few enough bytes for one more
-    # event of `size`. A caller may send a quarter of the whole, so that one cannot hold up the rest.
+    # Waits for room to send `size` bytes. One caller may use a quarter of the budget.
     @asynccontextmanager
     async def _send_budget(self, size: int, caller: str) -> AsyncIterator[None]:
         while (
@@ -812,8 +746,6 @@ class Events(Extension):
             self._sent.set()
             self._sent = asyncio.Event()
 
-    # A push stream follows what the type keeps from its position. One task sends everything, in order and one event
-    # at a time, and nothing before `active`.
     async def _stream(
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
@@ -821,7 +753,6 @@ class Events(Extension):
         declared = request.type
         await declared._settled(request.id)
         hold = self._open(request)
-        # Events emitted from here on reach this stream.
         seen = declared._sequence
         try:
             await self._ready(hold)
@@ -859,7 +790,6 @@ class Events(Extension):
                 hold.wake.clear()
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
-                    # Access is checked again while the subscription lasts, and one that is lost ends it.
                     try:
                         allowed = await declared._allows(
                             request.context, request.arguments
@@ -872,7 +802,7 @@ class Events(Extension):
                         break
                     await say("heartbeat", {"cursor": declared._position(seen)})
                 elif seen < declared._dropped:
-                    # What the stream had yet to send was let go: a gap, from the oldest still kept.
+                    # Evicted before it was sent: a gap.
                     seen = declared._dropped
                     await say(
                         "active",
@@ -905,5 +835,4 @@ class Events(Extension):
             )
         finally:
             self._close(hold)
-        # The final frame, sent when the server ends the stream; when the client did, nobody is listening.
         return {"_meta": {}}

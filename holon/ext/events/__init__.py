@@ -1,7 +1,4 @@
-"""MCP Events, the Triggers & Events Working Group's draft extension, in its poll and push delivery modes.
-
-The server declares and emits event types; every app client lists and subscribes to them. Like the draft, this
-interface may change.
+"""MCP Events, delivered by poll and push.
 
 https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md
 """

@@ -1,4 +1,4 @@
-"""Wire shapes and the codes both sides share, from the draft events extension."""
+"""Shared by the events server and client."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeAlias, TypeVar
 
 EVENTS_EXTENSION = "io.modelcontextprotocol/events"
-"""The identifier a server declares the extension under, in ``capabilities.extensions``."""
-# The sketch's general-purpose codes, provisional until the specification allocates them.
+# https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#error-codes
 NOT_FOUND = -32023
 FORBIDDEN = -32024
 RESOURCE_EXHAUSTED = -32025
@@ -19,18 +18,15 @@ Delivery: TypeAlias = Literal["poll", "push"]
 
 @dataclass(frozen=True)
 class Event(Generic[D]):
-    """One occurrence of an event type.
-
-    ``match`` and ``transform`` are given these, and a client's subscription yields them.
-    """
+    """One occurrence of an event type."""
 
     data: D
     event_id: str | None = None
-    """The source's own id, so that a client drops an event it has seen. Made up when not given."""
+    """Identifies the occurrence, so a client drops duplicates."""
     timestamp: str | None = None
     """When it happened, in RFC 3339."""
     cursor: str | None = None
-    """The position just after this event, where a client resumes."""
+    """Where a client resumes after this event."""
     meta: dict[str, Any] | None = None
     name: str | None = None
-    """The event type, as the occurrence on the wire names it."""
+    """The event type."""

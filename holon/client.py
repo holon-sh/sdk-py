@@ -67,13 +67,8 @@ class Binding(TypedDict):
 
     Attributes:
         endpoint: Streamable HTTP MCP URL.
-        http_client: Factory returning a fresh ``httpx2.AsyncClient`` for each
-            call. Configure authentication headers or a custom transport here.
-            The SDK closes the returned client when the call finishes.
-        file_origins: Origins (``https://host[:port]``) the server may send
-            file transfers to. When set, no other origin is used, and a listed
-            origin may also be plain-http loopback or a private address. When
-            unset, any https origin on a public address.
+        http_client: Returns a new ``httpx2.AsyncClient`` for each call, e.g. to authenticate.
+        file_origins: The only origins file transfers may use. Any public https origin when unset.
     """
 
     endpoint: str
@@ -105,7 +100,7 @@ ToolResult: TypeAlias = CompleteResult[Output] | ErrorResult | InputRequiredResu
 
 
 class CallOptions(TypedDict, total=False):
-    """Request controls, passed positionally to keep tool keywords available."""
+    """Options for one call, passed positionally before the tool's arguments."""
 
     timeout: float | None
     input_responses: InputResponses | None
@@ -115,11 +110,10 @@ class CallOptions(TypedDict, total=False):
 
 
 class ToolCallError(RuntimeError):
-    """Raised by ``tools.<name>`` for tool errors or additional input requests.
+    """Raised by ``tools.<name>`` when a tool fails or needs input.
 
     Attributes:
-        result: Original MCP error or input-required result. Pass ``elicit`` to
-            answer questions in place, or continue later through ``call_tool``.
+        result: The error or input-required result.
     """
 
     def __init__(
@@ -219,7 +213,6 @@ class _App:
                 if not name.startswith("_")
             }
         )
-        # Draft extensions, whose interfaces may change with the drafts.
         self.ext = SimpleNamespace(events=AppEvents(self, contract))
 
     async def call_tool(
@@ -229,31 +222,21 @@ class _App:
         /,
         **arguments: object,
     ) -> CallToolResult | InputRequiredResult:
-        """Call a dependency tool and return its full MCP result.
+        """Call a tool and return its full MCP result.
 
         Args:
             name: Tool name.
-            options: Request timeout in seconds, input responses, continuation
-                state, metadata, and ``elicit`` to answer the server's questions in
-                place. Passed positionally, separate from tool input.
-            **arguments: Tool input, which the server validates. Pass a
-                ``holon.ext.files.File`` where the tool takes a file.
+            options: Timeout, input responses, request state, metadata, and ``elicit``.
+            **arguments: Tool input. Pass a ``holon.ext.files.File`` where the tool takes a file.
 
         Returns:
-            A complete result, or an input-required result for a question left
-            unanswered. Tool error results are returned unchanged; successful
-            structured output is contract-validated.
+            The complete result, or an input-required result for questions left unanswered.
 
         Raises:
-            ValueError: Invalid output, or undeclared dependency.
-            RuntimeError: Endpoint resolution failed.
-            holon.ext.files.FileTransferError: A file was not sent; the tool did
-                not run.
-            holon.ext.files.OutcomeUnknownError: The call failed after its files
-                were sent; the tool may have run.
-
-        Transport and protocol exceptions propagate. Each call closes its HTTP
-        client and MCP session, including when an exception occurs.
+            ValueError: The output does not match the contract, or the dependency is undeclared.
+            RuntimeError: The dependency has no endpoint.
+            holon.ext.files.FileTransferError: A file was not sent; the tool did not run.
+            holon.ext.files.OutcomeUnknownError: The call failed after its files were sent.
         """
         options = options or {}
         definition = self._definitions.get(name, {})
@@ -303,8 +286,7 @@ class _App:
         headers = {"Authorization": f"Bearer {token}"} if token else None
         return endpoint, partial(http_client, headers=headers)
 
-    # An error in the block is raised as itself, not in the ExceptionGroup of the session's task group, once the
-    # session has closed. It wins over an error in closing.
+    # Raises an error from the block as itself, not in the session's ExceptionGroup.
     @asynccontextmanager
     async def _session(
         self,
@@ -371,26 +353,19 @@ class _App:
 
 
 class Apps:
-    """Create the dependency collection used by generated Python clients.
+    """An application's dependencies, as generated clients use them.
 
-    Applications typically use ``apps`` or ``create_apps`` from ``holon.apps``.
+    Applications use ``apps`` or ``create_apps`` from ``holon.apps``. Each dependency is ``apps.<name>``
+    or ``apps[name]``: its ``tools.<name>`` return structured output or raise :class:`ToolCallError`,
+    and its ``call_tool`` returns the full result.
 
     Args:
-        identity: Application name, version, and declared ``requires`` mapping.
-        contracts: Dependency contracts with a ``tools`` list, or ``None`` for
-            untyped dependencies.
-        bindings: Explicit bindings. When supplied, only these dependencies are
-            included; an empty mapping selects none. Otherwise all declared
-            dependencies and contracts are available.
+        identity: Application name, version, and ``requires``.
+        contracts: Dependency contracts by name.
+        bindings: Connection settings by name. When given, only these dependencies are available.
 
     Raises:
         ValueError: A binding names an unknown dependency.
-
-    Access a client with ``clients[name]`` or ``clients.name``. Its
-    ``tools.<name>(**arguments)`` methods return structured output, or the
-    complete result for a tool without an output schema, and raise
-    :class:`ToolCallError` for tool errors or questions left unanswered.
-    Use its ``call_tool`` method for the full result envelope.
     """
 
     def __init__(

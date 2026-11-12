@@ -126,12 +126,8 @@ async def test_inside_holon_a_tool_sees_whom_the_waypoint_admitted_and_not_the_h
                 {"x-holon-caller": REPORTER},
                 RequestContext(None, Caller("reporter", "session")),
             ),
-            # A signed-out person, through an edge that is no app of the session.
-            (
-                "/mcp",
-                {"x-holon-context": context(), "x-holon-caller": "spiffe://edge"},
-                RequestContext(None, None),
-            ),
+            # A signed-out person.
+            ("/mcp", {"x-holon-context": context()}, RequestContext(None, None)),
         ]:
             forged = {"x-holon-other": "forged", "authorization": "Bearer forged"}
             headers = {**headers, **forged, "traceparent": TRACEPARENT}
@@ -145,11 +141,42 @@ async def test_inside_holon_a_tool_sees_whom_the_waypoint_admitted_and_not_the_h
                 assert token is None
                 continue
             assert token.token == headers.get("x-holon-context", "")
-            if expected.principal:
-                assert (token.expires_at, token.resource) == (
-                    1900000060,
-                    "https://holon.example",
+
+
+def token(payload):
+    encoded = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=")
+    return f"e30.{encoded.decode()}.signature"
+
+
+@asynchronous
+async def test_a_malformed_context_is_a_bad_request(monkeypatch):
+    monkeypatch.setenv("HOLON_PLATFORM", "1")
+    person = {**PERSON, "act": {"sub": "agent"}}
+    seen = []
+    async with served(_asgi(App(inspector(seen)))) as origin:
+        for headers in [
+            [("x-holon-context", context()), ("x-holon-context", context())],
+            [("x-holon-caller", REPORTER), ("x-holon-caller", REPORTER)],
+            [("x-holon-caller", "spiffe://holon.example/sa/reporter")],
+            [("x-holon-context", "header.claims")],
+            [("x-holon-context", "e30.e30=.signature")],
+            [("x-holon-context", token("person"))],
+            [("x-holon-context", token("[]"))],
+            [("x-holon-context", token("null"))],
+            [("x-holon-context", context(principal="user"))],
+            [("x-holon-context", context(principal={"iss": 1}))],
+            [("x-holon-context", context(principal={"claims": []}))],
+            [("x-holon-context", context(principal={**person, "act": ["agent"]}))],
+        ]:
+            async with httpx2.AsyncClient() as client:
+                response = await client.post(
+                    origin + "/mcp", headers=headers, content="{}"
                 )
+            assert (response.status_code, response.text) == (
+                400,
+                "Malformed Holon context\n",
+            ), headers
+    assert seen == []
 
 
 @asynchronous

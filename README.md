@@ -42,7 +42,7 @@ def whoami() -> str:
     return context.principal.subject if context.principal else "anonymous"
 ```
 
-`get_context()` returns who the current MCP request comes from: `principal`, the person signed in, and `caller`, the app of the same session that called. Inside Holon these come from the headers Holon verified. Run anywhere else, every request is anonymous. A dependency the app calls during a request is called for the same person.
+`get_context()` returns who the current MCP request comes from: `principal`, the person signed in, and `caller`, the app of the same session that called. Inside Holon these come from the headers Holon verified. Run anywhere else, every request is anonymous. A request whose Holon headers are malformed is answered `400 Bad Request` before any app code runs. A dependency the app calls during a request is called for the same person.
 
 ## Invoking MCP Servers
 

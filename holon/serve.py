@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
-import json
-import math
 import mimetypes
 import os
 import re
@@ -23,9 +21,10 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.transport_security import TransportSecuritySettings
 from opentelemetry import context as tracing
 from opentelemetry import propagate
+from pydantic import BaseModel
 from starlette.authentication import AuthCredentials, UnauthenticatedUser
 from starlette.datastructures import Headers
-from starlette.responses import FileResponse, Response
+from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import _Request, _request
@@ -34,7 +33,15 @@ from holon.ext.events import Events
 __all__ = ["App", "load", "serve"]
 
 _MCP = re.compile(r"/mcp(/[^/]+)?")
+# The forms of the headers Holon's waypoint sets: a context is a compact JWS, whose payload segment is matched, and a
+# caller is the SPIFFE ID of an app of the session.
+_CONTEXT = re.compile(r"[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+")
 _CALLER = re.compile(r"spiffe://cluster\.local/ns/([^/]+)/sa/([^/]+)")
+_MALFORMED = PlainTextResponse(
+    "Malformed Holon context\n",
+    status_code=400,
+    headers={"x-content-type-options": "nosniff"},
+)
 
 
 @dataclass(frozen=True)
@@ -102,16 +109,22 @@ def _asgi(app: App) -> ASGIApp:
         if scope["type"] == "lifespan":
             await served(scope, receive, send)
             return
-        token, admitted = _admit(scope["headers"]) if platform else ("", None)
+        headers = scope["headers"]
         scope["headers"] = [
             (name, value)
-            for name, value in scope["headers"]
+            for name, value in headers
             if not name.startswith(b"x-holon-") and name != b"authorization"
         ]
         if not _MCP.fullmatch(scope["path"]):
             frontend = app.frontend if scope["method"] in ("GET", "HEAD") else None
             await _page(frontend, scope["path"])(scope, receive, send)
             return
+        read = _admit(headers) if platform else ("", None)
+        if read is None:
+            # A context the waypoint could not have sent is a malformed request (RFC 9110 §15.5.1).
+            await _MALFORMED(scope, receive, send)
+            return
+        token, admitted = read
         scope["user"] = UnauthenticatedUser()
         scope["auth"] = AuthCredentials()
         if admitted is not None:
@@ -131,37 +144,59 @@ def _asgi(app: App) -> ASGIApp:
     return dispatch
 
 
-def _admit(headers: list[tuple[bytes, bytes]]) -> tuple[str, AccessToken | None]:
-    """The request's context, and who it comes from when anyone signed in or an app calls."""
+class _Principal(BaseModel, strict=True):
+    iss: str | None = None
+    sub: str | None = None
+    client_id: str | None = None
+    scope: str | None = None
+    claims: dict[str, Any] | None = None
+    act: dict[str, Any] | None = None
+
+
+class _Claims(BaseModel, strict=True):
+    principal: _Principal | None = None
+
+
+def _admit(
+    headers: list[tuple[bytes, bytes]],
+) -> tuple[str, AccessToken | None] | None:
+    """The request's context and who it comes from, or None when the waypoint's headers are malformed.
+
+    The waypoint names the calling app of the session, a lifecycle hook's job as its app.
+    """
     contexts = [value for name, value in headers if name == b"x-holon-context"]
     callers = [value for name, value in headers if name == b"x-holon-caller"]
-    token, claims = "", {}
-    if len(contexts) == 1:
+    if len(contexts) > 1 or len(callers) > 1:
+        return None
+    token, principal, caller = "", None, None
+    if contexts:
         token = contexts[0].decode("latin-1")
-        claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
-    caller = (
-        _CALLER.fullmatch(callers[0].decode("latin-1")) if len(callers) == 1 else None
-    )
-    principal = claims.get("principal")
+        if (form := _CONTEXT.fullmatch(token)) is None:
+            return None
+        payload = form[1] + "=" * (-len(form[1]) % 4)
+        try:
+            claims = _Claims.model_validate_json(base64.urlsafe_b64decode(payload))
+        except ValueError:
+            return None
+        principal = claims.principal
+    if callers and (caller := _CALLER.fullmatch(callers[0].decode("latin-1"))) is None:
+        return None
     if principal is None and caller is None:
         return token, None
     extra: dict[str, Any] = {}
     if caller is not None:
         extra["caller"] = {"app": caller[2], "session": caller[1]}
     if principal is not None:
-        extra |= {"iss": principal["iss"], "sub": principal["sub"]}
-        if "claims" in principal:
-            extra["claims"] = principal["claims"]
-        if principal.get("act") is not None:
-            extra["act"] = principal["act"]
-    principal = principal or {}
-    audience = claims.get("aud", "")
+        extra |= {"iss": principal.iss or "", "sub": principal.sub or ""}
+        if principal.claims is not None:
+            extra["claims"] = principal.claims
+        if principal.act is not None:
+            extra["act"] = principal.act
+    scope = (principal.scope if principal else None) or ""
     return token, AccessToken(
         token=token,
-        client_id=principal.get("client_id", ""),
-        scopes=[each for each in (principal.get("scope") or "").split(" ") if each],
-        expires_at=math.floor(claims.get("exp", 0)),
-        resource=audience if isinstance(audience, str) else audience[0],
+        client_id=(principal.client_id if principal else None) or "",
+        scopes=[each for each in scope.split(" ") if each],
         subject=extra.get("sub"),
         claims=extra,
     )

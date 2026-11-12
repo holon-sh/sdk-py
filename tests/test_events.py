@@ -266,13 +266,13 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
             ) as polled,
         ):
             for board, id in ids.items():
-                say(changed, board, "last words", to=id)
+                say(changed, board, f"last words to {board}", to=id)
             changed.terminate(ids["closed"], ErrorData(code=-32000, message="Closed"))
             changed.terminate(ids["revoked"])
             changed.terminate(ids["polled"])
             for board in ids:
                 say(changed, board, "too late")
-            assert await take(closed, 1) == ["last words"]
+            assert await take(closed, 1) == ["last words to closed"]
             for changes, code in [
                 (closed, -32000),
                 (revoked, -32024),

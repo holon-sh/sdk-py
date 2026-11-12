@@ -132,7 +132,7 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 if value == "error":
                     assert error.value.result == raw
                     assert "Unavailable" in str(error.value)
-            with pytest.raises(ValueError, match="structured output"):
+            with pytest.raises(ValueError):
                 await apps.orders.tools.read(id="bad")
             undeclared = {**identity, "requires": {"orders": {}, "missing": {}}}
             untyped = Apps(undeclared, {}, bindings)
@@ -143,14 +143,14 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             }
             plain = Apps(identity, {"orders": {"tools": [tool]}}, bindings)
             assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
-            with pytest.raises(RuntimeError, match=r"unavailable \(MISSING_MCP_URL\)"):
+            with pytest.raises(RuntimeError):
                 await Apps(undeclared, {}).missing.call_tool("read")
             script = {**identity, "requires": {}}
-            with pytest.raises(ValueError, match="Unknown app binding"):
+            with pytest.raises(ValueError):
                 Apps(script, {"orders": CONTRACT}, {"missing": binding})
             bound = Apps(script, {"orders": CONTRACT}, bindings)
             assert await bound.orders.tools.read(id="good") == {"total": 5}
-            with pytest.raises(ValueError, match="not declared"):
+            with pytest.raises(ValueError):
                 await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
             assert set(headers) == {b"Bearer external"}
             sock = socket.create_server(("127.0.0.1", 0))

@@ -79,7 +79,6 @@ __all__ = [
     "EVENTS_EXTENSION",
     "AppEvents",
     "Event",
-    "EventResult",
     "EventType",
     "Events",
     "NoCompatibleDeliveryMode",
@@ -95,7 +94,7 @@ NOT_FOUND = -32023
 FORBIDDEN = -32024
 RESOURCE_EXHAUSTED = -32025
 UNSUPPORTED = -32026
-# What one poll answers at most, and one check read gives a stream, unless the request asks for fewer.
+# What one poll answers at most, unless the request asks for fewer.
 _PAGE = 1000
 # Marks a request that came through `Events.asgi`, whose answer can be a stream.
 _STREAMS = "holon.ext.events.streams"
@@ -105,7 +104,7 @@ _STREAMS = "holon.ext.events.streams"
 _KEEP_AGE = 600.0
 _KEEP_EVENTS = 10_000
 _KEEP_BYTES = 4 * 2**20
-# Seconds a poll is told to wait, and how often a stream asks a type's check function.
+# Seconds a poll is told to wait.
 _INTERVAL = 1.0
 # Seconds between a stream's heartbeats. One whose reader takes nothing for two is closed, to reconnect from its cursor.
 _HEARTBEAT = 30.0
@@ -130,8 +129,7 @@ Delivery: TypeAlias = Literal["poll", "push"]
 class Event(Generic[D]):
     """One occurrence of an event type.
 
-    A check function returns these, ``match`` and ``transform`` are given them,
-    and a client's subscription yields them.
+    ``match`` and ``transform`` are given these, and a client's subscription yields them.
     """
 
     data: D
@@ -140,30 +138,12 @@ class Event(Generic[D]):
     timestamp: datetime | str | None = None
     """When it happened. Now when not given."""
     cursor: str | None = None
-    """The position just after this event, so that a check's batch can be cut short, and where a client resumes."""
+    """The position just after this event, where a client resumes."""
     meta: dict[str, Any] | None = None
     name: str | None = None
     """The event type, as the occurrence on the wire names it."""
 
 
-@dataclass(frozen=True)
-class EventResult(Generic[D]):
-    """What happened after a cursor, as a check function finds it: the sketch's EventResult."""
-
-    events: Sequence[Event[D]]
-    """Empty when the cursor was None, which asks only for the current position. A source without positions
-    answers with a None cursor, is asked with None each time, and answers each time with what is new."""
-    cursor: str | None
-    """The position after these events, or None when the source cannot be resumed from a position."""
-    truncated: bool = False
-    """Events between the cursor and these were skipped, for instance because the source no longer keeps them."""
-    has_more: bool = False
-    """More events are ready at once after this batch."""
-
-
-Check: TypeAlias = Callable[
-    [RequestContext, A, str | None], EventResult[D] | Awaitable[EventResult[D]]
-]
 Match: TypeAlias = Callable[[RequestContext, Event[D], A], bool]
 Transform: TypeAlias = Callable[[RequestContext, Event[D], A], object]
 Authorize: TypeAlias = Callable[[RequestContext, A], bool | Awaitable[bool]]
@@ -179,7 +159,7 @@ class _SubscribeParams(RequestParams):
 
 
 _FORBIDDEN = ErrorData(code=FORBIDDEN, message="Forbidden")
-_REMOVED = ErrorData(code=NOT_FOUND, message="NotFound", data={"kind": "event"})
+_NOT_FOUND = ErrorData(code=NOT_FOUND, message="NotFound", data={"kind": "event"})
 
 
 class _Stalled(Exception):
@@ -205,25 +185,6 @@ def _iso(value: datetime | str | None) -> str:
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _seconds(timestamp: str) -> float:
-    try:
-        return datetime.fromisoformat(timestamp).timestamp()
-    except ValueError:
-        return math.inf
-
-
-def _occurrence(event: Event[Any], data: Any) -> dict[str, Any]:
-    occurrence = {
-        "eventId": event.event_id,
-        "name": event.name,
-        "timestamp": event.timestamp,
-        "data": to_jsonable_python(data, by_alias=True),
-    }
-    if event.meta:
-        occurrence["_meta"] = to_jsonable_python(event.meta, by_alias=True)
-    return occurrence
-
-
 @dataclass(frozen=True, eq=False)
 class _Request:
     """A subscription as one request names it, with that request's caller.
@@ -245,19 +206,8 @@ class _Kept:
     event: Event[Any]
     size: int
     target: str | None
-    key: str | None
     sequence: int = 0
     at: float = 0.0
-
-
-@dataclass
-class _Read:
-    events: list[tuple[dict[str, Any], str | None]]
-    """Each occurrence with the position after it."""
-    start: str | None
-    cursor: str | None
-    truncated: bool = False
-    has_more: bool = False
 
 
 @dataclass(eq=False)
@@ -276,14 +226,11 @@ class _Hold:
 
     type: EventType[Any, Any]
     request: _Request
-    delivery: Delivery
     entry: _Entry
     wake: Callable[[], None]
     """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
     until: int = 0
-    missed: bool = False
-    """An event emitted to it could not be given to it, which its next read reports as a gap."""
 
 
 @dataclass(eq=False)
@@ -298,13 +245,10 @@ class EventType(Generic[A, D]):
 
     name: str
     _events: Events
-    _order: int
     _input: TypeAdapter[A]
     _descriptor: dict[str, Any]
     _match: Match[D, A] | None
     _transform: Transform[D, A] | None
-    _key: Callable[[D], str] | None
-    _check: Check[A, D] | None
     _delivery: list[Delivery]
     _authorize: Authorize[A] | None
     _on_subscribe: SubscriptionHook[A] | None
@@ -314,13 +258,9 @@ class EventType(Generic[A, D]):
     _sequence: int = 0
     _dropped: int = 0
     _bytes: int = 0
-    _latest: dict[tuple[str | None, str], _Kept] = field(default_factory=dict)
     _subscriptions: dict[str, _Entry] = field(default_factory=dict)
     # Subscriptions being told they ended, which one that begins with the same id waits for.
     _closing: dict[str, asyncio.Event] = field(default_factory=dict)
-    # Subscriptions of a type with a check function, held by nothing, that an event emitted to them could not reach,
-    # oldest first. Ids that never come back are let go once there are as many as the events kept.
-    _missed: dict[str, None] = field(default_factory=dict)
 
     def emit(
         self,
@@ -334,55 +274,30 @@ class EventType(Generic[A, D]):
 
         Give the source's own ``event_id`` when it has one, so that a client drops an occurrence it has seen. With
         ``subscription_id``, the sketch's targeted emit, the occurrence goes to that subscription alone, whatever its
-        arguments. It is kept like any
-        other, so a subscription that reconnects or polls from its cursor still has it, or is told of a gap. A type
-        with a check function serves polls from the check function, so an occurrence emitted to a subscription that
-        has no open stream is reported to it as a gap.
+        arguments. It is kept like any other, so a subscription that reconnects or polls from its cursor still has
+        it, or is told of a gap.
 
         Emitting is synchronous, and happens on the event loop that serves the events, from the first emit on: from
-        another thread, call ``loop.call_soon_threadsafe(event_type.emit, data)``. Occurrences emitted one after another in the same
-        synchronous run reach each subscription in that order, with no other occurrence of this type between them,
-        whether polled or pushed, unless it is told of a gap. A type with a ``key`` promises less: see
-        :meth:`Events.event`. Data that cannot be serialised raises here, before anything changes.
+        another thread, call ``loop.call_soon_threadsafe(event_type.emit, data)``. Occurrences emitted one after
+        another in the same synchronous run reach each subscription in that order, with no other occurrence of this
+        type between them, whether polled or pushed, unless it is told of a gap. Data that cannot be serialised
+        raises here, before anything changes.
         """
         self._events._on_loop()
         size = len(to_json(data, by_alias=True))
         event = Event(
             data, event_id or str(uuid.uuid4()), _iso(timestamp), name=self.name
         )
-        self._keep(
-            _Kept(event, size, subscription_id, self._key(data) if self._key else None)
-        )
-        if subscription_id is None:
-            holds = [
-                hold for entry in self._subscriptions.values() for hold in entry.holds
-            ]
-        else:
-            entry = self._subscriptions.get(subscription_id)
-            holds = list(entry.holds) if entry else []
-            # A type with a check function answers polls from it, so neither a poll nor a subscription held by
-            # nothing now can be given this.
-            if self._check is not None:
-                if not holds:
-                    self._missed[subscription_id] = None
-                    if len(self._missed) > _KEEP_EVENTS:
-                        del self._missed[next(iter(self._missed))]
-                for hold in holds:
-                    hold.missed |= hold.delivery == "poll" and hold.request.targetable
-        for hold in holds:
+        self._keep(_Kept(event, size, subscription_id))
+        for hold in self._holds(subscription_id):
             hold.wake()
 
     def cursor(self) -> str:
         """The position after the last occurrence emitted.
 
         Return it with the state a tool reads, in the same synchronous run, and a client that subscribes from it
-        hears every change after that state and none before. A type with a check function has no such position
-        here, since its cursor is its source's own, so this raises for it.
+        hears every change after that state and none before.
         """
-        if self._check is not None:
-            raise TypeError(
-                f"Event {self.name} has a check function, whose cursor is its source's own."
-            )
         return self._position()
 
     def terminate(
@@ -394,22 +309,18 @@ class EventType(Generic[A, D]):
         """
         error = error or _FORBIDDEN
         until = 0 if error.code == _FORBIDDEN.code else self._sequence
-        if subscription_id is None:
-            entries = list(self._subscriptions.values())
-        else:
-            entries = (
-                [entry] if (entry := self._subscriptions.get(subscription_id)) else []
-            )
-        for hold in [hold for entry in entries for hold in entry.holds]:
+        for hold in self._holds(subscription_id):
             if hold.ended is None:
                 hold.ended, hold.until = error, until
                 hold.wake()
 
-    def remove(self) -> None:
-        """Stop offering this event type: its subscriptions end with NotFound."""
-        if self._events._types.get(self.name) is self:
-            del self._events._types[self.name]
-            self.terminate(error=_REMOVED)
+    def _holds(self, subscription_id: str | None) -> list[_Hold]:
+        if subscription_id is None:
+            entries = list(self._subscriptions.values())
+        else:
+            entry = self._subscriptions.get(subscription_id)
+            entries = [entry] if entry else []
+        return [hold for entry in entries for hold in entry.holds]
 
     def _position(self, sequence: int | None = None) -> str:
         return (
@@ -419,17 +330,6 @@ class EventType(Generic[A, D]):
     def _keep(self, kept: _Kept) -> None:
         self._sequence += 1
         kept.sequence, kept.at = self._sequence, time.monotonic()
-        # An event with a key replaces the one before it with the same key, for the same subscriptions.
-        if kept.key is not None:
-            slot = (kept.target, kept.key)
-            if older := self._latest.get(slot):
-                self._kept.pop(
-                    bisect.bisect_left(
-                        self._kept, older.sequence, key=lambda each: each.sequence
-                    )
-                )
-                self._bytes -= older.size
-            self._latest[slot] = kept
         self._kept.append(kept)
         self._bytes += kept.size
         # The newest is kept whatever it weighs, since streams read it from here.
@@ -439,14 +339,8 @@ class EventType(Generic[A, D]):
             or self._bytes > _KEEP_BYTES
             or self._kept[dropped].at < kept.at - _KEEP_AGE
         ):
-            oldest = self._kept[dropped]
-            self._dropped = oldest.sequence
-            self._bytes -= oldest.size
-            if (
-                oldest.key is not None
-                and self._latest.get((oldest.target, oldest.key)) is oldest
-            ):
-                del self._latest[(oldest.target, oldest.key)]
+            self._dropped = self._kept[dropped].sequence
+            self._bytes -= self._kept[dropped].size
             dropped += 1
         del self._kept[:dropped]
 
@@ -498,25 +392,26 @@ class EventType(Generic[A, D]):
             if self._transform
             else kept.event.data
         )
-        return _occurrence(kept.event, data)
+        return {
+            "eventId": kept.event.event_id,
+            "name": kept.event.name,
+            "timestamp": kept.event.timestamp,
+            "data": to_jsonable_python(data, by_alias=True),
+        }
 
-    # What a poll is owed after a cursor from what is kept. An event that cannot be shaped for this subscription is
+    # A poll's answer after a cursor from what is kept. An event that cannot be shaped for this subscription is
     # skipped for it, and the failure logged.
     def _since(
         self,
         request: _Request,
-        cursor: str | None,
+        cursor: str,
         max_age_ms: int | None,
         limit: int,
         opened: int,
-    ) -> _Read:
+    ) -> dict[str, Any]:
         reached, truncated = self._resume(cursor, max_age_ms, opened)
-        events: list[tuple[dict[str, Any], str | None]] = []
-        while (kept := self._next(reached)) is not None:
-            if len(events) == limit:
-                return _Read(
-                    events, None, self._position(reached), truncated, has_more=True
-                )
+        events: list[dict[str, Any]] = []
+        while len(events) < limit and (kept := self._next(reached)) is not None:
             reached = kept.sequence
             try:
                 occurrence = self._shape(kept, request)
@@ -524,63 +419,13 @@ class EventType(Generic[A, D]):
                 _described(error)
                 continue
             if occurrence is not None:
-                events.append((occurrence, self._position(reached)))
-        return _Read(events, None, self._position(), truncated)
-
-    # What a subscription is owed after a cursor from the type's check function, whose cursors are the source's
-    # own. Each event is placed at its own cursor when it has one, so a batch can be cut short; otherwise at the
-    # cursor before the batch, which is safe to resume from. Delivery starts where the first event delivered does.
-    async def _checked(
-        self,
-        hold: _Hold,
-        request: _Request,
-        cursor: str | None,
-        max_age_ms: int | None,
-        limit: int,
-    ) -> _Read:
-        assert self._check is not None
-        result = await _settle(self._check(request.context, request.arguments, cursor))
-        after_all = result.cursor
-        missed, hold.missed = hold.missed, False
-        # A None cursor asks for the current position and nothing before it, except of a source that has no
-        # positions: each check of that is asked with None, and answers with what is new.
-        if cursor is None and after_all is not None:
-            return _Read([], after_all, after_all)
-        floor = (
-            -math.inf
-            if max_age_ms is None or cursor is None
-            else time.time() - max_age_ms / 1000
-        )
-        # Without a position there is nothing to have skipped past.
-        truncated = after_all is not None and (result.truncated or missed)
-        events: list[tuple[dict[str, Any], str | None]] = []
-        reached, start, cuttable = cursor, after_all, False
-        for index, item in enumerate(result.events):
-            if len(events) == limit and cuttable:
-                return _Read(events, start, reached, truncated, has_more=True)
-            after = (
-                after_all if index == len(result.events) - 1 else item.cursor or reached
-            )
-            event = Event(
-                item.data,
-                item.event_id or str(uuid.uuid4()),
-                _iso(item.timestamp),
-                meta=item.meta,
-                name=self.name,
-            )
-            if _seconds(cast(str, event.timestamp)) < floor:
-                truncated = after_all is not None
-            else:
-                try:
-                    occurrence = _occurrence(event, event.data)
-                except Exception as error:  # noqa: BLE001
-                    _described(error)
-                else:
-                    if not events:
-                        start = reached
-                    events.append((occurrence, after))
-            reached, cuttable = after, item.cursor is not None
-        return _Read(events, start, after_all, truncated, result.has_more)
+                events.append(occurrence)
+        return {
+            "events": events,
+            "cursor": self._position(reached),
+            "truncated": truncated,
+            "hasMore": self._next(reached) is not None,
+        }
 
     async def _allows(self, context: RequestContext, arguments: Any) -> bool:
         return self._authorize is None or bool(
@@ -637,10 +482,9 @@ class Events(Extension):
 
     Each type keeps what it emits, for ten minutes and up to 10,000 events and 4 MiB, for polls and for streams that
     are behind or reconnect; those cursors last as long as the process, and after a restart a client is told that
-    events were skipped. A type with a check function serves polls from it instead, with cursors that are its
-    source's. A type is asked again, and a poll told to come back, every second. A stream hears from the server every
-    30 seconds, and one whose reader has taken nothing for two heartbeats is closed, to reconnect from its cursor. A
-    poll subscription lasts a minute after its last poll.
+    events were skipped. A poll is told to come back every second. A stream hears from the server every 30 seconds,
+    and one whose reader has taken nothing for two heartbeats is closed, to reconnect from its cursor. A poll
+    subscription lasts a minute after its last poll.
 
     A stream sends one event at a time and holds nothing else of its own. Every stream together sends at most 16 MiB
     of events at once, and one caller's streams a quarter of it; an event is sent alone when nothing else is, whatever
@@ -657,7 +501,6 @@ class Events(Extension):
         # Cursors of kept events are positions in this process's memory; one from another process names nothing.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
-        self._declared = 0
         self._held = 0
         self._callers: dict[str, int] = {}
         self._leases: dict[str, _Lease] = {}
@@ -674,11 +517,8 @@ class Events(Extension):
         input_schema: type[A] | TypeAdapter[A],
         payload_schema: type[D] | TypeAdapter[D],
         description: str | None = None,
-        meta: dict[str, Any] | None = None,
         match: Match[D, A] | None = None,
         transform: Transform[D, A] | None = None,
-        key: Callable[[D], str] | None = None,
-        check: Check[A, D] | None = None,
         delivery: Sequence[Delivery] = ("poll", "push"),
         authorize: Authorize[A] | None = None,
         on_subscribe: SubscriptionHook[A] | None = None,
@@ -694,15 +534,6 @@ class Events(Extension):
                 every subscription does. An event it raises for, or that cannot be shaped, is skipped for that
                 subscription and logged, and a stream is told with ``notifications/events/error``.
             transform: ``(context, event, arguments)``: the data a subscription receives of an emitted event.
-            key: For events that each hold the whole of a record: an emitted event replaces the one before it with
-                the same key. A subscriber is given the latest occurrence of each key, in the order of those latest
-                emits, and events emitted together are not kept together; no gap is reported for what was replaced.
-                ``match`` must then answer the same for every occurrence of a key. Do not give a key to events that
-                each say what changed.
-            check: ``(context, arguments, cursor)``: what happened after a cursor, for a source that keeps its own
-                history. Polls are answered by it, and streams ask it every second. A None cursor asks for the
-                current position. It filters and shapes for the arguments itself; ``match`` and ``transform`` apply
-                only to what is emitted.
             delivery: The delivery modes this type offers.
             authorize: ``(context, arguments)``: whether the caller may subscribe. A subscription is refused with
                 Forbidden when it may not, and one already held is ended when it no longer may: each poll asks, and
@@ -736,19 +567,14 @@ class Events(Extension):
             "delivery": list(delivery),
             "inputSchema": arguments.json_schema(),
             "payloadSchema": payload.json_schema(),
-            **({"_meta": meta} if meta else {}),
         }
-        self._declared += 1
         declared = EventType(
             name,
             self,
-            self._declared,
             arguments,
             descriptor,
             match,
             transform,
-            key,
-            check,
             list(delivery),
             authorize,
             on_subscribe,
@@ -816,30 +642,21 @@ class Events(Extension):
     async def _list(
         self, ctx: ServerRequestContext[Any, Any], params: PaginatedRequestParams
     ) -> HandlerResult:
-        declared = list(self._types.values())
-        start = 0
-        if params.cursor is not None:
-            if not params.cursor.isdigit():
-                raise MCPError(INVALID_PARAMS, "Invalid cursor for events/list")
-            start = next(
-                (
-                    index
-                    for index, each in enumerate(declared)
-                    if each._order > int(params.cursor)
-                ),
-                len(declared),
-            )
-        page = declared[start : start + _LIST_PAGE_SIZE]
+        # Types are only ever added, so a cursor is the index of the next page.
+        cursor = params.cursor or "0"
+        if not cursor.isdigit():
+            raise MCPError(INVALID_PARAMS, "Invalid cursor for events/list")
+        start = int(cursor)
         streams = _streams(ctx)
         listed = []
-        for each in page:
+        for each in list(self._types.values())[start : start + _LIST_PAGE_SIZE]:
             if delivery := [
                 mode for mode in each._delivery if streams or mode != "push"
             ]:
                 listed.append({**each._descriptor, "delivery": delivery})
         result: dict[str, Any] = {"events": listed}
-        if start + _LIST_PAGE_SIZE < len(declared):
-            result["nextCursor"] = str(page[-1]._order)
+        if start + _LIST_PAGE_SIZE < len(self._types):
+            result["nextCursor"] = str(start + _LIST_PAGE_SIZE)
         return result
 
     async def _poll(
@@ -847,27 +664,24 @@ class Events(Extension):
     ) -> HandlerResult:
         declared, request = await self._subscription(params, "poll", _streams(ctx))
         opened = declared._sequence
-        hold = await self._lease(declared, request)
-        limit = params.max_events or _PAGE
-        if declared._check is not None:
-            read = await declared._checked(
-                hold, request, params.cursor, params.max_age_ms, limit
-            )
-        elif params.cursor is None:
+        await self._lease(declared, request)
+        if params.cursor is None:
             # The sketch: a poll from null "returns no events and provides a fresh cursor".
-            read = _Read([], None, declared._position(opened))
+            answer = {
+                "events": [],
+                "cursor": declared._position(opened),
+                "truncated": False,
+                "hasMore": False,
+            }
         else:
-            read = declared._since(
-                request, params.cursor, params.max_age_ms, limit, opened
+            answer = declared._since(
+                request,
+                params.cursor,
+                params.max_age_ms,
+                params.max_events or _PAGE,
+                opened,
             )
-        # A poll carries its cursor once, for the whole answer.
-        return {
-            "events": [occurrence for occurrence, _ in read.events],
-            "cursor": read.cursor,
-            "truncated": read.truncated,
-            "hasMore": read.has_more,
-            "nextPollMs": round(_INTERVAL * 1000),
-        }
+        return {**answer, "nextPollMs": round(_INTERVAL * 1000)}
 
     async def _stream(
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
@@ -904,7 +718,7 @@ class Events(Extension):
         self._loop = self._loop or asyncio.get_running_loop()
         declared = self._types.get(params.name)
         if declared is None:
-            raise MCPError.from_error_data(_REMOVED)
+            raise MCPError.from_error_data(_NOT_FOUND)
         if delivery not in declared._delivery or (delivery == "push" and not streams):
             raise MCPError(
                 UNSUPPORTED,
@@ -966,11 +780,8 @@ class Events(Extension):
         self,
         declared: EventType[Any, Any],
         request: _Request,
-        delivery: Delivery,
         wake: Callable[[], None],
     ) -> _Hold:
-        if self._types.get(declared.name) is not declared:
-            raise MCPError.from_error_data(_REMOVED)
         if self._held >= _MAX_SUBSCRIPTIONS:
             raise MCPError(
                 RESOURCE_EXHAUSTED,
@@ -994,10 +805,7 @@ class Events(Extension):
                 asyncio.ensure_future(self._set_up(declared, request)), request
             )
             declared._subscriptions[request.id] = entry
-        hold = _Hold(declared, request, delivery, entry, wake)
-        if request.targetable and request.id in declared._missed:
-            del declared._missed[request.id]
-            hold.missed = True
+        hold = _Hold(declared, request, entry, wake)
         entry.holds.add(hold)
         return hold
 
@@ -1012,7 +820,7 @@ class Events(Extension):
 
     async def _ready(self, hold: _Hold) -> None:
         await asyncio.shield(hold.entry.ready)
-        # Ended, or its type removed, while it was being set up.
+        # Ended while it was being set up.
         if hold.ended is not None:
             raise MCPError.from_error_data(hold.ended)
 
@@ -1068,11 +876,8 @@ class Events(Extension):
     async def _lease(self, declared: EventType[Any, Any], request: _Request) -> _Hold:
         await declared._settled(request.id)
         lease = self._leases.get(request.id)
-        if lease is not None and lease.hold.type is not declared:
-            self._stop(request.id, lease)
-            lease = None
         if lease is None:
-            hold = self._open(declared, request, "poll", lambda: None)
+            hold = self._open(declared, request, lambda: None)
             # Nothing waits on a lease for new events; ending one tears it down at once.
             hold.wake = lambda: self._close(hold) if hold.ended is not None else None
             lease = self._leases[request.id] = _Lease(hold)
@@ -1118,19 +923,17 @@ class Events(Extension):
             self._sent.set()
             self._sent = asyncio.Event()
 
-    # A push stream follows what the type keeps from its position, and a type with a check function is asked again
-    # every interval. One task sends everything, in order and one event at a time, and nothing before `active`.
+    # A push stream follows what the type keeps from its position. One task sends everything, in order and one event
+    # at a time, and nothing before `active`.
     async def _serve_stream(
         self, params: _SubscribeParams, request_id: Any, notify: Notify, streams: bool
     ) -> dict[str, Any]:
         declared, request = await self._subscription(params, "push", streams)
         await declared._settled(request.id)
         wake = asyncio.Event()
-        hold = self._open(declared, request, "push", wake.set)
-        checked = declared._check is not None
-        # Events emitted from here on reach this stream, whatever the check function finds.
+        hold = self._open(declared, request, wake.set)
+        # Events emitted from here on reach this stream.
         seen = declared._sequence
-        cursor: str | None = None
         try:
             await self._ready(hold)
 
@@ -1145,18 +948,6 @@ class Events(Extension):
                 if waited.cancelled_caught:
                     raise _Stalled
 
-            async def deliver(
-                occurrence: dict[str, Any], after: str | None, size: int | None = None
-            ) -> None:
-                await say(
-                    "event",
-                    {**occurrence, "cursor": after},
-                    len(to_json(occurrence)) if size is None else size,
-                )
-
-            def position() -> str | None:
-                return cursor if checked else declared._position(seen)
-
             async def send(kept: _Kept) -> None:
                 try:
                     shaped = declared._shape(kept, request)
@@ -1164,24 +955,13 @@ class Events(Extension):
                     await say("error", {"error": _described(error)})
                     return
                 if shaped is not None:
-                    await deliver(shaped, position(), kept.size)
+                    cursor = declared._position(seen)
+                    await say("event", {**shaped, "cursor": cursor}, kept.size)
 
-            # Without a first answer there is no stream to tell, and the request fails.
-            if checked:
-                read = await declared._checked(
-                    hold, request, params.cursor, params.max_age_ms, _PAGE
-                )
-                cursor = read.cursor
-                await say("active", {"cursor": read.start, "truncated": read.truncated})
-                for occurrence, after in read.events:
-                    await deliver(occurrence, after)
-                due = time.monotonic() + (0 if read.has_more else _INTERVAL)
-            else:
-                seen, truncated = declared._resume(
-                    params.cursor, params.max_age_ms, seen
-                )
-                await say("active", {"cursor": position(), "truncated": truncated})
-                due = math.inf
+            seen, truncated = declared._resume(params.cursor, params.max_age_ms, seen)
+            await say(
+                "active", {"cursor": declared._position(seen), "truncated": truncated}
+            )
             beat = time.monotonic() + _HEARTBEAT
             while hold.ended is None:
                 wake.clear()
@@ -1198,33 +978,19 @@ class Events(Extension):
                     if not allowed:
                         hold.ended = _FORBIDDEN
                         break
-                    await say("heartbeat", {"cursor": position()})
-                elif time.monotonic() >= due:
-                    try:
-                        read = await declared._checked(
-                            hold, request, cursor, None, _PAGE
-                        )
-                    except Exception as error:  # noqa: BLE001
-                        await say("error", {"error": _described(error)})
-                        due = time.monotonic() + _INTERVAL
-                        continue
-                    if read.truncated:
-                        await say("active", {"cursor": read.start, "truncated": True})
-                    for occurrence, after in read.events:
-                        await deliver(occurrence, after)
-                    cursor = read.cursor
-                    due = time.monotonic() + (0 if read.has_more else _INTERVAL)
+                    await say("heartbeat", {"cursor": declared._position(seen)})
                 elif seen < declared._dropped:
-                    # What the stream had yet to send was let go: a gap, from the oldest still kept, or for a type
-                    # with a check function, from where its check has reached.
+                    # What the stream had yet to send was let go: a gap, from the oldest still kept.
                     seen = declared._dropped
-                    if position() is not None:
-                        await say("active", {"cursor": position(), "truncated": True})
+                    await say(
+                        "active",
+                        {"cursor": declared._position(seen), "truncated": True},
+                    )
                 elif (kept := declared._next(seen)) is not None:
                     seen = kept.sequence
                     await send(kept)
                 else:
-                    with anyio.move_on_after(min(beat, due) - time.monotonic()):
+                    with anyio.move_on_after(beat - time.monotonic()):
                         await wake.wait()
             while (
                 kept := declared._next(seen)

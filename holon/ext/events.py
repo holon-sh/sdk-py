@@ -1037,6 +1037,18 @@ async def _request(
     return answer.model_extra or {}
 
 
+async def _list(client: Client) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    cursor = None
+    while True:
+        page = await _request(
+            client, "events/list", {} if cursor is None else {"cursor": cursor}
+        )
+        events += page.get("events", [])
+        if not (cursor := page.get("nextCursor")):
+            return events
+
+
 # A server's refusal ends a subscription: the event type is gone, access was lost, the request is not valid, or the
 # delivery mode is not offered. Anything else is tried again from the cursor.
 def _refused(error: Exception) -> bool:
@@ -1066,17 +1078,8 @@ class AppEvents:
 
     async def list(self) -> list[dict[str, Any]]:
         """The event types the app offers, as ``events/list`` describes them."""
-        events: list[dict[str, Any]] = []
         async with self._app._session(_TIMEOUT) as client:
-            cursor = None
-            while True:
-                page = await _request(
-                    client, "events/list", {} if cursor is None else {"cursor": cursor}
-                )
-                events += page.get("events", [])
-                if not (cursor := page.get("nextCursor")):
-                    break
-        return events
+            return await _list(client)
 
     def subscribe(
         self,
@@ -1147,10 +1150,9 @@ class Subscription(Generic[D]):
     ) -> None:
         self.cursor = cursor
         self.delivery = delivery
-        self._forced = delivery is not None
-        self._events = events
         self._app = events._app
         self._name = name
+        self._payload = events._payloads.get(name)
         self._request: dict[str, Any] = {"name": name, "arguments": arguments}
         if max_age is not None:
             self._request["maxAgeMs"] = round(max_age * 1000)
@@ -1173,17 +1175,6 @@ class Subscription(Generic[D]):
         self._ended: Exception | None = None
 
     async def __aenter__(self) -> Subscription[D]:
-        listed = [
-            each for each in await self._events.list() if each["name"] == self._name
-        ]
-        # A type the app does not list is refused by the app, with NotFound.
-        offered: list[str] = listed[0].get("delivery", []) if listed else ["poll"]
-        wanted: list[Delivery] = [self.delivery] if self.delivery else ["push", "poll"]
-        if not (usable := [mode for mode in wanted if mode in offered]):
-            raise NoCompatibleDeliveryMode(
-                f"{self._app._name} does not deliver {self._name} by {' or '.join(wanted)}."
-            )
-        self.delivery = usable[0]
         self._group = anyio.create_task_group()
         await self._group.__aenter__()
         self._group.start_soon(self._run)
@@ -1246,24 +1237,34 @@ class Subscription(Generic[D]):
                 async with self._app._session(
                     _TIMEOUT, partial(_ordered, notified=self._notified)
                 ) as client:
-                    if self.delivery == "push":
-                        try:
-                            await self._push(client)
-                        except MCPError as error:
-                            # An endpoint that cannot stream refuses push, and the subscription polls instead.
-                            if (
-                                self._forced
-                                or self._active
-                                or error.code != UNSUPPORTED
-                            ):
-                                raise
-                            self.delivery = "poll"
-                    await self._poll(client)
+                    await self._follow(client)
             except Exception as error:  # noqa: BLE001
                 self._failure = error
             finally:
                 self._settled.set()
                 self._send.close()
+
+    # By push when the app offers it, else by poll, unless the subscriber chose.
+    async def _follow(self, client: Client) -> None:
+        listed = [each for each in await _list(client) if each["name"] == self._name]
+        # A type the app does not list is refused by the app, with NotFound.
+        offered = listed[0].get("delivery", []) if listed else ["poll"]
+        wanted: list[Delivery] = [self.delivery] if self.delivery else ["push", "poll"]
+        modes = [mode for mode in wanted if mode in offered]
+        if not modes:
+            raise NoCompatibleDeliveryMode(
+                f"{self._app._name} does not deliver {self._name} by {' or '.join(wanted)}."
+            )
+        self.delivery = modes[0]
+        if self.delivery == "push":
+            try:
+                await self._push(client)
+            except MCPError as error:
+                # An endpoint that cannot stream refuses push, and the subscription polls instead if it may.
+                if "poll" not in modes or self._active or error.code != UNSUPPORTED:
+                    raise
+                self.delivery = "poll"
+        await self._poll(client)
 
     def _confirm(self) -> None:
         self._active = True
@@ -1287,10 +1288,10 @@ class Subscription(Generic[D]):
             if len(self._seen) > 1024:
                 del self._seen[next(iter(self._seen))]
         data = occurrence.get("data")
-        if (schema := self._events._payloads.get(self._name)) is not None:
+        if self._payload is not None:
             self._app._validate(
                 "events/" + self._name,
-                schema,
+                self._payload,
                 data,
                 f"data of {self._app._name} {self._name}",
             )

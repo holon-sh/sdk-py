@@ -390,10 +390,13 @@ class Transfers:
             except (FileTransferError, Rejected) as error:
                 reason = str(error)
                 break
-            if 200 <= status < 300:
+            if httpx2.codes.is_success(status):
                 return
             reason = f"the target answered HTTP {status}"
-            if status < 500 and status not in (408, 429):
+            if status < httpx2.codes.INTERNAL_SERVER_ERROR and status not in (
+                httpx2.codes.REQUEST_TIMEOUT,
+                httpx2.codes.TOO_MANY_REQUESTS,
+            ):
                 break
         raise self.fail(f"the upload of {_file_name(file.name)!r} failed: {reason}")
 
@@ -517,7 +520,7 @@ class Download:
             async with self._call.exchange(
                 self._target, "GET", dict(self._target.get("headers", {}))
             ) as response:
-                if response.status_code != 200:
+                if response.status_code != httpx2.codes.OK:
                     raise FileTransferError(
                         f"{label} failed: HTTP {response.status_code}"
                     )

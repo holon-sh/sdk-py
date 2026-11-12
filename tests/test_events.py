@@ -12,9 +12,21 @@ from mcp.server import MCPServer, Server
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
+from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.exceptions import MCPError
-from mcp.types import CallToolResult, ErrorData
+from mcp.shared.inbound import MCP_METHOD_HEADER, MCP_PROTOCOL_VERSION_HEADER
+from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
+from mcp.types import (
+    CLIENT_CAPABILITIES_META_KEY,
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    JSONRPC_VERSION,
+    LATEST_PROTOCOL_VERSION,
+    PROTOCOL_VERSION_META_KEY,
+    CallToolResult,
+    ErrorData,
+)
 from pydantic import BaseModel, TypeAdapter
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -126,21 +138,21 @@ def client(port, user=None, path="/mcp/"):
 def request(method, params, id=1):
     return {
         "json": {
-            "jsonrpc": "2.0",
+            "jsonrpc": JSONRPC_VERSION,
             "id": id,
             "method": method,
             "params": {
                 **params,
                 "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
+                    PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
+                    CLIENT_CAPABILITIES_META_KEY: {},
                 },
             },
         },
         "headers": {
-            "accept": "application/json, text/event-stream",
-            "mcp-protocol-version": "2026-07-28",
-            "mcp-method": method,
+            "accept": f"{CONTENT_TYPE_JSON}, {CONTENT_TYPE_SSE}",
+            MCP_PROTOCOL_VERSION_HEADER: LATEST_PROTOCOL_VERSION,
+            MCP_METHOD_HEADER: method,
         },
     }
 
@@ -346,8 +358,8 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
         for method, params, code in [
             ("events/poll", {"name": "board.moved"}, -32023),
-            ("events/poll", {"name": "board.changed", "arguments": {}}, -32602),
-            ("events/poll", changed_on("b1", 1), -32602),
+            ("events/poll", {"name": "board.changed", "arguments": {}}, INVALID_PARAMS),
+            ("events/poll", changed_on("b1", 1), INVALID_PARAMS),
             (
                 "events/stream",
                 {"name": "board.locked", "arguments": {"board": "b1"}},
@@ -368,7 +380,7 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             frames = (
                 json.loads(frame.data) async for frame in httpx2.EventSource(stream)
             )
-            meta = {"_meta": {"io.modelcontextprotocol/subscriptionId": 7}}
+            meta = {"_meta": {SUBSCRIPTION_ID_META_KEY: 7}}
             active = await anext(frames)
             assert active["params"] == {"cursor": opened, "truncated": False, **meta}
             assert (await anext(frames))["params"]["eventId"] == "welcome"
@@ -377,7 +389,7 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             error = await anext(frames)
             assert (error["method"], error["params"]["error"]["code"]) == (
                 "notifications/events/error",
-                -32603,
+                INTERNAL_ERROR,
             )
             event = (await anext(frames))["params"]
             assert event == {
@@ -459,7 +471,7 @@ async def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_release
     events, _ = declare(on_subscribe=on_subscribe)
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         refused = await call(http, port, "events/poll", changed_on("b1"))
-        assert refused["error"]["code"] == -32603
+        assert refused["error"]["code"] == INTERNAL_ERROR
         assert "result" in await call(http, port, "events/poll", changed_on("b1"))
     assert calls[0] == calls[1]
 

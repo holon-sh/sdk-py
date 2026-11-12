@@ -24,6 +24,7 @@ from mcp.client import Transport
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import (
+    LATEST_PROTOCOL_VERSION,
     CallToolRequest,
     CallToolRequestParams,
     CallToolResult,
@@ -59,7 +60,6 @@ __all__ = [
 ]
 
 Output = TypeVar("Output")
-_VERSION = "2026-07-28"
 
 
 class Binding(TypedDict):
@@ -328,7 +328,7 @@ class _App:
                     client_info=Implementation(
                         name=self._identity["name"], version=self._identity["version"]
                     ),
-                    mode=_VERSION,
+                    mode=LATEST_PROTOCOL_VERSION,
                     elicitation_callback=_declare_elicitation,
                     extensions=[FILES],
                 ) as client:

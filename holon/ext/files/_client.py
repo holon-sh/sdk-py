@@ -148,7 +148,6 @@ def _loopback(host: str) -> bool:
 class Transfers:
     endpoint: httpx2.URL
     http_client: Callable[[], httpx2.AsyncClient]
-    http: httpx2.AsyncClient
 
     def __init__(self, label: str, file_origins: Sequence[str] | None) -> None:
         self.label = label
@@ -169,8 +168,8 @@ class Transfers:
     ) -> None:
         self.endpoint = httpx2.URL(endpoint)
         self.http_client = http_client
-        self.http = http
 
+        # An include target takes the credential the call sends to the MCP address, however `http` adds it.
         async def capture(request: httpx2.Request) -> None:
             if request.url == self.endpoint:
                 self.authorization = request.headers.get("authorization")
@@ -217,10 +216,8 @@ class Transfers:
         quiet = _quiet.set(True)
         try:
             async with AsyncExitStack() as stack:
-                if "url" not in target:
-                    client = self.http
-                    if client.is_closed:
-                        client = await stack.enter_async_context(self.http_client())
+                if "url" not in target:  # A fresh client from the binding's factory.
+                    client = await stack.enter_async_context(self.http_client())
                     path = self.endpoint.path.rstrip("/") + target["path"]
                     request = client.build_request(
                         method,

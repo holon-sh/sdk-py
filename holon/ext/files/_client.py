@@ -366,19 +366,20 @@ class Transfers:
             )
         try:
             async with anyio.create_task_group() as group:
-                for target in targets.values():
-                    group.start_soon(self._transfer, target)
+                for file, entry in self.owed.values():
+                    group.start_soon(self._transfer, targets[entry["id"]], file, entry)
         except* FileTransferError as failed:
             raise failed.exceptions[0] from None
         self.uploaded = True
         return state
 
-    async def _transfer(self, target: UploadTarget) -> None:
-        file, entry = self.owed[target.get("fileId", "")]
+    async def _transfer(
+        self, target: UploadTarget, file: File, entry: dict[str, Any]
+    ) -> None:
         method = target.get("method", "PUT")
+        deadline = expires_at(target)
         reason = "it was not sent"
         for _ in range(3 if method == "PUT" else 1):
-            deadline = expires_at(target)
             if deadline is not None and datetime.now(UTC) >= deadline:
                 reason = "its target expired before the transfer started"
                 break

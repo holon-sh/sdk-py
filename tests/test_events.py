@@ -98,7 +98,6 @@ def mounted(events):
     return _asgi(App(MCPServer("boards", extensions=[events], middleware=[events])))
 
 
-# The context Holon's waypoint sends for a signed-in user.
 def signed_in(user):
     principal = {"iss": "https://id.example", "sub": user, "client_id": "c"}
     claims = {

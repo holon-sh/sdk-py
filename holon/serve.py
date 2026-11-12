@@ -33,8 +33,6 @@ from holon.ext.events import Events
 __all__ = ["App", "load", "serve"]
 
 _MCP = re.compile(r"/mcp(/[^/]+)?")
-# The forms of the headers Holon's waypoint sets: a context is a compact JWS, whose payload segment is matched, and a
-# caller is the SPIFFE ID of an app of the session.
 _CONTEXT = re.compile(r"[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+")
 _CALLER = re.compile(r"spiffe://cluster\.local/ns/([^/]+)/sa/([^/]+)")
 _MALFORMED = PlainTextResponse(
@@ -77,7 +75,6 @@ async def serve(app: App) -> None:
         host=os.environ.get("HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "3000")),
         lifespan="on",
-        # A context is up to 16 KiB.
         h11_max_incomplete_event_size=65536,
         access_log=False,
         proxy_headers=False,
@@ -102,7 +99,6 @@ def _asgi(app: App) -> ASGIApp:
     mcp = AuthContextMiddleware(
         manager.handle_request if events is None else events.asgi(manager)
     )
-    # Inside Holon only the waypoint reaches the app, and it verifies the context and sets these headers itself.
     platform = os.environ.get("HOLON_PLATFORM") == "1"
 
     async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:
@@ -203,7 +199,6 @@ def _admit(
 
 
 def _page(directory: Path | None, path: str) -> Response:
-    # The path is decoded, so this refuses a dot however it is spelled. Windows reads a backslash as a slash.
     if directory is None or "/." in path or "\\" in path:
         return Response(status_code=404)
     try:

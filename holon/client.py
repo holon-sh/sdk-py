@@ -285,7 +285,6 @@ class _App:
             )
         token = os.environ.get(prefix + "TOKEN")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        # Inside Holon the platform writes every such endpoint, so the request's context may go to it.
         request = _request.get()
         if request is not None and not request.ended and request.token:
             headers["X-Holon-Context"] = request.token

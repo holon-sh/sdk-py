@@ -97,7 +97,7 @@ def get_context() -> RequestContext:
 class _Request:
     """The MCP request being served. Tasks it spawns share it, and see when it ends."""
 
-    token: str  # its X-Holon-Context, or "" without one
+    token: str
     ended: bool = False
 
 

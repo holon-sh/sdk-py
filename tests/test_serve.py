@@ -39,7 +39,6 @@ def asynchronous(test):
     return run
 
 
-# The waypoint verified the signature, so the app reads only the payload.
 def context(**payload):
     claims = {"exp": 1900000060.25, "aud": ["https://holon.example"], **payload}
     encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
@@ -120,13 +119,11 @@ async def test_inside_holon_a_tool_sees_whom_the_waypoint_admitted_and_not_the_h
                 {"x-holon-context": signed_in, "x-holon-caller": REPORTER},
                 RequestContext(ann, Caller("reporter", "session")),
             ),
-            # An app's call outside a request carries no context.
             (
                 "/mcp",
                 {"x-holon-caller": REPORTER},
                 RequestContext(None, Caller("reporter", "session")),
             ),
-            # A signed-out person.
             ("/mcp", {"x-holon-context": context()}, RequestContext(None, None)),
         ]:
             forged = {"x-holon-other": "forged", "authorization": "Bearer forged"}
@@ -223,7 +220,6 @@ async def test_a_peer_call_carries_the_context_until_its_request_ends_and_the_ap
     async def relay() -> str:
         await apps.peer.call_tool("ping")
         phases.append(len(received))
-        # A binding the app passes in is no peer the platform wrote.
         bound = {"endpoint": os.environ["PEER_MCP_URL"]}
         await Apps(IDENTITY, {}, {"peer": bound}).peer.call_tool("ping")
         phases.append(len(received))
@@ -364,7 +360,6 @@ def subject() -> str:
                 except httpx2.ConnectError:
                     await asyncio.sleep(0.05)
         assert home.text == "<p>Home</p>"
-        # The server holds headers that arrive in pieces until they end, up to its limit.
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         head = f"GET / HTTP/1.1\r\nhost: app\r\nx-holon-context: {token}\r\n\r\n"
         for piece in [head[:-2], head[-2:]]:

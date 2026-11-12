@@ -108,8 +108,8 @@ _KEEP_BYTES = 4 * 2**20
 _INTERVAL = 1.0
 # Seconds between a stream's heartbeats. One whose reader takes nothing for two is closed, to reconnect from its cursor.
 _HEARTBEAT = 30.0
-# Seconds a poll subscription lasts after its last poll: a minute or three intervals.
-_POLL_SUBSCRIPTION_TTL = max(60.0, 3 * _INTERVAL)
+# Seconds a poll subscription lasts after its last poll.
+_POLL_SUBSCRIPTION_TTL = 60.0
 # The bytes of events every stream together is sending at once, of which one caller's streams may send a quarter.
 _MAX_SENDING_BYTES = 16 * 2**20
 # The subscriptions held at once, streams and poll leases alike, and those of one caller.
@@ -177,13 +177,6 @@ def _described(error: BaseException) -> dict[str, Any]:
 
 async def _settle(value: T | Awaitable[T]) -> T:
     return await value if inspect.isawaitable(value) else value
-
-
-def _iso(value: datetime | str | None) -> str:
-    if isinstance(value, str):
-        return value
-    moment = (value or datetime.now(UTC)).astimezone(UTC)
-    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, eq=False)
@@ -268,7 +261,7 @@ class EventType(Generic[A, D]):
         data: D,
         *,
         event_id: str | None = None,
-        timestamp: datetime | str | None = None,
+        timestamp: datetime | None = None,
         subscription_id: str | None = None,
     ) -> None:
         """Emit an occurrence to the subscriptions it matches.
@@ -286,8 +279,12 @@ class EventType(Generic[A, D]):
         """
         self._events._on_loop()
         size = len(to_json(data, by_alias=True))
+        moment = (timestamp or datetime.now(UTC)).astimezone(UTC)
         event = Event(
-            data, event_id or str(uuid.uuid4()), _iso(timestamp), name=self.name
+            data,
+            event_id or str(uuid.uuid4()),
+            moment.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            name=self.name,
         )
         self._keep(event, size, subscription_id)
         for hold in self._holds(subscription_id):
@@ -438,9 +435,6 @@ class EventType(Generic[A, D]):
             await closing.wait()
 
 
-Notify: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[None]]
-
-
 # The manager's own handling of a 2026-07-28 request, answering by stream as it does subscriptions/listen, which is
 # the one method the SDK streams on an endpoint that answers in JSON. The path is private to the SDK, so it is looked
 # for when an endpoint is mounted, and an endpoint without it offers poll only.
@@ -563,7 +557,6 @@ class Events(Extension):
         descriptor = {
             "name": name,
             **({"description": description} if description else {}),
-            "delivery": list(delivery),
             "inputSchema": arguments.json_schema(),
             "payloadSchema": payload.json_schema(),
         }
@@ -681,18 +674,6 @@ class Events(Extension):
                 opened,
             )
         return {**answer, "nextPollMs": round(_INTERVAL * 1000)}
-
-    async def _stream(
-        self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
-    ) -> HandlerResult:
-        async def notify(method: str, body: dict[str, Any]) -> None:
-            notification = Notification[dict[str, Any], str](method=method, params=body)
-            await ctx.session.send_notification(
-                cast(ServerNotification, notification),
-                related_request_id=ctx.request_id,
-            )
-
-        return await self._serve_stream(params, ctx.request_id, notify, _streams(ctx))
 
     # Emitting must happen on the loop that serves the events, since it changes what they keep and wakes their
     # streams without a lock: the first emit fixes the loop, and every later one must run on it.
@@ -924,10 +905,10 @@ class Events(Extension):
 
     # A push stream follows what the type keeps from its position. One task sends everything, in order and one event
     # at a time, and nothing before `active`.
-    async def _serve_stream(
-        self, params: _SubscribeParams, request_id: Any, notify: Notify, streams: bool
-    ) -> dict[str, Any]:
-        declared, request = await self._subscription(params, "push", streams)
+    async def _stream(
+        self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
+    ) -> HandlerResult:
+        declared, request = await self._subscription(params, "push", _streams(ctx))
         await declared._settled(request.id)
         wake = asyncio.Event()
         hold = self._open(declared, request, wake.set)
@@ -937,13 +918,16 @@ class Events(Extension):
             await self._ready(hold)
 
             async def say(method: str, body: dict[str, Any], size: int = 0) -> None:
-                body["_meta"] = {
-                    **body.get("_meta", {}),
-                    SUBSCRIPTION_ID_META_KEY: request_id,
-                }
+                body["_meta"] = {SUBSCRIPTION_ID_META_KEY: ctx.request_id}
+                notification = Notification[dict[str, Any], str](
+                    method=f"notifications/events/{method}", params=body
+                )
                 with anyio.move_on_after(2 * _HEARTBEAT) as waited:
                     async with self._send_budget(size, request.caller):
-                        await notify(f"notifications/events/{method}", body)
+                        await ctx.session.send_notification(
+                            cast(ServerNotification, notification),
+                            related_request_id=ctx.request_id,
+                        )
                 if waited.cancelled_caught:
                     raise _Stalled
 
@@ -1028,7 +1012,7 @@ class _Answer(BaseModel):
 
 @asynccontextmanager
 async def _ordered(
-    transport: Transport, notified: Notify
+    transport: Transport, notified: Callable[[str, dict[str, Any]], Awaitable[None]]
 ) -> AsyncIterator[TransportStreams]:
     """The transport, with MCP Events' notifications handed to ``notified`` as they arrive.
 

@@ -233,21 +233,19 @@ class FileServer:
             mime_type: Media type. Guessed from ``name`` when omitted.
             text: What the result says, for the model.
         """
-        if name is None and not isinstance(source, bytes):
-            name = Path(source).name
+        if not isinstance(source, bytes):
+            source = Path(source)
+            name = source.name if name is None else name
         mime_type = media_type(name, mime_type)
         said = TextContent(type="text", text=text)
         if "download" in (declared(ctx.session.client_capabilities) or {}):
             target = await self._storage.publish(
-                source if isinstance(source, bytes) else Path(source),
-                name,
-                mime_type,
-                time.time() + _TTL,
+                source, name, mime_type, time.time() + _TTL
             )
             return CallToolResult(
                 content=[said], _meta={EXTENSION: {"downloads": [target]}}
             )
-        if not isinstance(source, bytes):
+        if isinstance(source, Path):
             source = await anyio.Path(source).read_bytes()
         resource = BlobResourceContents(
             uri=f"file:///{quote(name or 'file')}",

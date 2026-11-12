@@ -169,7 +169,6 @@ class Transfers:
         self.endpoint = httpx2.URL(endpoint)
         self.http_client = http_client
 
-        # An include target takes the credential the call sends to the MCP address, however `http` adds it.
         async def capture(request: httpx2.Request) -> None:
             if request.url == self.endpoint:
                 self.authorization = request.headers.get("authorization")
@@ -216,7 +215,7 @@ class Transfers:
         quiet = _quiet.set(True)
         try:
             async with AsyncExitStack() as stack:
-                if "url" not in target:  # A fresh client from the binding's factory.
+                if "url" not in target:
                     client = await stack.enter_async_context(self.http_client())
                     path = self.endpoint.path.rstrip("/") + target["path"]
                     request = client.build_request(

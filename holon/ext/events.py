@@ -180,7 +180,6 @@ async def _settle(value: T | Awaitable[T]) -> T:
     return await value if inspect.isawaitable(value) else value
 
 
-# Takes `amount` back from what `key` holds, and forgets a key that holds nothing.
 def _release(counts: Counter[str], key: str, amount: int) -> None:
     counts[key] -= amount
     if not counts[key]:
@@ -215,15 +214,10 @@ class _Kept:
 
 @dataclass(eq=False)
 class _Entry:
-    """A subscription held by one or more streams or poll leases.
-
-    The type's on_subscribe sets it up, apart from any request, when its first hold begins, and its on_unsubscribe
-    tears it down once its last has ended. It stays its type's until that returns, so that one which begins again
-    with the same id waits.
-    """
+    """A subscription held by one or more streams or poll leases, set up once by the type's on_subscribe."""
 
     request: _Request
-    """The request that began it, whose context and arguments both hooks are given."""
+    """The request that began it, whose context and arguments on_unsubscribe is given."""
     setup: asyncio.Future[None]
     holds: set[_Hold] = field(default_factory=set)
     teardown: asyncio.Future[None] | None = None
@@ -236,11 +230,10 @@ class _Hold:
     request: _Request
     entry: _Entry
     wake: asyncio.Event = field(default_factory=asyncio.Event)
-    """Set when there is something new for it, or it was ended."""
+    """Told when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
     until: int = 0
     lease: asyncio.TimerHandle | None = None
-    """When a poll lease lapses, unless a poll renews it first."""
 
 
 @dataclass(eq=False, repr=False)
@@ -319,7 +312,6 @@ class EventType(Generic[A, D]):
             if hold.ended is None:
                 hold.ended, hold.until = error, until
                 hold.wake.set()
-                # Nothing waits on a poll lease: it ends at once, and its next poll is told why.
                 if hold.lease is not None:
                     self._events._close(hold)
 
@@ -507,7 +499,6 @@ class Events(Extension):
         # Cursors of kept events are positions in this process's memory; one from another process names nothing.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
-        # The subscriptions each caller holds, and the bytes each caller's streams are sending.
         self._held: Counter[str] = Counter()
         self._sending: Counter[str] = Counter()
         self._sent = asyncio.Event()
@@ -765,7 +756,8 @@ class Events(Extension):
         return request
 
     # Begins holding a subscription, by a stream or a poll lease: counted against the limits first, so a refused one
-    # provisions nothing. Await `_settled` before, and `_ready` after.
+    # provisions nothing. The type's on_subscribe runs, apart from the request, when the first hold of an id begins,
+    # and its on_unsubscribe when the last ends. Await `_ready` before serving the hold.
     def _open(self, request: _Request) -> _Hold:
         if self._held.total() >= _MAX_SUBSCRIPTIONS:
             raise MCPError(
@@ -1244,7 +1236,6 @@ class Subscription(Generic[D]):
                 self._settled.set()
                 self._send.close()
 
-    # By push when the app offers it, else by poll, unless the subscriber chose.
     async def _follow(self, client: Client) -> None:
         listed = [each for each in await _list(client) if each["name"] == self._name]
         # A type the app does not list is refused by the app, with NotFound.
@@ -1260,7 +1251,7 @@ class Subscription(Generic[D]):
             try:
                 await self._push(client)
             except MCPError as error:
-                # An endpoint that cannot stream refuses push, and the subscription polls instead if it may.
+                # An endpoint that cannot stream refuses push, and the subscription polls instead.
                 if "poll" not in modes or self._active or error.code != UNSUPPORTED:
                     raise
                 self.delivery = "poll"

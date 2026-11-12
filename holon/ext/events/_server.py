@@ -155,6 +155,8 @@ class _Hold:
     ended: ErrorData | None = None
     until: int = 0
     lease: asyncio.TimerHandle | None = None
+    seen: int = 0
+    """The last sequence a stream has sent."""
 
 
 @dataclass(eq=False, repr=False)
@@ -191,7 +193,8 @@ class EventType(Generic[A, D]):
         Args:
             event_id: The source's own id, so a client drops duplicates.
             timestamp: When it happened. Defaults to now.
-            subscription_id: Send it to this subscription alone.
+            subscription_id: Send it to this subscription alone. It and what follows it are kept until each of
+                the subscription's open streams has sent it, beyond what the type otherwise keeps.
 
         Call it on the event loop that serves the events; from another thread, use ``loop.call_soon_threadsafe``.
         """
@@ -256,8 +259,14 @@ class EventType(Generic[A, D]):
             or self._bytes > _KEEP_BYTES
             or self._kept[dropped].at < kept.at - _KEEP_AGE
         ):
-            self._dropped = self._kept[dropped].sequence
-            self._bytes -= self._kept[dropped].size
+            oldest = self._kept[dropped]
+            if oldest.target is not None and any(
+                hold.lease is None and hold.seen < oldest.sequence
+                for hold in self._holds(oldest.target)
+            ):
+                break
+            self._dropped = oldest.sequence
+            self._bytes -= oldest.size
             dropped += 1
         del self._kept[:dropped]
 
@@ -753,7 +762,7 @@ class Events(Extension):
         declared = request.type
         await declared._settled(request.id)
         hold = self._open(request)
-        seen = declared._sequence
+        hold.seen = declared._sequence
         try:
             await self._ready(hold)
 
@@ -778,12 +787,15 @@ class Events(Extension):
                     await say("error", {"error": _described(error)})
                     return
                 if shaped is not None:
-                    cursor = declared._position(seen)
+                    cursor = declared._position(hold.seen)
                     await say("event", {**shaped, "cursor": cursor}, kept.size)
 
-            seen, truncated = declared._resume(params.cursor, params.max_age_ms, seen)
+            hold.seen, truncated = declared._resume(
+                params.cursor, params.max_age_ms, hold.seen
+            )
             await say(
-                "active", {"cursor": declared._position(seen), "truncated": truncated}
+                "active",
+                {"cursor": declared._position(hold.seen), "truncated": truncated},
             )
             beat = time.monotonic() + _HEARTBEAT
             while hold.ended is None:
@@ -800,24 +812,24 @@ class Events(Extension):
                     if not allowed:
                         hold.ended = _FORBIDDEN
                         break
-                    await say("heartbeat", {"cursor": declared._position(seen)})
-                elif seen < declared._dropped:
+                    await say("heartbeat", {"cursor": declared._position(hold.seen)})
+                elif hold.seen < declared._dropped:
                     # Evicted before it was sent: a gap.
-                    seen = declared._dropped
+                    hold.seen = declared._dropped
                     await say(
                         "active",
-                        {"cursor": declared._position(seen), "truncated": True},
+                        {"cursor": declared._position(hold.seen), "truncated": True},
                     )
-                elif (kept := declared._next(seen)) is not None:
-                    seen = kept.sequence
+                elif (kept := declared._next(hold.seen)) is not None:
+                    hold.seen = kept.sequence
                     await send(kept)
                 else:
                     with anyio.move_on_after(beat - time.monotonic()):
                         await hold.wake.wait()
             while (
-                kept := declared._next(seen)
+                kept := declared._next(hold.seen)
             ) is not None and kept.sequence <= hold.until:
-                seen = kept.sequence
+                hold.seen = kept.sequence
                 await send(kept)
             if hold.ended is not None:
                 await say(

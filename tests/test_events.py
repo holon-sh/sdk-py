@@ -237,6 +237,27 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
 
 
 @asynchronous
+async def test_a_stream_is_sent_everything_emitted_to_its_subscription_past_what_is_kept(
+    monkeypatch,
+):
+    monkeypatch.setattr(_server, "_KEEP_BYTES", 1)
+    ids, heard = [], []
+    events, changed = declare(
+        on_subscribe=lambda context, arguments, id: ids.append(id)
+    )
+    async with (
+        served(events) as port,
+        client(port).subscribe(
+            "board.changed", {"board": "b1"}, on_gap=lambda: heard.append("gap")
+        ) as changes,
+    ):
+        for text in ["a", "b", "c", "d"]:
+            say(changed, "b1", text, to=ids[0])
+        heard.extend(await take(changes, 4))
+    assert heard == ["a", "b", "c", "d"]
+
+
+@asynchronous
 async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_cursor_from_before_a_restart_is_a_gap():
     events, changed = declare(
         on_subscribe=lambda context, arguments, id: say(

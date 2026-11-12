@@ -148,7 +148,6 @@ def _loopback(host: str) -> bool:
 class Transfers:
     endpoint: httpx2.URL
     http_client: Callable[[], httpx2.AsyncClient]
-    http: httpx2.AsyncClient
 
     def __init__(self, label: str, file_origins: Sequence[str] | None) -> None:
         self.label = label
@@ -169,7 +168,6 @@ class Transfers:
     ) -> None:
         self.endpoint = httpx2.URL(endpoint)
         self.http_client = http_client
-        self.http = http
 
         async def capture(request: httpx2.Request) -> None:
             if request.url == self.endpoint:
@@ -218,9 +216,7 @@ class Transfers:
         try:
             async with AsyncExitStack() as stack:
                 if "url" not in target:
-                    client = self.http
-                    if client.is_closed:
-                        client = await stack.enter_async_context(self.http_client())
+                    client = await stack.enter_async_context(self.http_client())
                     path = self.endpoint.path.rstrip("/") + target["path"]
                     request = client.build_request(
                         method,
@@ -394,10 +390,13 @@ class Transfers:
             except (FileTransferError, Rejected) as error:
                 reason = str(error)
                 break
-            if 200 <= status < 300:
+            if httpx2.codes.is_success(status):
                 return
             reason = f"the target answered HTTP {status}"
-            if status < 500 and status not in (408, 429):
+            if status < httpx2.codes.INTERNAL_SERVER_ERROR and status not in (
+                httpx2.codes.REQUEST_TIMEOUT,
+                httpx2.codes.TOO_MANY_REQUESTS,
+            ):
                 break
         raise self.fail(f"the upload of {_file_name(file.name)!r} failed: {reason}")
 
@@ -521,7 +520,7 @@ class Download:
             async with self._call.exchange(
                 self._target, "GET", dict(self._target.get("headers", {}))
             ) as response:
-                if response.status_code != 200:
+                if response.status_code != httpx2.codes.OK:
                     raise FileTransferError(
                         f"{label} failed: HTTP {response.status_code}"
                     )

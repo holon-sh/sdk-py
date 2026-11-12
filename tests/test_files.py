@@ -14,7 +14,19 @@ import httpx2
 import pytest
 import uvicorn
 from mcp.server.lowlevel import Server
+from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
+from mcp.shared.inbound import (
+    MCP_METHOD_HEADER,
+    MCP_NAME_HEADER,
+    MCP_PROTOCOL_VERSION_HEADER,
+)
 from mcp.types import (
+    CLIENT_CAPABILITIES_META_KEY,
+    INVALID_PARAMS,
+    JSONRPC_VERSION,
+    LATEST_PROTOCOL_VERSION,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    PROTOCOL_VERSION_META_KEY,
     CallToolResult,
     ElicitRequest,
     ElicitRequestFormParams,
@@ -24,6 +36,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
+from starlette import status
 from starlette.responses import Response
 from starlette.routing import Mount, Route, Router
 
@@ -199,7 +212,7 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
         headers = {k: v for k, v in replay["headers"].items() if k != "content-length"}
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as raw:
             response = await raw.post(ENDPOINT, content=replay["body"], headers=headers)
-        assert response.json()["error"]["code"] == -32602
+        assert response.json()["error"]["code"] == INVALID_PARAMS
 
     run(app, body)
     assert (tmp_path / "saved/a.txt").read_bytes() == b"tiny"
@@ -216,7 +229,11 @@ def sink(attempts, served=None):
         name = request.path_params["name"]
         if request.method == "GET":
             return Response(served[name])
-        return Response(status_code=503 if name == "busy" else 201)
+        return Response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+            if name == "busy"
+            else status.HTTP_201_CREATED
+        )
 
     return Router(routes=[Route("/{name}", transfer, methods=["GET", "PUT", "POST"])])
 
@@ -340,7 +357,7 @@ def test_a_form_target_on_an_allowed_origin_gets_a_multipart_post():
 
     async def receive(request):
         received.append((await request.body(), request.headers))
-        return Response(status_code=204)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     replies = []
     app = scripted(replies, Router())
@@ -374,18 +391,18 @@ def test_a_form_target_on_an_allowed_origin_gets_a_multipart_post():
 def rpc(http, method, params=None, *, declare=True):
     capabilities = {"extensions": {EXTENSION: {"upload": {}, "download": {}}}}
     meta = {
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": capabilities if declare else {},
+        PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
+        CLIENT_CAPABILITIES_META_KEY: capabilities if declare else {},
     }
     params = {**(params or {}), "_meta": meta}
     headers = {
-        "accept": "application/json, text/event-stream",
-        "mcp-protocol-version": "2026-07-28",
-        "mcp-method": method,
+        "accept": f"{CONTENT_TYPE_JSON}, {CONTENT_TYPE_SSE}",
+        MCP_PROTOCOL_VERSION_HEADER: LATEST_PROTOCOL_VERSION,
+        MCP_METHOD_HEADER: method,
     }
     if "name" in params:
-        headers["mcp-name"] = params["name"]
-    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        headers[MCP_NAME_HEADER] = params["name"]
+    body = {"jsonrpc": JSONRPC_VERSION, "id": 1, "method": method, "params": params}
     return http.post(ENDPOINT, json=body, headers=headers)
 
 
@@ -416,7 +433,7 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
             assert [tool["name"] for tool in listed["result"]["tools"]] == ["export"]
 
             missing = await call({"file": text_file()}, declare=False)
-            assert missing["error"]["code"] == -32021
+            assert missing["error"]["code"] == MISSING_REQUIRED_CLIENT_CAPABILITY
             required = missing["error"]["data"]["requiredCapabilities"]
             assert required == {"extensions": {EXTENSION: {"upload": {}}}}
 
@@ -455,13 +472,13 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
             [target] = requested["uploads"]
             assert target["fileId"] == "f" and target["credentials"] == "omit"
             put = await http.put(f"{ENDPOINT}{target['path']}", content=good[:9])
-            assert put.status_code == 400
+            assert put.status_code == status.HTTP_400_BAD_REQUEST
             state = requested["requestState"]
             result = await call(arguments, requestState=state)
             assert result["result"]["isError"] is True and ran == []
             changed = await call({**arguments, "note": "x"}, requestState=state)
             forged = await call(arguments, requestState="files.forged")
-            assert changed["error"]["code"] == forged["error"]["code"] == -32602
+            assert changed["error"]["code"] == forged["error"]["code"] == INVALID_PARAMS
 
             exported = (await call({}, name="export", declare=False))["result"]
             [_, resource] = exported["content"]

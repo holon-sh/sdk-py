@@ -6,7 +6,12 @@ import httpx2
 import pytest
 import uvicorn
 from mcp.server import MCPServer
-from mcp.types import CallToolResult, InputRequiredResult, TextContent
+from mcp.types import (
+    CLIENT_INFO_META_KEY,
+    CallToolResult,
+    InputRequiredResult,
+    TextContent,
+)
 
 from holon.client import Apps, ToolCallError
 
@@ -118,7 +123,7 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             assert request["_meta"]["trace"] == "control"
             assert not any(request["method"] == "tools/list" for request in requests)
             callers = [
-                request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
+                request["params"]["_meta"][CLIENT_INFO_META_KEY]["name"]
                 for request in requests
                 if request["method"] == "tools/call"
             ]

@@ -38,6 +38,7 @@ from mcp.types import (
     TextContent,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette import status
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, Response
 from starlette.routing import Route, Router
@@ -593,11 +594,11 @@ class LocalStorage:
     async def _put(self, request: Request) -> Response:
         claims = self._unseal(request, "u")
         if claims is None:
-            return Response(status_code=404)
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
         key, size, keep_until = claims
         staged = self._dir("u") / key
         if staged.exists():  # One write: the target is spent.
-            return Response(status_code=409)
+            return Response(status_code=status.HTTP_409_CONFLICT)
         written = 0
         try:
             if request.headers.get("content-length") != str(size):
@@ -614,13 +615,13 @@ class LocalStorage:
                 if written != size:
                     raise ValueError("less than the declared size")
         except (ValueError, OSError, ClientDisconnect):
-            return Response(status_code=400)
+            return Response(status_code=status.HTTP_400_BAD_REQUEST)
         self._files[staged] = keep_until
-        return Response(status_code=201)
+        return Response(status_code=status.HTTP_201_CREATED)
 
     async def _get(self, request: Request) -> Response:
         claims = self._unseal(request, "d")
         if claims is None:
-            return Response(status_code=404)
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
         file, name, mime_type = claims
         return FileResponse(self._dir("d") / file, media_type=mime_type, filename=name)

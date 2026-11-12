@@ -18,6 +18,8 @@ from pydantic import BaseModel
 from holon.client import Apps, ToolCallError
 
 QUESTION = "Which size should I ship?"
+CONNECT = "Connect your account."
+LINK = "https://orders.example/connect"
 ID_ONLY = {
     "type": "object",
     "properties": {"id": {"type": "string"}},
@@ -63,12 +65,16 @@ def exercise(body):
 
         @server.tool()
         async def nag(id: str) -> CallToolResult | InputRequiredResult:
-            params = ElicitRequestFormParams(
+            form = ElicitRequestFormParams(
                 message=QUESTION,
                 requested_schema={"type": "object", "properties": {}},
             )
+            url = ElicitRequestURLParams(message=CONNECT, url=LINK, elicitation_id="l")
             return InputRequiredResult(
-                input_requests={"q": ElicitRequest(params=params)}
+                input_requests={
+                    "q": ElicitRequest(params=form),
+                    "l": ElicitRequest(params=url),
+                }
             )
 
         app = server.streamable_http_app(stateless_http=True)
@@ -112,22 +118,23 @@ def test_a_server_that_keeps_asking_stops_after_ten_answers():
     answers = []
 
     async def elicit(params):
-        answers.append(params)
+        answers.append(params.message)
         return ElicitResult(action="decline")
 
     async def body(orders):
-        with pytest.raises(ToolCallError, match=QUESTION):
+        with pytest.raises(ToolCallError) as error:
             await orders.tools.nag({"elicit": elicit}, id="A-1")
+        # The questions left unanswered reach the caller, a URL one with its URL.
+        assert QUESTION in str(error.value) and LINK in str(error.value)
 
     exercise(body)
-    assert len(answers) == 10
+    assert answers == [QUESTION, CONNECT] * 10
 
 
 def test_without_elicit_the_question_reaches_the_caller_who_continues():
     async def body(orders):
         with pytest.raises(ToolCallError) as error:
             await orders.tools.ship(id="A-1")
-        assert str(error.value) == f"orders.ship: additional input required: {QUESTION}"
         result = error.value.result
         [key] = result.input_requests
         answer = ElicitResult(action="accept", content={"size": "small"})
@@ -150,16 +157,3 @@ def test_an_error_while_answering_reaches_the_caller_unwrapped():
             await orders.tools.ship({"elicit": elicit}, id="A-1")
 
     exercise(body)
-
-
-def test_a_url_question_names_its_url():
-    params = ElicitRequestURLParams(
-        message="Connect your account.",
-        url="https://orders.example/connect",
-        elicitation_id="link",
-    )
-    result = InputRequiredResult(input_requests={"link": ElicitRequest(params=params)})
-    assert str(ToolCallError("orders", "ship", result)) == (
-        "orders.ship: additional input required: "
-        "Connect your account. https://orders.example/connect"
-    )

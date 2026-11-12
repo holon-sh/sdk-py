@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import socket
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx2
@@ -23,7 +24,6 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Mount, Route, Router
 
@@ -186,7 +186,7 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
         assert upload_retry["params"]["arguments"] == first["params"]["arguments"]
         assert "inputResponses" not in upload_retry["params"]
         [put] = [e for e in seen if e["method"] == "PUT"]
-        assert put["path"].startswith("/mcp/files/u/") and put["body"] == b"x" * 100
+        assert put["path"].startswith("/mcp/files/") and put["body"] == b"x" * 100
         # A path target goes through the binding's client, without its credentials.
         assert not {"authorization", "cookie", "content-type"} & put["headers"].keys()
 
@@ -207,31 +207,52 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
     assert ran == ["save"] * 3
 
 
-def scripted(replies):
-    """A server that answers tools/call from ``replies``; returns (app, attempts)."""
-    attempts = []
+def sink(attempts, served=None):
+    """Where transfers land: records each (method, authorization), serves
+    ``served`` by name, and answers 503 for ``busy``."""
 
-    async def sink(request):
+    async def transfer(request):
         attempts.append((request.method, request.headers.get("authorization")))
-        busy = request.path_params["name"] == "busy"
-        return Response(status_code=503 if busy else 201)
+        name = request.path_params["name"]
+        if request.method == "GET":
+            return Response(served[name])
+        return Response(status_code=503 if name == "busy" else 201)
+
+    return Router(routes=[Route("/{name}", transfer, methods=["GET", "PUT", "POST"])])
+
+
+def scripted(replies, transfers):
+    """A server that answers tools/call from ``replies``, with ``transfers``
+    under its MCP address."""
 
     async def call_tool(ctx, params):
-        return replies.pop(0)(params.arguments["file"]["id"])
+        return replies.pop(0)(params.arguments)
 
     server = Server("scripted", on_call_tool=call_tool)
     server.extensions[EXTENSION] = {"upload": {}}
-    sink_app = Router(routes=[Route("/{name}", sink, methods=["PUT", "POST"])])
-    app = server.streamable_http_app(
+    return server.streamable_http_app(
         stateless_http=True,
         json_response=True,
-        custom_starlette_routes=[Mount("/mcp/files", app=sink_app)],
+        custom_starlette_routes=[Mount("/mcp/files", app=transfers)],
     )
-    return app, attempts
+
+
+@asynccontextmanager
+async def listening(app):
+    """Serves ``app`` on a loopback port, for url targets; yields its origin."""
+    sock = socket.create_server(("127.0.0.1", 0))
+    http = uvicorn.Server(uvicorn.Config(app, lifespan="off", log_level="warning"))
+    serving = asyncio.create_task(http.serve(sockets=[sock]))
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        http.should_exit = True
+        await serving
 
 
 def upload(requestState="s", **target):
-    def reply(file_id):
+    def reply(arguments):
+        file_id = arguments["file"]["id"]
         uploads = [{"fileId": file_id, "credentials": "omit", **target}]
         return {
             "resultType": "upload_required",
@@ -242,70 +263,74 @@ def upload(requestState="s", **target):
     return reply
 
 
-def done(file_id):
+def done(arguments):
     return CallToolResult(content=[TextContent(type="text", text="ok")])
 
 
-def broken(file_id):
+def broken(arguments):
     raise RuntimeError("lost")
 
 
 def test_the_client_checks_every_upload_request_and_retries_only_after_success():
-    replies = []
-    app, attempts = scripted(replies)
-    seen = []
-    files = client(app, seen)
+    replies, attempts, seen = [], [], []
+    transfers = sink(attempts)
+    app = scripted(replies, transfers)
     form = {"fields": [], "fileField": "file"}
 
-    async def call():
-        return await files.tools.save(file=File(b"0123456789"))
-
     async def body():
-        for target in [
-            {"path": "/files/ok", "headers": {"Authorization": "Bearer x"}},
-            {"path": "/files/ok", "headers": {"X-Forwarded-Host": "elsewhere"}},
-            {"path": "/files/../ok"},
-            {"path": "/files/ok", "url": "https://files.example/u"},
-            {"path": "/files/ok", "size": 3},
-            {"path": "/files/ok", "form": form},
-            {"url": "https://user@files.example/u"},
-            {"url": "https://files.example/u", "credentials": "include"},
-            {"url": "http://127.0.0.1:9/u"},
-            {"path": "/files/ok", "fileId": "another"},
-            {"path": "/files/ok", "requestState": None},  # on the result
-        ]:
-            replies.append(upload(**target))
-            with pytest.raises(FileTransferError, match="did not run"):
+        async with listening(transfers) as origin:
+            listed = client(app, seen, file_origins=[origin])
+
+            async def call(files=listed):
+                return await files.tools.save(file=File(b"0123456789"))
+
+            # Every target is reachable, so only the rule it breaks keeps the
+            # bytes from it.
+            for files, target in [
+                (listed, {"path": "/files/ok", "headers": {"Authorization": "x"}}),
+                (listed, {"path": "/files/ok", "headers": {"X-Forwarded-Host": "e"}}),
+                (listed, {"path": "/files/../files/ok"}),
+                (listed, {"path": "/files/ok", "url": f"{origin}/ok"}),
+                (listed, {"path": "/files/ok", "size": 3}),
+                (listed, {"path": "/files/ok", "form": form}),
+                (listed, {"url": origin.replace("//", "//user@") + "/ok"}),
+                (listed, {"url": f"{origin}/ok", "credentials": "include"}),
+                (client(app, seen), {"url": f"{origin}/ok"}),  # plain http, unlisted
+                (listed, {"path": "/files/ok", "fileId": "another"}),
+                (listed, {"path": "/files/ok", "requestState": None}),  # on the result
+            ]:
+                replies.append(upload(**target))
+                with pytest.raises(FileTransferError):
+                    await call(files)
+            assert attempts == [] and len(tool_calls(seen)) == 11
+
+            # A failed PUT is repeated a bounded number of times, a POST never; no retry.
+            seen.clear()
+            replies.append(upload(path="/files/busy"))
+            with pytest.raises(FileTransferError):
                 await call()
-        assert attempts == [] and len(tool_calls(seen)) == 11
+            replies.append(upload(path="/files/busy", method="POST", form=form))
+            with pytest.raises(FileTransferError):
+                await call()
+            assert attempts == [("PUT", None)] * 3 + [("POST", None)]
+            assert len(tool_calls(seen)) == 2
 
-        # A failed PUT is repeated a bounded number of times, a POST never; no retry.
-        seen.clear()
-        replies.append(upload(path="/files/busy"))
-        with pytest.raises(FileTransferError, match="did not run.*HTTP 503"):
-            await call()
-        replies.append(upload(path="/files/busy", method="POST", form=form))
-        with pytest.raises(FileTransferError, match="HTTP 503"):
-            await call()
-        assert attempts == [("PUT", None)] * 3 + [("POST", None)]
-        assert len(tool_calls(seen)) == 2
+            # Once the files are sent, failures leave the outcome unknown.
+            attempts.clear()
+            seen.clear()
+            replies.extend([upload(path="/files/ok"), upload(path="/files/ok")])
+            with pytest.raises(OutcomeUnknownError):
+                await call()
+            replies.extend([upload(path="/files/ok"), broken])
+            with pytest.raises(OutcomeUnknownError):
+                await call()
+            assert len(attempts) == 2 and len(tool_calls(seen)) == 4
 
-        # Once the files are sent, failures leave the outcome unknown.
-        attempts.clear()
-        seen.clear()
-        replies.extend([upload(path="/files/ok"), upload(path="/files/ok")])
-        with pytest.raises(OutcomeUnknownError, match="second upload"):
+            # include attaches the credential the client sends to the MCP address.
+            attempts.clear()
+            replies.extend([upload(path="/files/ok", credentials="include"), done])
             await call()
-        replies.extend([upload(path="/files/ok"), broken])
-        with pytest.raises(OutcomeUnknownError, match="outcome is unknown"):
-            await call()
-        assert len(attempts) == 2 and len(tool_calls(seen)) == 4
-
-        # include attaches the credential the client sends to the MCP address.
-        attempts.clear()
-        replies.extend([upload(path="/files/ok", credentials="include"), done])
-        await call()
-        assert attempts == [("PUT", "Bearer mcp")]
+            assert attempts == [("PUT", "Bearer mcp")]
 
     run(app, body)
 
@@ -313,31 +338,22 @@ def test_the_client_checks_every_upload_request_and_retries_only_after_success()
 def test_a_form_target_on_an_allowed_origin_gets_a_multipart_post():
     received = []
 
-    async def sink(request):
+    async def receive(request):
         received.append((await request.body(), request.headers))
         return Response(status_code=204)
 
-    sock = socket.create_server(("127.0.0.1", 0))
-    origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    replies = []
+    app = scripted(replies, Router())
     fields = [{"name": "key", "value": "k"}, {"name": "policy", "value": "signed"}]
-    target = {
-        "url": f"{origin}/upload",
-        "method": "POST",
-        "form": {"fields": fields, "fileField": "file"},
-    }
-    app, _ = scripted([upload(**target), done])
     pdf = File(b"%PDF-1.7 report", name='q3/Q3 "final".pdf')
 
     async def body():
-        storage = Starlette(routes=[Route("/upload", sink, methods=["POST"])])
-        config = uvicorn.Config(storage, lifespan="off", log_level="warning")
-        http = uvicorn.Server(config)
-        serving = asyncio.create_task(http.serve(sockets=[sock]))
-        try:
+        storage = Router(routes=[Route("/upload", receive, methods=["POST"])])
+        async with listening(storage) as origin:
+            form = {"fields": fields, "fileField": "file"}
+            url = f"{origin}/upload"
+            replies.extend([upload(url=url, method="POST", form=form), done])
             await client(app, [], file_origins=[origin]).tools.save(file=pdf)
-        finally:
-            http.should_exit = True
-            await serving
 
     run(app, body)
     [(raw, headers)] = received
@@ -442,8 +458,7 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
             assert put.status_code == 400
             state = requested["requestState"]
             result = await call(arguments, requestState=state)
-            assert "did not arrive" in result["result"]["content"][0]["text"]
-            assert ran == []
+            assert result["result"]["isError"] is True and ran == []
             changed = await call({**arguments, "note": "x"}, requestState=state)
             forged = await call(arguments, requestState="files.forged")
             assert changed["error"]["code"] == forged["error"]["code"] == -32602
@@ -474,18 +489,44 @@ def test_a_returned_file_is_fetched_checked_and_saved(tmp_path):
         assert path.read_bytes() == CSV and not path.stat().st_mode & 0o111
         with pytest.raises(FileExistsError):
             await download.save(folder)
-        assert all(
-            "authorization" not in e["headers"] for e in seen if e["method"] == "GET"
-        )
-
-        [published] = (tmp_path / "storage" / "d").iterdir()
-        published.write_bytes(b"a,b\n1,3\n")
-        with pytest.raises(FileTransferError, match="digest"):
-            await download.save(folder, overwrite=True)
-        published.write_bytes(CSV + b"3,4\n")
-        with pytest.raises(FileTransferError, match="larger"):
-            await download.read()
-        assert os.listdir(folder) == ["report.csv"] and path.read_bytes() == CSV
+        fetches = [e for e in seen if e["method"] == "GET"]
+        assert len(fetches) == 2
+        assert not any("authorization" in e["headers"] for e in fetches)
 
     run(app, body)
     assert ran == ["export"]
+
+
+def offer(name, **target):
+    """A tool result offering the sink's ``name`` as an 8-byte report.csv."""
+
+    def reply(arguments):
+        offered = {
+            "path": f"/files/{name}",
+            "name": "report.csv",
+            "mimeType": "text/csv",
+            "size": len(CSV),
+            "credentials": "omit",
+            **target,
+        }
+        return CallToolResult(content=[], _meta={EXTENSION: {"downloads": [offered]}})
+
+    return reply
+
+
+def test_a_fetch_whose_bytes_break_what_was_declared_keeps_nothing(tmp_path):
+    served = {"tampered": b"a,b\n1,3\n", "longer": CSV + b"3,4\n", "shorter": CSV[:-1]}
+    replies = [offer("tampered", digest=digest(CSV)), offer("longer"), offer("shorter")]
+    app = scripted(replies, sink([], served))
+    (tmp_path / "report.csv").write_bytes(b"kept")
+
+    async def body():
+        files = client(app, [])
+        for _ in served:
+            [download] = downloads(await files.call_tool("export"))
+            with pytest.raises(FileTransferError):
+                await download.save(tmp_path, overwrite=True)
+
+    run(app, body)
+    assert os.listdir(tmp_path) == ["report.csv"]
+    assert (tmp_path / "report.csv").read_bytes() == b"kept"

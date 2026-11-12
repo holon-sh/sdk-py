@@ -55,16 +55,30 @@ class Principal:
 
 
 @dataclass(frozen=True)
+class Caller:
+    """The app a request comes from. A lifecycle hook's job calls as its app."""
+
+    app: str  # as named in holon.yaml
+    session: str  # the namespace of the session both apps run in
+
+
+@dataclass(frozen=True)
 class RequestContext:
-    principal: Principal | None
+    principal: Principal | None  # None when anonymous
+    caller: Caller | None  # None when a person calls the app directly
 
 
 def get_context() -> RequestContext:
-    """The caller of the current MCP request; ``principal`` is ``None`` when anonymous."""
+    """Who the current MCP request comes from: the person and the calling app."""
     admitted = get_access_token()
     extra = (admitted.claims or {}) if admitted else {}
+    # None for a person's direct call, and for an older runtime's raw mesh identity.
+    caller: Caller | None = None
+    match extra.get("caller"):
+        case {"app": str(app), "session": str(session)}:
+            caller = Caller(app, session)
     if admitted is None or admitted.subject is None or "iss" not in extra:
-        return RequestContext(principal=None)
+        return RequestContext(principal=None, caller=caller)
     return RequestContext(
         Principal(
             issuer=extra["iss"],
@@ -73,5 +87,6 @@ def get_context() -> RequestContext:
             scopes=admitted.scopes,
             claims=extra.get("claims", {}),
             actor=extra.get("act"),
-        )
+        ),
+        caller,
     )

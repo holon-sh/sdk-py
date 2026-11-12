@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
@@ -90,3 +91,14 @@ def get_context() -> RequestContext:
         ),
         caller,
     )
+
+
+@dataclass
+class _Request:
+    """The MCP request being served. Tasks it spawns share it, and see when it ends."""
+
+    token: str  # its X-Holon-Context, or "" without one
+    ended: bool = False
+
+
+_request: ContextVar[_Request | None] = ContextVar("holon_request", default=None)

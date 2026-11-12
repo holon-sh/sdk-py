@@ -40,6 +40,7 @@ from mcp.types import (
 )
 from referencing import Registry
 
+from holon.context import _request
 from holon.ext.events import AppEvents
 from holon.ext.files._client import (
     FILES,
@@ -283,7 +284,11 @@ class _App:
                 f"Dependency {self._name} is unavailable ({prefix}URL). Set the endpoint or supply a binding."
             )
         token = os.environ.get(prefix + "TOKEN")
-        headers = {"Authorization": f"Bearer {token}"} if token else None
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        # Inside Holon the platform writes every such endpoint, so the request's context may go to it.
+        request = _request.get()
+        if request is not None and not request.ended and request.token:
+            headers["X-Holon-Context"] = request.token
         return endpoint, partial(http_client, headers=headers)
 
     # Raises an error from the block as itself, not in the session's ExceptionGroup.

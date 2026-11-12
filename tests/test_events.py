@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import socket
 import sys
@@ -9,9 +10,6 @@ import httpx2
 import pytest
 import uvicorn
 from mcp.server import MCPServer, Server
-from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
-from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from mcp.server.auth.provider import AccessToken
 from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.exceptions import MCPError
@@ -33,6 +31,7 @@ from starlette.routing import Mount
 
 from holon.client import Apps
 from holon.ext.events import Events, NoCompatibleDeliveryMode, _server
+from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 
@@ -90,32 +89,25 @@ async def serve(app, port=0):
     return sock.getsockname()[1], stop
 
 
-# An `x-user` header stands in for the caller Holon admits.
+@pytest.fixture(autouse=True)
+def inside_holon(monkeypatch):
+    monkeypatch.setenv("HOLON_PLATFORM", "1")
+
+
 def mounted(events):
-    server = MCPServer("boards", extensions=[events], middleware=[events])
-    server.streamable_http_app(stateless_http=True)
-    manager = server.session_manager
-    app = AuthContextMiddleware(
-        Starlette(
-            routes=[Mount("/mcp", app=events.asgi(manager))],
-            lifespan=lambda app: manager.run(),
-        )
-    )
+    return _asgi(App(MCPServer("boards", extensions=[events], middleware=[events])))
 
-    async def admitted(scope, receive, send):
-        if user := dict(scope.get("headers", [])).get(b"x-user"):
-            claims = {"iss": "https://id.example", "sub": user.decode()}
-            token = AccessToken(
-                token="t",
-                client_id="c",
-                scopes=[],
-                subject=user.decode(),
-                claims=claims,
-            )
-            scope = {**scope, "user": AuthenticatedUser(token)}
-        await app(scope, receive, send)
 
-    return admitted
+# The context Holon's waypoint sends for a signed-in user.
+def signed_in(user):
+    principal = {"iss": "https://id.example", "sub": user, "client_id": "c"}
+    claims = {
+        "exp": 1900000000,
+        "aud": "https://boards.example",
+        "principal": principal,
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
+    return f"e30.{payload.decode()}.signature"
 
 
 @asynccontextmanager
@@ -127,10 +119,11 @@ async def served(events):
         await stop()
 
 
-def client(port, user=None, path="/mcp/"):
+def client(port, user=None, path="/mcp"):
     binding = {"endpoint": f"http://127.0.0.1:{port}{path}"}
     if user:
-        binding["http_client"] = lambda: httpx2.AsyncClient(headers={"x-user": user})
+        headers = {"x-holon-context": signed_in(user)}
+        binding["http_client"] = lambda: httpx2.AsyncClient(headers=headers)
     return Apps(IDENTITY, {}, {"boards": binding}).boards.ext.events
 
 
@@ -157,7 +150,7 @@ def request(method, params, id=1):
 
 
 async def call(http, port, method, params):
-    url = f"http://127.0.0.1:{port}/mcp/"
+    url = f"http://127.0.0.1:{port}/mcp"
     return (await http.post(url, **request(method, params))).json()
 
 
@@ -376,7 +369,7 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
         ]:
             assert (await call(http, port, method, params))["error"]["code"] == code
 
-        url, opened = f"http://127.0.0.1:{port}/mcp/", changed.cursor()
+        url, opened = f"http://127.0.0.1:{port}/mcp", changed.cursor()
         async with http.stream(
             "POST", url, **request("events/stream", changed_on("b1"), id=7)
         ) as stream:

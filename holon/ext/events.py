@@ -18,6 +18,7 @@ import math
 import secrets
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -179,6 +180,13 @@ async def _settle(value: T | Awaitable[T]) -> T:
     return await value if inspect.isawaitable(value) else value
 
 
+# Takes `amount` back from what `key` holds, and forgets a key that holds nothing.
+def _release(counts: Counter[str], key: str, amount: int) -> None:
+    counts[key] -= amount
+    if not counts[key]:
+        del counts[key]
+
+
 @dataclass(frozen=True, eq=False)
 class _Request:
     """A subscription as one request names it, with that request's caller.
@@ -188,6 +196,7 @@ class _Request:
     polls share one lease per arguments, which no targeted event reaches.
     """
 
+    type: EventType[Any, Any]
     id: str
     context: RequestContext
     caller: str
@@ -206,31 +215,32 @@ class _Kept:
 
 @dataclass(eq=False)
 class _Entry:
-    """A subscription held by one or more streams or poll leases, set up once by the type's on_subscribe."""
+    """A subscription held by one or more streams or poll leases.
 
-    ready: asyncio.Future[None]
+    The type's on_subscribe sets it up, apart from any request, when its first hold begins, and its on_unsubscribe
+    tears it down once its last has ended. It stays its type's until that returns, so that one which begins again
+    with the same id waits.
+    """
+
     request: _Request
-    """The request that began it, whose context and arguments on_unsubscribe is given."""
+    """The request that began it, whose context and arguments both hooks are given."""
+    setup: asyncio.Future[None]
     holds: set[_Hold] = field(default_factory=set)
+    teardown: asyncio.Future[None] | None = None
 
 
 @dataclass(eq=False)
 class _Hold:
     """One stream, or one poll lease, holding a subscription."""
 
-    type: EventType[Any, Any]
     request: _Request
     entry: _Entry
-    wake: Callable[[], None]
-    """Told when there is something new for it, or it was ended."""
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set when there is something new for it, or it was ended."""
     ended: ErrorData | None = None
     until: int = 0
-
-
-@dataclass(eq=False)
-class _Lease:
-    hold: _Hold
-    timer: asyncio.TimerHandle | None = None
+    lease: asyncio.TimerHandle | None = None
+    """When a poll lease lapses, unless a poll renews it first."""
 
 
 @dataclass(eq=False, repr=False)
@@ -253,8 +263,6 @@ class EventType(Generic[A, D]):
     _dropped: int = 0
     _bytes: int = 0
     _subscriptions: dict[str, _Entry] = field(default_factory=dict)
-    # Subscriptions being told they ended, which one that begins with the same id waits for.
-    _closing: dict[str, asyncio.Event] = field(default_factory=dict)
 
     def emit(
         self,
@@ -288,7 +296,7 @@ class EventType(Generic[A, D]):
         )
         self._keep(event, size, subscription_id)
         for hold in self._holds(subscription_id):
-            hold.wake()
+            hold.wake.set()
 
     def cursor(self) -> str:
         """The position after the last occurrence emitted.
@@ -310,7 +318,10 @@ class EventType(Generic[A, D]):
         for hold in self._holds(subscription_id):
             if hold.ended is None:
                 hold.ended, hold.until = error, until
-                hold.wake()
+                hold.wake.set()
+                # Nothing waits on a poll lease: it ends at once, and its next poll is told why.
+                if hold.lease is not None:
+                    self._events._close(hold)
 
     def _holds(self, subscription_id: str | None) -> list[_Hold]:
         if subscription_id is None:
@@ -431,8 +442,8 @@ class EventType(Generic[A, D]):
         )
 
     async def _settled(self, id: str) -> None:
-        while (closing := self._closing.get(id)) is not None:
-            await closing.wait()
+        while (entry := self._subscriptions.get(id)) and entry.teardown is not None:
+            await asyncio.shield(entry.teardown)
 
 
 # The manager's own handling of a 2026-07-28 request, answering by stream as it does subscriptions/listen, which is
@@ -496,13 +507,11 @@ class Events(Extension):
         # Cursors of kept events are positions in this process's memory; one from another process names nothing.
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
-        self._held = 0
-        self._callers: dict[str, int] = {}
-        self._leases: dict[str, _Lease] = {}
-        self._tasks: set[asyncio.Future[Any]] = set()
-        self._sending = 0
-        self._sending_by: dict[str, int] = {}
+        # The subscriptions each caller holds, and the bytes each caller's streams are sending.
+        self._held: Counter[str] = Counter()
+        self._sending: Counter[str] = Counter()
         self._sent = asyncio.Event()
+        self._leases: dict[str, _Hold] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def event(
@@ -654,9 +663,10 @@ class Events(Extension):
     async def _poll(
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
-        declared, request = await self._subscription(params, "poll", _streams(ctx))
+        request = await self._subscription(params, "poll", _streams(ctx))
+        declared = request.type
         opened = declared._sequence
-        await self._lease(declared, request)
+        await self._lease(request)
         if params.cursor is None:
             # The sketch: a poll from null "returns no events and provides a fresh cursor".
             answer = {
@@ -694,7 +704,7 @@ class Events(Extension):
     # subscription at once.
     async def _subscription(
         self, params: _SubscribeParams, delivery: Delivery, streams: bool
-    ) -> tuple[EventType[Any, Any], _Request]:
+    ) -> _Request:
         self._loop = self._loop or asyncio.get_running_loop()
         declared = self._types.get(params.name)
         if declared is None:
@@ -740,6 +750,7 @@ class Events(Extension):
             )
             id = f"sub_{hashlib.sha256(canonical.encode()).hexdigest()[:32]}"
         request = _Request(
+            declared,
             id,
             context,
             caller,
@@ -749,26 +760,20 @@ class Events(Extension):
         if not await declared._allows(context, arguments):
             declared.terminate(id, _FORBIDDEN)
             if lease := self._leases.get(id):
-                self._stop(id, lease)
+                self._stop(lease)
             raise MCPError.from_error_data(_FORBIDDEN)
-        return declared, request
+        return request
 
     # Begins holding a subscription, by a stream or a poll lease: counted against the limits first, so a refused one
-    # provisions nothing. The type's on_subscribe runs, apart from the request, when the first hold of an id begins,
-    # and its on_unsubscribe when the last ends. Await `_ready` before serving the hold.
-    def _open(
-        self,
-        declared: EventType[Any, Any],
-        request: _Request,
-        wake: Callable[[], None],
-    ) -> _Hold:
-        if self._held >= _MAX_SUBSCRIPTIONS:
+    # provisions nothing. Await `_settled` before, and `_ready` after.
+    def _open(self, request: _Request) -> _Hold:
+        if self._held.total() >= _MAX_SUBSCRIPTIONS:
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",
                 {"limit": "subscriptions", "max": _MAX_SUBSCRIPTIONS},
             )
-        if self._callers.get(request.caller, 0) >= _MAX_SUBSCRIPTIONS_PER_CALLER:
+        if self._held[request.caller] >= _MAX_SUBSCRIPTIONS_PER_CALLER:
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",
@@ -777,29 +782,29 @@ class Events(Extension):
                     "max": _MAX_SUBSCRIPTIONS_PER_CALLER,
                 },
             )
-        self._held += 1
-        self._callers[request.caller] = self._callers.get(request.caller, 0) + 1
-        entry = declared._subscriptions.get(request.id)
+        self._held[request.caller] += 1
+        subscriptions = request.type._subscriptions
+        entry = subscriptions.get(request.id)
         if entry is None:
-            entry = _Entry(
-                asyncio.ensure_future(self._set_up(declared, request)), request
-            )
-            declared._subscriptions[request.id] = entry
-        hold = _Hold(declared, request, entry, wake)
+            setup = asyncio.ensure_future(self._set_up(request))
+            entry = subscriptions[request.id] = _Entry(request, setup)
+        hold = _Hold(request, entry)
         entry.holds.add(hold)
         return hold
 
-    async def _set_up(self, declared: EventType[Any, Any], request: _Request) -> None:
-        if declared._on_subscribe is None:
+    async def _set_up(self, request: _Request) -> None:
+        if request.type._on_subscribe is None:
             return
         # A hook that never returns would hold its id for good: past the deadline the subscription is refused.
         async with asyncio.timeout(_SUBSCRIBE_TIMEOUT):
             await _settle(
-                declared._on_subscribe(request.context, request.arguments, request.id)
+                request.type._on_subscribe(
+                    request.context, request.arguments, request.id
+                )
             )
 
     async def _ready(self, hold: _Hold) -> None:
-        await asyncio.shield(hold.entry.ready)
+        await asyncio.shield(hold.entry.setup)
         # Ended while it was being set up.
         if hold.ended is not None:
             raise MCPError.from_error_data(hold.ended)
@@ -809,97 +814,71 @@ class Events(Extension):
         if hold not in entry.holds:
             return
         entry.holds.discard(hold)
-        self._held -= 1
-        caller = hold.request.caller
-        if self._callers[caller] == 1:
-            del self._callers[caller]
-        else:
-            self._callers[caller] -= 1
-        if entry.holds:
-            return
-        declared, id = hold.type, hold.request.id
-        if declared._subscriptions.get(id) is entry:
-            del declared._subscriptions[id]
-        closing = declared._closing[id] = asyncio.Event()
-        task = asyncio.ensure_future(self._tear_down(declared, id, entry, closing))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        _release(self._held, hold.request.caller, 1)
+        if not entry.holds:
+            entry.teardown = asyncio.ensure_future(self._tear_down(entry))
 
     # Only a subscription that was set up is told it ended. A hook that fails has nobody to tell but the log, and must
     # not take the process down.
-    async def _tear_down(
-        self,
-        declared: EventType[Any, Any],
-        id: str,
-        entry: _Entry,
-        closing: asyncio.Event,
-    ) -> None:
+    async def _tear_down(self, entry: _Entry) -> None:
+        request = entry.request
         try:
-            await entry.ready
-            if declared._on_unsubscribe is not None:
-                request = entry.request
+            await entry.setup
+            if request.type._on_unsubscribe is not None:
                 await _settle(
-                    declared._on_unsubscribe(request.context, request.arguments, id)
+                    request.type._on_unsubscribe(
+                        request.context, request.arguments, request.id
+                    )
                 )
         except Exception:
             logger.exception(
                 "An event subscription's on_subscribe or on_unsubscribe failed"
             )
         finally:
-            if declared._closing.get(id) is closing:
-                del declared._closing[id]
-            closing.set()
+            del request.type._subscriptions[request.id]
 
     # Poll subscriptions are leased: the first poll of a subscription begins one, each poll renews it, and it ends
     # when polls stop for the lease's length. The poll after the app ended it is answered with why, and the one after
     # that begins afresh.
-    async def _lease(self, declared: EventType[Any, Any], request: _Request) -> _Hold:
-        await declared._settled(request.id)
-        lease = self._leases.get(request.id)
-        if lease is None:
-            hold = self._open(declared, request, lambda: None)
-            # Nothing waits on a lease for new events; ending one tears it down at once.
-            hold.wake = lambda: self._close(hold) if hold.ended is not None else None
-            lease = self._leases[request.id] = _Lease(hold)
+    async def _lease(self, request: _Request) -> None:
+        await request.type._settled(request.id)
+        hold = self._leases.get(request.id)
+        if hold is None:
+            hold = self._leases[request.id] = self._open(request)
         # Renewed before waiting, so that a poll which gives up during setup still lets the lease lapse.
-        if lease.timer is not None:
-            lease.timer.cancel()
-        lease.timer = asyncio.get_running_loop().call_later(
-            _POLL_SUBSCRIPTION_TTL, self._stop, request.id, lease
+        if hold.lease is not None:
+            hold.lease.cancel()
+        hold.lease = asyncio.get_running_loop().call_later(
+            _POLL_SUBSCRIPTION_TTL, self._stop, hold
         )
         try:
-            await self._ready(lease.hold)
+            await self._ready(hold)
         except Exception:
-            self._stop(request.id, lease)
+            self._stop(hold)
             raise
-        return lease.hold
 
-    def _stop(self, id: str, lease: _Lease) -> None:
-        if self._leases.get(id) is lease:
-            del self._leases[id]
-        if lease.timer is not None:
-            lease.timer.cancel()
-        self._close(lease.hold)
+    def _stop(self, hold: _Hold) -> None:
+        if self._leases.get(hold.request.id) is hold:
+            del self._leases[hold.request.id]
+        if hold.lease is not None:
+            hold.lease.cancel()
+        self._close(hold)
 
     # Waits until every stream together, and the caller's own streams, are sending few enough bytes for one more
     # event of `size`. A caller may send a quarter of the whole, so that one cannot hold up the rest.
     @asynccontextmanager
     async def _send_budget(self, size: int, caller: str) -> AsyncIterator[None]:
-        while (self._sending and self._sending + size > _MAX_SENDING_BYTES) or (
-            (mine := self._sending_by.get(caller, 0))
-            and mine + size > _MAX_SENDING_BYTES // 4
+        while (
+            (sending := self._sending.total()) and sending + size > _MAX_SENDING_BYTES
+        ) or (
+            (mine := self._sending[caller]) and mine + size > _MAX_SENDING_BYTES // 4
         ):
             await self._sent.wait()
-        self._sending += size
-        self._sending_by[caller] = self._sending_by.get(caller, 0) + size
+        self._sending[caller] += size
         try:
             yield
         finally:
-            self._sending -= size
-            if self._sending_by[caller] == size:
-                del self._sending_by[caller]
-            else:
-                self._sending_by[caller] -= size
+            _release(self._sending, caller, size)
             self._sent.set()
             self._sent = asyncio.Event()
 
@@ -908,10 +887,10 @@ class Events(Extension):
     async def _stream(
         self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
     ) -> HandlerResult:
-        declared, request = await self._subscription(params, "push", _streams(ctx))
+        request = await self._subscription(params, "push", _streams(ctx))
+        declared = request.type
         await declared._settled(request.id)
-        wake = asyncio.Event()
-        hold = self._open(declared, request, wake.set)
+        hold = self._open(request)
         # Events emitted from here on reach this stream.
         seen = declared._sequence
         try:
@@ -947,7 +926,7 @@ class Events(Extension):
             )
             beat = time.monotonic() + _HEARTBEAT
             while hold.ended is None:
-                wake.clear()
+                hold.wake.clear()
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
                     # Access is checked again while the subscription lasts, and one that is lost ends it.
@@ -974,7 +953,7 @@ class Events(Extension):
                     await send(kept)
                 else:
                     with anyio.move_on_after(beat - time.monotonic()):
-                        await wake.wait()
+                        await hold.wake.wait()
             while (
                 kept := declared._next(seen)
             ) is not None and kept.sequence <= hold.until:

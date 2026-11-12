@@ -38,7 +38,6 @@ def test_get_context_reads_the_caller_holon_admitted():
         ("", [], {"hook": {"event": "installed"}}, None),
         ("web", [], {"sub": "user"}, None),
     ]:
-        # The Holon host builds the access token this way from what it admitted.
         token = AccessToken(
             token="t",
             client_id=client_id,

@@ -57,20 +57,19 @@ from holon.ext.files._wire import (
 )
 
 _STATE = "files."
-# Seconds an upload stays valid, through every retry, and a returned file stays available.
+# Seconds an upload or a returned file stays valid.
 _TTL = 900.0
 
 
 @dataclass(frozen=True)
 class ReceivedFile:
-    """A file argument whose bytes the server checked.
+    """A file argument, its bytes checked against its size and any digest.
 
     Attributes:
-        name: Name the client gave. Untrusted.
-        mime_type: Media type the client claimed. A tool that restricts type
-            inspects the bytes.
-        size: Size in bytes, checked against the bytes.
-        digest: Base64url SHA-256, only when the server verified it.
+        name: Client-given name. Untrusted.
+        mime_type: Client-claimed media type. Untrusted.
+        size: Size in bytes.
+        digest: Base64url SHA-256, when verified.
     """
 
     name: str | None
@@ -115,11 +114,7 @@ class Storage(Protocol):
     async def issue(
         self, key: str, size: int, mime_type: str, expires_at: float
     ) -> UploadTarget:
-        """Return a target that accepts one write of ``size`` bytes for ``key``.
-
-        It must stop accepting writes by ``expires_at`` and keep the staged
-        bytes until then, for every retry the upload's requestState allows.
-        """
+        """Return a target accepting one write of ``size`` bytes for ``key``, kept until ``expires_at``."""
         ...
 
     async def confirm(self, key: str, size: int, digest: str | None) -> Path | None:
@@ -164,24 +159,18 @@ _received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
 
 
 class FileServer:
-    """Accept file arguments in ``tools/call``, as low-level server middleware.
+    """Low-level server middleware that accepts file arguments in ``tools/call``.
 
-    Insert it first, so it wraps any ``RequestStateBoundary``::
+    Insert it first::
 
         server.extensions[EXTENSION] = files.settings()
         server.middleware.insert(0, files)
 
     Args:
-        storage: Where out-of-band files land and returned files are served.
-        tools: Returns a tool's definition (``inputSchema``, ``annotations``)
-            by name, or None. A tool runs at most once per upload unless its
-            annotations set ``idempotentHint``.
-        max_inline_bytes: Largest total of inline file bytes in one request;
-            0 takes every file out of band.
-        codec: Seals ``requestState``. Defaults to a key held by this process.
-
-    An upload is bound to the authenticated user, and stays valid for 15
-    minutes through every retry; a returned file stays available as long.
+        storage: Where uploads are staged and returned files are served.
+        tools: Returns a tool's definition by name, or None.
+        max_inline_bytes: Largest total of inline file bytes per request.
+        codec: Seals ``requestState``. Defaults to a per-process key.
     """
 
     def __init__(
@@ -480,16 +469,12 @@ def _hash_file(path: Path) -> str:
 
 
 class LocalStorage:
-    """``Storage`` on a local directory, for one server process.
+    """``Storage`` in a local directory, for a single server process.
 
-    Mount ``app`` at ``{MCP address}{path}``. Its targets are ``path`` targets
-    authorized by a token alone, sealed with a key this process holds.
-    Consumed nonces live in this process, and files left by a restart are not
-    cleaned up.
+    Mount ``app`` at ``{MCP address}{path}``.
 
     Args:
-        root: Directory for staged uploads and published downloads. Defaults
-            to a temporary directory made on first use and removed at exit.
+        root: Directory for files. Defaults to a temporary directory.
         path: Where ``app`` is mounted, relative to the MCP address.
     """
 
@@ -499,7 +484,7 @@ class LocalStorage:
         self._root = None if root is None else Path(root)
         self._path = path.rstrip("/")
         self._codec = AESGCMRequestStateCodec([os.urandom(32)])
-        self._files: dict[Path, float] = {}  # removed once their time is up
+        self._files: dict[Path, float] = {}
         self._nonces: dict[str, float] = {}
         self.app = Router(
             routes=[

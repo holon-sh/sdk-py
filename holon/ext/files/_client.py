@@ -49,32 +49,25 @@ from holon.ext.files._wire import (
 FILES = advertise(EXTENSION, {"upload": {}, "download": {}})
 _CHUNK = 1 << 16
 _TIMEOUT = httpx2.Timeout(60.0, connect=10.0)
-# The WHATWG multipart/form-data escapes for a filename, and other controls.
+# Filename escapes: https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data
 _QUOTE = {ord('"'): "%22"} | {c: f"%{c:02X}" for c in range(32)}
 
 
 class FileTransferError(RuntimeError):
-    """A file could not be sent or fetched.
-
-    Raised for a call means the tool did not run. Some bytes may already be at
-    the target.
-    """
+    """A file could not be sent or fetched. When a call raises it, the tool did not run."""
 
 
 class OutcomeUnknownError(RuntimeError):
-    """The call failed after its files were sent; the tool may have run.
-
-    Do not repeat the call automatically.
-    """
+    """The call failed after its files were sent, so the tool may have run."""
 
 
 class File:
-    """A file argument: a local path or bytes.
+    """A file argument.
 
     Args:
-        source: Path of a local file, or the file's bytes.
+        source: A local path, or the file's bytes.
         name: Name sent to the server. Defaults to the path's base name.
-        mime_type: Media type. Guessed from ``name`` when omitted.
+        mime_type: Media type. Guessed from ``name`` by default.
     """
 
     def __init__(
@@ -183,7 +176,7 @@ class Transfers:
         return self.origins is not None and _origin(url) in self.origins
 
     def check(self, target: UploadTarget | DownloadTarget) -> None:
-        """The Credentials rules and this binding's origin policy."""
+        """Reject a target the Credentials rules or ``file_origins`` forbid."""
         if "url" not in target:
             if not (
                 self.endpoint.scheme == "https"
@@ -228,7 +221,7 @@ class Transfers:
                     for name in ("authorization", "cookie", "content-type"):
                         if name not in listed:
                             request.headers.pop(name, None)
-                else:  # A fresh client, connected to an address _address allows.
+                else:
                     url = httpx2.URL(target["url"])
                     client = await stack.enter_async_context(
                         httpx2.AsyncClient(trust_env=False, timeout=_TIMEOUT)
@@ -452,14 +445,14 @@ def remember(result: CallToolResult, transfers: Transfers) -> None:
 
 @dataclass(frozen=True)
 class Download:
-    """A file a tool returned. Fetching it is the caller's choice.
+    """A file a tool returned.
 
     Attributes:
-        name: Name the server suggests. Untrusted.
-        mime_type: Media type the server claims. Untrusted.
-        size: Size in bytes; a fetch checks it.
-        digest: Base64url SHA-256 the fetch checks, if the server gave one.
-        expires_at: Time after which the server may refuse the fetch.
+        name: Suggested name. Untrusted.
+        mime_type: Claimed media type. Untrusted.
+        size: Size in bytes.
+        digest: Base64url SHA-256, if given.
+        expires_at: When the server may stop serving it.
     """
 
     name: str | None
@@ -481,20 +474,11 @@ class Download:
     async def save(
         self, directory: str | os.PathLike[str], *, overwrite: bool = False
     ) -> Path:
-        """Fetch the file into ``directory`` under a safe form of its name.
-
-        Args:
-            directory: A directory you control, which nothing runs or loads
-                configuration from.
-            overwrite: Replace a file of the same name.
-
-        Returns:
-            The saved file's path. It is never executable.
+        """Fetch the file into ``directory`` under a sanitized name, and return its path.
 
         Raises:
             FileExistsError: The file exists and ``overwrite`` is False.
-            FileTransferError: The fetch failed or the bytes failed a check;
-                nothing is kept.
+            FileTransferError: The fetch failed or the bytes failed a check.
         """
         destination = Path(directory) / _file_name(
             re.sub(r"[\x00-\x1f\x7f]", "", self.name or "")
@@ -546,8 +530,7 @@ def downloads(result: CallToolResult) -> list[Download]:
     """List the files a tool result offers for download.
 
     Raises:
-        ValueError: A target breaks the extension's rules, or the result did
-            not come from a holon client.
+        ValueError: A target is invalid, or the result did not come from a holon client.
     """
     meta = (result.meta or {}).get(EXTENSION)
     if meta is None:

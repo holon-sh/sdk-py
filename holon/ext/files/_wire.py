@@ -1,4 +1,4 @@
-"""Wire shapes and the rules both sides share, from the draft files extension."""
+"""Shared by the files server and client."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from typing_extensions import TypedDict  # pydantic validates it on Python 3.11
 
 EXTENSION = "io.modelcontextprotocol/files"
 
-# Targets rule 1: no member a type does not define, no value it does not allow.
+# Targets rule 1: no unknown members or values.
 _SHAPE = ConfigDict(extra="forbid", strict=True)
 
 
@@ -108,8 +108,8 @@ def file_input_schema(
 
     Args:
         accept: Media types or dot-prefixed extensions the tool takes.
-        max_size: Largest file in bytes, however it travels.
-        digest: Require a SHA-256 digest, which the server then verifies.
+        max_size: Largest file in bytes.
+        digest: Require a SHA-256 digest.
     """
     descriptor: dict[str, Any] = {}
     if accept is not None:
@@ -229,9 +229,6 @@ def _item_schema(schema: Mapping[str, Any], index: int) -> Any:
     if isinstance(items, list):  # draft 2019-09 tuple form
         prefix, items = items, schema.get("additionalItems")
     return prefix[index] if isinstance(prefix, list) and index < len(prefix) else items
-
-
-# Targets: the rules every upload and download target must pass.
 
 
 class Rejected(Exception): ...

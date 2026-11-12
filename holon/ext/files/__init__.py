@@ -1,9 +1,9 @@
-"""Files in MCP tool calls: the draft ``io.modelcontextprotocol/files`` extension.
+"""Files in MCP tool calls.
 
-Clients pass a :class:`File` where a tool takes a file and read what a tool
-returns with :func:`downloads`. Servers accept file arguments through
-:class:`FileServer`, staging uploads in a :class:`Storage` such as
-:class:`LocalStorage`.
+Clients pass a :class:`File` and read returned files with :func:`downloads`. Servers accept files with
+:class:`FileServer` and a :class:`Storage` such as :class:`LocalStorage`.
+
+https://github.com/modelcontextprotocol/experimental-ext-file-uploads/blob/main/specification/draft/file-uploads.md
 """
 
 from holon.ext.files._client import (

@@ -156,7 +156,6 @@ class _Hold:
     until: int = 0
     lease: asyncio.TimerHandle | None = None
     seen: int = 0
-    """The last sequence a stream has sent."""
 
 
 @dataclass(eq=False, repr=False)
@@ -193,8 +192,7 @@ class EventType(Generic[A, D]):
         Args:
             event_id: The source's own id, so a client drops duplicates.
             timestamp: When it happened. Defaults to now.
-            subscription_id: Send it to this subscription alone. It and what follows it are kept until each of
-                the subscription's open streams has sent it, beyond what the type otherwise keeps.
+            subscription_id: Send it to this subscription alone, and keep it until the subscription's open streams have sent it.
 
         Call it on the event loop that serves the events; from another thread, use ``loop.call_soon_threadsafe``.
         """
@@ -780,23 +778,23 @@ class Events(Extension):
                 if waited.cancelled_caught:
                     raise _Stalled
 
+            async def active(seen: int, truncated: bool) -> None:
+                hold.seen = seen
+                cursor = declared._position(seen)
+                await say("active", {"cursor": cursor, "truncated": truncated})
+
             async def send(kept: _Kept) -> None:
+                hold.seen = kept.sequence
                 try:
                     shaped = declared._shape(kept, request)
                 except Exception as error:  # noqa: BLE001
                     await say("error", {"error": _described(error)})
                     return
                 if shaped is not None:
-                    cursor = declared._position(hold.seen)
+                    cursor = declared._position(kept.sequence)
                     await say("event", {**shaped, "cursor": cursor}, kept.size)
 
-            hold.seen, truncated = declared._resume(
-                params.cursor, params.max_age_ms, hold.seen
-            )
-            await say(
-                "active",
-                {"cursor": declared._position(hold.seen), "truncated": truncated},
-            )
+            await active(*declared._resume(params.cursor, params.max_age_ms, hold.seen))
             beat = time.monotonic() + _HEARTBEAT
             while hold.ended is None:
                 hold.wake.clear()
@@ -815,31 +813,16 @@ class Events(Extension):
                     await say("heartbeat", {"cursor": declared._position(hold.seen)})
                 elif hold.seen < declared._dropped:
                     # Evicted before it was sent: a gap.
-                    hold.seen = declared._dropped
-                    await say(
-                        "active",
-                        {"cursor": declared._position(hold.seen), "truncated": True},
-                    )
+                    await active(declared._dropped, True)
                 elif (kept := declared._next(hold.seen)) is not None:
-                    hold.seen = kept.sequence
                     await send(kept)
                 else:
                     with anyio.move_on_after(beat - time.monotonic()):
                         await hold.wake.wait()
-            while (
-                kept := declared._next(hold.seen)
-            ) is not None and kept.sequence <= hold.until:
-                hold.seen = kept.sequence
+            while (kept := declared._next(hold.seen)) and kept.sequence <= hold.until:
                 await send(kept)
-            if hold.ended is not None:
-                await say(
-                    "terminated",
-                    {
-                        "error": hold.ended.model_dump(
-                            by_alias=True, exclude_none=True, mode="json"
-                        )
-                    },
-                )
+            ended = MCPError.from_error_data(hold.ended)
+            await say("terminated", {"error": _described(ended)})
         except _Stalled:
             logger.info(
                 "Closed a stream of %s whose reader took nothing for two heartbeats",

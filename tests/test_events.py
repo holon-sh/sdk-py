@@ -213,17 +213,21 @@ async def test_a_signed_in_caller_has_one_subscription_per_arguments_and_a_calle
             assert began[3] == began[0]
 
 
+@pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("delivery", ["push", "poll"])
 @asynchronous
-async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries_on(
-    monkeypatch, delivery
+async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries_on_but_a_stream_is_sent_all_emitted_to_its_subscription(
+    monkeypatch, delivery, targeted
 ):
     monkeypatch.setattr(_server, "_KEEP_EVENTS", 2)
-    events, changed = declare()
-    heard = []
+    ids, heard = [], []
+    events, changed = declare(
+        on_subscribe=lambda context, arguments, id: ids.append(id)
+    )
+    owed = delivery == "push" and targeted
     async with (
         served(events) as port,
-        client(port).subscribe(
+        client(port, user="ann").subscribe(
             "board.changed",
             {"board": "b1"},
             delivery=delivery,
@@ -231,30 +235,9 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
         ) as changes,
     ):
         for text in ["a", "b", "c", "d"]:
-            say(changed, "b1", text)
+            say(changed, "b1", text, to=ids[0] if targeted else None)
         heard.extend(await take(changes, 2))
-    assert heard == ["gap", "c", "d"]
-
-
-@asynchronous
-async def test_a_stream_is_sent_everything_emitted_to_its_subscription_past_what_is_kept(
-    monkeypatch,
-):
-    monkeypatch.setattr(_server, "_KEEP_BYTES", 1)
-    ids, heard = [], []
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: ids.append(id)
-    )
-    async with (
-        served(events) as port,
-        client(port).subscribe(
-            "board.changed", {"board": "b1"}, on_gap=lambda: heard.append("gap")
-        ) as changes,
-    ):
-        for text in ["a", "b", "c", "d"]:
-            say(changed, "b1", text, to=ids[0])
-        heard.extend(await take(changes, 4))
-    assert heard == ["a", "b", "c", "d"]
+    assert heard == (["a", "b"] if owed else ["gap", "c", "d"])
 
 
 @asynchronous

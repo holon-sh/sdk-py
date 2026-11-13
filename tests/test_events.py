@@ -190,20 +190,25 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
 @asynchronous
 async def test_a_signed_in_caller_has_one_subscription_per_arguments_and_a_caller_without_an_identity_its_own():
     began, ended = [], []
-    events, _ = declare(
-        on_subscribe=lambda context, arguments, id: began.append(id),
-        on_unsubscribe=lambda context, arguments, id: ended.append(id),
-    )
+
+    def on_subscribe(context, arguments, id):
+        began.append(id)
+        return partial(ended.append, id)
+
+    events, _ = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
         ann, anonymous = client(port, user="ann"), client(port)
-        async with (
-            ann.subscribe("board.changed", {"board": "b1"}),
-            ann.subscribe("board.changed", {"board": "b1"}),
-            anonymous.subscribe("board.changed", {"board": "b1"}),
-            anonymous.subscribe("board.changed", {"board": "b1"}),
-        ):
-            assert len(set(began)) == len(began) == 3
-        await until(lambda: len(ended) == 3)
+        async with ann.subscribe("board.changed", {"board": "b1"}):
+            async with (
+                ann.subscribe("board.changed", {"board": "b1"}),
+                anonymous.subscribe("board.changed", {"board": "b1"}),
+                anonymous.subscribe("board.changed", {"board": "b1"}),
+            ):
+                assert len(set(began)) == len(began) == 3
+            await until(lambda: len(ended) >= 2)
+            assert sorted(ended) == sorted(began[1:])
+        await until(lambda: len(ended) >= 3)
+        assert sorted(ended) == sorted(began)
         async with ann.subscribe("board.changed", {"board": "b1"}):
             assert began[3] == began[0]
 
@@ -263,9 +268,11 @@ async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_
 @asynchronous
 async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless_it_lost_access():
     ids = {}
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: ids.setdefault(arguments.board, id)
-    )
+
+    def on_subscribe(context, arguments, id):
+        ids[arguments.board] = id
+
+    events, changed = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
         boards = client(port, user="ann")
         async with (
@@ -432,10 +439,12 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its
         setting_up.set()
         await release.wait()
 
-    events, _ = declare(
-        on_subscribe=on_subscribe,
-        on_unsubscribe=lambda context, arguments, id: ended.append(id),
-    )
+        async def cleanup():
+            ended.append(id)
+
+        return cleanup
+
+    events, _ = declare(on_subscribe=on_subscribe)
     app, left = mounted(events), asyncio.Event()
 
     # Tells when the server sees the poll that gives up disconnect.

@@ -22,6 +22,7 @@ def emit() -> None:
     changed: EventType[dict[str, str], dict[str, str]] = Events().event(
         "board.changed", input_schema=dict[str, str],
         payload_schema={"type": "object", "additionalProperties": {"type": "string"}},
+        on_subscribe=lambda context, arguments, id: lambda: None,
     )
     changed.emit({"text": "hello"})
     changed.emit("wrong")  # type: ignore[arg-type]

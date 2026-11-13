@@ -77,7 +77,10 @@ T = TypeVar("T")
 Match: TypeAlias = Callable[[RequestContext, Event[D], A], bool]
 Transform: TypeAlias = Callable[[RequestContext, Event[D], A], object]
 Authorize: TypeAlias = Callable[[RequestContext, A], bool | Awaitable[bool]]
-SubscriptionHook: TypeAlias = Callable[[RequestContext, A, str], None | Awaitable[None]]
+Cleanup: TypeAlias = Callable[[], None | Awaitable[None]]
+SubscriptionHook: TypeAlias = Callable[
+    [RequestContext, A, str], Cleanup | None | Awaitable[Cleanup | None]
+]
 
 
 class _SubscribeParams(RequestParams):
@@ -138,9 +141,7 @@ class _Kept:
 class _Entry:
     """A subscription, held by one or more streams or poll leases."""
 
-    request: _Request
-    """The request that began it."""
-    setup: asyncio.Future[None]
+    setup: asyncio.Future[Cleanup | None]
     holds: set[_Hold] = field(default_factory=set)
     teardown: asyncio.Future[None] | None = None
 
@@ -171,7 +172,6 @@ class EventType(Generic[A, D]):
     _delivery: list[Delivery]
     _authorize: Authorize[A] | None
     _on_subscribe: SubscriptionHook[A] | None
-    _on_unsubscribe: SubscriptionHook[A] | None
     # Emitted events, oldest first; `_dropped` is the last sequence evicted.
     _kept: list[_Kept] = field(default_factory=list)
     _sequence: int = 0
@@ -420,7 +420,6 @@ class Events(Extension):
         delivery: Sequence[Delivery] = ("poll", "push"),
         authorize: Authorize[A] | None = None,
         on_subscribe: SubscriptionHook[A] | None = None,
-        on_unsubscribe: SubscriptionHook[A] | None = None,
     ) -> EventType[A, D]:
         """Declare an event type.
 
@@ -434,7 +433,7 @@ class Events(Extension):
             delivery: The delivery modes offered.
             authorize: ``(context, arguments)``: whether the caller may subscribe, checked again while subscribed.
             on_subscribe: ``(context, arguments, subscription_id)``: called when a subscription begins.
-            on_unsubscribe: ``(context, arguments, subscription_id)``: called when it ends.
+                May return a zero-argument cleanup function, called when the subscription ends.
         """
         if name in self._types:
             raise ValueError(f"Event {name} is already declared.")
@@ -461,7 +460,6 @@ class Events(Extension):
             list(delivery),
             authorize,
             on_subscribe,
-            on_unsubscribe,
         )
         self._types[name] = declared
         return declared
@@ -661,16 +659,16 @@ class Events(Extension):
         entry = subscriptions.get(request.id)
         if entry is None:
             setup = asyncio.ensure_future(self._set_up(request))
-            entry = subscriptions[request.id] = _Entry(request, setup)
+            entry = subscriptions[request.id] = _Entry(setup)
         hold = _Hold(request, entry)
         entry.holds.add(hold)
         return hold
 
-    async def _set_up(self, request: _Request) -> None:
+    async def _set_up(self, request: _Request) -> Cleanup | None:
         if request.type._on_subscribe is None:
-            return
+            return None
         async with asyncio.timeout(_SUBSCRIBE_TIMEOUT):
-            await _settle(
+            return await _settle(
                 request.type._on_subscribe(
                     request.context, request.arguments, request.id
                 )
@@ -688,23 +686,17 @@ class Events(Extension):
         entry.holds.discard(hold)
         _release(self._held, hold.request.caller, 1)
         if not entry.holds:
-            entry.teardown = asyncio.ensure_future(self._tear_down(entry))
+            entry.teardown = asyncio.ensure_future(self._tear_down(hold))
 
-    # on_unsubscribe follows only a setup that succeeded; a failing hook is logged.
-    async def _tear_down(self, entry: _Entry) -> None:
-        request = entry.request
+    # Cleanup follows only a setup that succeeded; a failing hook is logged.
+    async def _tear_down(self, hold: _Hold) -> None:
+        request = hold.request
         try:
-            await entry.setup
-            if request.type._on_unsubscribe is not None:
-                await _settle(
-                    request.type._on_unsubscribe(
-                        request.context, request.arguments, request.id
-                    )
-                )
+            cleanup = await hold.entry.setup
+            if cleanup is not None:
+                await _settle(cleanup())
         except Exception:
-            logger.exception(
-                "An event subscription's on_subscribe or on_unsubscribe failed"
-            )
+            logger.exception("An event subscription's setup or cleanup failed")
         finally:
             del request.type._subscriptions[request.id]
 

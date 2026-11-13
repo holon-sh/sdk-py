@@ -10,7 +10,15 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["mcp>=2.3,<3", "jsonschema>=4.26,<5", "httpx2>=2.10,<3"]
+dependencies = [
+    "mcp>=2.3,<3",
+    "jsonschema>=4.26,<5",
+    "httpx2>=2.10,<3",
+    "opentelemetry-api>=1.28,<2",
+    "pydantic>=2.12,<3",
+    "starlette>=0.48,<2",
+    "uvicorn>=0.31.1,<1",
+]
 
 [project.urls]
 Repository = "https://github.com/holon-sh/sdk-py"

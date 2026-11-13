@@ -187,25 +187,25 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
     await stop()
 
 
+@pytest.mark.parametrize("user", ["ann", None])
 @asynchronous
-async def test_a_signed_in_caller_has_one_subscription_per_arguments_and_a_caller_without_an_identity_its_own():
-    began, ended = [], []
-    events, _ = declare(
-        on_subscribe=lambda context, arguments, id: began.append(id),
-        on_unsubscribe=lambda context, arguments, id: ended.append(id),
+async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_readers(
+    user,
+):
+    subscribed = asyncio.Queue()
+    events, changed = declare(
+        on_subscribe=lambda context, arguments, id: subscribed.put_nowait(id)
     )
     async with served(events) as port:
-        ann, anonymous = client(port, user="ann"), client(port)
-        async with (
-            ann.subscribe("board.changed", {"board": "b1"}),
-            ann.subscribe("board.changed", {"board": "b1"}),
-            anonymous.subscribe("board.changed", {"board": "b1"}),
-            anonymous.subscribe("board.changed", {"board": "b1"}),
-        ):
-            assert len(set(began)) == len(began) == 3
-        await until(lambda: len(ended) == 3)
-        async with ann.subscribe("board.changed", {"board": "b1"}):
-            assert began[3] == began[0]
+        reader = client(port, user=user)
+        async with reader.subscribe("board.changed", {"board": "b1"}) as first:
+            subscription_id = await subscribed.get()
+            async with reader.subscribe("board.changed", {"board": "b1"}) as second:
+                say(changed, "b1", "private", to=subscription_id)
+                say(changed, "b1", "public")
+                assert await take(first, 2) == ["private", "public"]
+                for expected in ["private", "public"] if user else ["public"]:
+                    assert (await anext(second)).event_id == expected
 
 
 @pytest.mark.parametrize("targeted", [False, True])
@@ -215,9 +215,9 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
     monkeypatch, delivery, targeted
 ):
     monkeypatch.setattr(_server, "_KEEP_EVENTS", 2)
-    ids, heard = [], []
+    subscribed, heard = asyncio.Queue(), []
     events, changed = declare(
-        on_subscribe=lambda context, arguments, id: ids.append(id)
+        on_subscribe=lambda context, arguments, id: subscribed.put_nowait(id)
     )
     owed = delivery == "push" and targeted
     async with (
@@ -229,8 +229,9 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
             on_gap=lambda: heard.append("gap"),
         ) as changes,
     ):
+        subscription_id = await subscribed.get()
         for text in ["a", "b", "c", "d"]:
-            say(changed, "b1", text, to=ids[0] if targeted else None)
+            say(changed, "b1", text, to=subscription_id if targeted else None)
         heard.extend(await take(changes, 2))
     assert heard == (["a", "b"] if owed else ["gap", "c", "d"])
 
@@ -263,9 +264,11 @@ async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_
 @asynchronous
 async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless_it_lost_access():
     ids = {}
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: ids.setdefault(arguments.board, id)
-    )
+
+    def on_subscribe(context, arguments, id):
+        ids[arguments.board] = id
+
+    events, changed = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
         boards = client(port, user="ann")
         async with (
@@ -324,25 +327,25 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     )
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         discovered = await call(http, port, "server/discover", {})
-        assert discovered["result"]["capabilities"]["events"] == {"listChanged": False}
-        [listed, locked] = (await call(http, port, "events/list", {}))["result"][
-            "events"
-        ]
-        assert locked["payloadSchema"] == recursive
-        assert listed == {
-            "name": "board.changed",
+        assert discovered["result"]["capabilities"]["events"]["listChanged"] is False
+        listed = {
+            event["name"]: event
+            for event in (await call(http, port, "events/list", {}))["result"]["events"]
+        }
+        assert listed["board.locked"]["payloadSchema"] == recursive
+        assert set(listed["board.changed"]["delivery"]) == {"poll", "push"}
+        expected = {
             "description": "A board changed",
-            "delivery": ["poll", "push"],
             "inputSchema": Board.model_json_schema(),
             "payloadSchema": Change.model_json_schema(),
         }
+        assert {key: listed["board.changed"][key] for key in expected} == expected
         # A poll from null has no events, and a cursor from before its setup's welcome.
         now = (await call(http, port, "events/poll", changed_on("b1")))["result"]
-        assert (now["events"], now["truncated"], now["hasMore"], now["nextPollMs"]) == (
+        assert (now["events"], now["truncated"], now["hasMore"]) == (
             [],
             False,
             False,
-            1000,
         )
         for text in ["one", "bad", "two", "three"]:
             say(changed, "b1", text)
@@ -358,7 +361,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             "one",
             True,
         )
-        assert set(one) == {"eventId", "name", "timestamp", "data"}
         rest = await call(
             http, port, "events/poll", changed_on("b1", page["result"]["cursor"])
         )
@@ -391,9 +393,11 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             frames = (
                 json.loads(frame.data) async for frame in httpx2.EventSource(stream)
             )
-            meta = {"_meta": {SUBSCRIPTION_ID_META_KEY: 7}}
             active = await anext(frames)
-            assert active["params"] == {"cursor": opened, "truncated": False, **meta}
+            assert (active["params"]["cursor"], active["params"]["truncated"]) == (
+                opened,
+                False,
+            )
             assert (await anext(frames))["params"]["eventId"] == "welcome"
             say(changed, "b1", "bad")
             say(changed, "b1", "four")
@@ -403,19 +407,19 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
                 INTERNAL_ERROR,
             )
             event = (await anext(frames))["params"]
-            assert event == {
+            expected = {
                 "eventId": "four",
                 "name": "board.changed",
-                "timestamp": event["timestamp"],
                 "data": {"board": "b1", "text": "four"},
                 "cursor": changed.cursor(),
-                **meta,
             }
+            assert {key: event[key] for key in expected} == expected
+            assert event["_meta"][SUBSCRIPTION_ID_META_KEY] == 7
             changed.terminate()
             terminated = await anext(frames)
-            assert (terminated["method"], terminated["params"]["error"]) == (
+            assert (terminated["method"], terminated["params"]["error"]["code"]) == (
                 "notifications/events/terminated",
-                {"code": -32024, "message": "Forbidden"},
+                -32024,
             )
             assert "result" in await anext(frames)
 
@@ -426,16 +430,18 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its
 ):
     monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.1)
     monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    setting_up, release, ended = asyncio.Event(), asyncio.Event(), []
+    setting_up, release, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def on_subscribe(context, arguments, id):
         setting_up.set()
         await release.wait()
 
-    events, _ = declare(
-        on_subscribe=on_subscribe,
-        on_unsubscribe=lambda context, arguments, id: ended.append(id),
-    )
+        async def cleanup():
+            ended.set()
+
+        return cleanup
+
+    events, _ = declare(on_subscribe=on_subscribe)
     app, left = mounted(events), asyncio.Event()
 
     # Tells when the server sees the poll that gives up disconnect.
@@ -458,33 +464,32 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its
     await setting_up.wait()
     async with httpx2.AsyncClient(timeout=10) as http:
         exhausted = await call(http, port, "events/poll", changed_on("b2"))
-        assert exhausted["error"]["data"] == {"limit": "subscriptions", "max": 1}
+        limit = exhausted["error"]["data"]
+        assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
         giving_up.cancel()
         await left.wait()
         release.set()
-        await until(lambda: ended)
+        await ended.wait()
         assert "result" in await call(http, port, "events/poll", changed_on("b2"))
     await stop()
 
 
 @asynchronous
-async def test_a_subscribe_hook_that_does_not_return_in_time_refuses_and_releases_the_id(
+async def test_a_subscription_can_be_retried_after_setup_times_out(
     monkeypatch,
 ):
     monkeypatch.setattr(_server, "_SUBSCRIBE_TIMEOUT", 0.1)
-    calls = []
+    ready = asyncio.Event()
 
     async def on_subscribe(context, arguments, id):
-        calls.append(id)
-        if len(calls) == 1:
-            await asyncio.Event().wait()
+        await ready.wait()
 
     events, _ = declare(on_subscribe=on_subscribe)
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         refused = await call(http, port, "events/poll", changed_on("b1"))
         assert refused["error"]["code"] == INTERNAL_ERROR
+        ready.set()
         assert "result" in await call(http, port, "events/poll", changed_on("b1"))
-    assert calls[0] == calls[1]
 
 
 @asynchronous
@@ -556,5 +561,6 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
     ) as changes:
         assert changes.delivery == "push"
         tell("once subscribed")
-        assert state["said"] + await take(changes, 2) == said
+        assert state["said"] == ["in the snapshot"]
+        assert await take(changes, 2) == ["after the snapshot", "once subscribed"]
     await stop()

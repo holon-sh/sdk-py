@@ -16,6 +16,15 @@ def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path)
 import holon
 import holon.client
 from holon.apps import apps, Inputs, Outputs
+from holon.ext.events import Events, EventType
+
+def emit() -> None:
+    changed: EventType[dict[str, str], dict[str, str]] = Events().event(
+        "board.changed", input_schema=dict[str, str],
+        payload_schema={"type": "object", "additionalProperties": {"type": "string"}},
+    )
+    changed.emit({"text": "hello"})
+    changed.emit("wrong")  # type: ignore[arg-type]
 
 async def run() -> float:
     arguments: Inputs.orders.read = {

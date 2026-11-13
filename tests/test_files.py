@@ -14,6 +14,7 @@ import httpx2
 import pytest
 import uvicorn
 from mcp.server.lowlevel import Server
+from mcp.server.request_state import RequestStateBoundary, RequestStateSecurity
 from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.shared.inbound import (
     MCP_METHOD_HEADER,
@@ -48,6 +49,7 @@ from holon.ext.files import (
     FileTransferError,
     LocalStorage,
     OutcomeUnknownError,
+    ReceivedFile,
     downloads,
     file_input_schema,
 )
@@ -109,15 +111,26 @@ def serve(tmp_path):
                 input_requests={"why": ElicitRequest(params=question)},
                 request_state="asked",
             )
-        for value in arguments.get("files") or [arguments["file"]]:
-            received = files.received(value)
-            if params.name == "save":
-                await received.save(tmp_path / "saved" / Path(received.name).name)
+        if params.name == "save":
+            received: ReceivedFile = arguments["file"]
+            await received.save(tmp_path / "saved" / Path(received.name).name)
+        if params.name == "check":
+            return CallToolResult(
+                content=[],
+                structured_content={
+                    "files": [
+                        (await file.read()).decode() for file in arguments["files"]
+                    ]
+                },
+            )
         return CallToolResult(content=[TextContent(type="text", text="ok")])
 
     server = Server("files", on_list_tools=list_tools, on_call_tool=call_tool)
     server.extensions[EXTENSION] = files.settings()
     server.middleware.insert(0, files)
+    server.middleware.append(
+        RequestStateBoundary(RequestStateSecurity.ephemeral(), default_audience="files")
+    )
     app = server.streamable_http_app(
         stateless_http=True,
         json_response=True,
@@ -479,6 +492,11 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
             changed = await call({**arguments, "note": "x"}, requestState=state)
             forged = await call(arguments, requestState="files.forged")
             assert changed["error"]["code"] == forged["error"]["code"] == INVALID_PARAMS
+
+            checked = await call(
+                {"files": [text_file(data=good, digest=digest(good))]}, name="check"
+            )
+            assert checked["result"]["structuredContent"] == {"files": [good.decode()]}
 
             exported = (await call({}, name="export", declare=False))["result"]
             [_, resource] = exported["content"]

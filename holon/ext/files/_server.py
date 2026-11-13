@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import atexit
 import base64
-import contextvars
 import hashlib
 import json
 import os
@@ -13,9 +12,9 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Final, Literal, Protocol
 from urllib.parse import quote
 
 import anyio
@@ -61,8 +60,7 @@ _STATE = "files."
 _TTL = 900.0
 
 
-@dataclass(frozen=True)
-class ReceivedFile:
+class ReceivedFile(dict[str, Any]):
     """A file argument, its bytes checked against its size and any digest.
 
     Attributes:
@@ -72,11 +70,25 @@ class ReceivedFile:
         digest: Base64url SHA-256, when verified.
     """
 
-    name: str | None
-    mime_type: str
-    size: int
-    digest: str | None
-    _source: Path | bytes
+    __slots__ = ("_source", "digest", "mime_type", "name", "size")
+
+    def __init__(
+        self,
+        name: str | None,
+        mime_type: str,
+        size: int,
+        digest: str | None,
+        source: Path | bytes,
+        *,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        # MCP binds continuation tokens to the original JSON arguments.
+        super().__init__(arguments)
+        self.name: Final = name
+        self.mime_type: Final = mime_type
+        self.size: Final = size
+        self.digest: Final = digest
+        self._source: Final = source
 
     async def read(self) -> bytes:
         if isinstance(self._source, bytes):
@@ -153,13 +165,10 @@ class _FileInput(BaseModel):
 class _Refused(Exception): ...
 
 
-_received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
-    contextvars.ContextVar("holon_files_received", default=None)
-)
-
-
 class FileServer:
     """Low-level server middleware that accepts file arguments in ``tools/call``.
+
+    Handlers receive a ``ReceivedFile`` in place of each checked file argument.
 
     Insert it first::
 
@@ -191,20 +200,6 @@ class FileServer:
         if self._max_inline_bytes:
             return {"upload": {}, "maxInlineBytes": self._max_inline_bytes}
         return {"upload": {}}
-
-    def received(self, file_input: Mapping[str, Any]) -> ReceivedFile:
-        """The checked bytes of a file argument of the current call.
-
-        Raises:
-            LookupError: The argument is not a file of this call.
-        """
-        file_id = file_input.get("id")
-        found = (
-            (_received.get() or {}).get(file_id) if isinstance(file_id, str) else None
-        )
-        if found is None:
-            raise LookupError("not a file argument of this call")
-        return found
 
     async def reply(
         self,
@@ -265,16 +260,18 @@ class FileServer:
         ):
             return await call_next(ctx)
         definition = self._tools(name) or {}
-        found: list[tuple[Any, Mapping[str, Any]]] = []
+        schema = definition.get("inputSchema")
+        if not isinstance(schema, Mapping):
+            return await call_next(ctx)
+        found: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
 
-        def collect(value: Any, marked: Mapping[str, Any]) -> Any:
+        def collect(value: object, marked: Mapping[str, Any]) -> object:
             if not isinstance(value, dict):
                 return None
             found.append((value, marked))
             return value
 
-        if isinstance(schema := definition.get("inputSchema"), Mapping):
-            walk_files(schema, arguments, collect)
+        walk_files(schema, arguments, collect)
         if not found:
             return await call_next(ctx)
         state = params.get("requestState")
@@ -294,9 +291,7 @@ class FileServer:
             received, owed = _inspect(found, self._max_inline_bytes)
         except _Refused as refusal:
             return _error(str(refusal))
-        if record is None and not owed:
-            return await self._run(ctx, call_next, received)
-        if record is None:
+        if record is None and owed:
             if "upload" not in (settings or {}):
                 required = ClientCapabilities(extensions={EXTENSION: {"upload": {}}})
                 data = MissingRequiredClientCapabilityErrorData(
@@ -313,7 +308,7 @@ class FileServer:
                 "f": {},
             }
             uploads = []
-            for file, _ in owed:
+            for file, _, _ in owed:
                 record["f"][file.id] = key = secrets.token_hex(16)
                 target = await self._storage.issue(
                     key, file.size, file.mimeType, record["e"]
@@ -324,43 +319,43 @@ class FileServer:
                 "uploads": uploads,
                 "requestState": self._seal(record, None),
             }
-        for file, digest in owed:  # Step 3: confirm the bytes.
-            key = record["f"].get(file.id)
-            path = key and await self._storage.confirm(key, file.size, digest)
-            if not path:
-                return _error(
-                    f"The bytes of file {file.name or file.id!r} did not arrive intact."
+        inner = dict(params)
+        if record is not None:
+            for file, digest, value in owed:  # Step 3: confirm the bytes.
+                key = record["f"].get(file.id)
+                path = key and await self._storage.confirm(key, file.size, digest)
+                if not path:
+                    return _error(
+                        f"The bytes of file {file.name or file.id!r} did not arrive intact."
+                    )
+                received[file.id] = ReceivedFile(
+                    file.name, file.mimeType, file.size, digest, path, arguments=value
                 )
-            received[file.id] = ReceivedFile(
-                file.name, file.mimeType, file.size, digest, path
-            )
-        annotations = definition.get("annotations") or {}
-        if annotations.get("idempotentHint") is not True and not (
-            await self._storage.consume(record["n"], record["e"])
+            annotations = definition.get("annotations") or {}
+            if annotations.get("idempotentHint") is not True and not (
+                await self._storage.consume(record["n"], record["e"])
+            ):
+                raise _invalid_state()  # Step 4: another retry used this state.
+            inner.pop("requestState")
+            if record["i"] is not None:
+                inner["requestState"] = record["i"]
+
+        inner["arguments"] = walk_files(
+            schema,
+            arguments,
+            lambda value, _: received[value["id"]] if isinstance(value, dict) else None,
+        )
+        result = await call_next(replace(ctx, params=inner))
+        if (
+            record is not None
+            and isinstance(result, dict)
+            and result.get("resultType") == "input_required"
         ):
-            raise _invalid_state()  # Step 4: another retry used this state.
-        inner = {key: value for key, value in params.items() if key != "requestState"}
-        if record["i"] is not None:
-            inner["requestState"] = record["i"]
-        result = await self._run(replace(ctx, params=inner), call_next, received)
-        if isinstance(result, dict) and result.get("resultType") == "input_required":
             return {
                 **result,
                 "requestState": self._seal(record, result.get("requestState")),
             }
         return result
-
-    async def _run(
-        self,
-        ctx: ServerRequestContext[Any, Any],
-        call_next: CallNext,
-        received: dict[str, ReceivedFile],
-    ) -> HandlerResult:
-        token = _received.set(received)
-        try:
-            return await call_next(ctx)
-        finally:
-            _received.reset(token)
 
     def _binding(
         self, ctx: ServerRequestContext[Any, Any], name: str, arguments: Any
@@ -400,10 +395,12 @@ def _canonical(value: Any) -> Any:
 
 
 def _inspect(
-    found: list[tuple[Any, Mapping[str, Any]]], max_inline_bytes: int
-) -> tuple[dict[str, ReceivedFile], list[tuple[_FileInput, str | None]]]:
+    found: list[tuple[dict[str, Any], Mapping[str, Any]]], max_inline_bytes: int
+) -> tuple[
+    dict[str, ReceivedFile], list[tuple[_FileInput, str | None, dict[str, Any]]]
+]:
     received: dict[str, ReceivedFile] = {}
-    owed: list[tuple[_FileInput, str | None]] = []
+    owed: list[tuple[_FileInput, str | None, dict[str, Any]]] = []
     seen: set[str] = set()
     inline = 0
     for value, marked in found:
@@ -428,7 +425,7 @@ def _inspect(
         if verify and digest is None:
             raise _Refused(f"File {label} needs a SHA-256 digest.")
         if file.size and "data" not in file.model_fields_set:
-            owed.append((file, digest))
+            owed.append((file, digest, value))
             continue
         try:
             raw = base64.b64decode(file.data, validate=True)
@@ -442,7 +439,7 @@ def _inspect(
             raise _Refused(f"File {label} does not match its digest.")
         inline += file.size
         received[file.id] = ReceivedFile(
-            file.name, file.mimeType, file.size, digest, raw
+            file.name, file.mimeType, file.size, digest, raw, arguments=value
         )
     if inline > max_inline_bytes:
         raise _Refused("The inline file data is larger than this server accepts.")

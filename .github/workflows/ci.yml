@@ -22,6 +22,20 @@ jobs:
       - run: uv build
       - name: Verify installed wheel and sdist consumers
         run: uv run --no-sync python scripts/verify_distribution.py
+      - uses: actions/checkout@v4
+        with:
+          repository: holon-sh/cli
+          ref: b46bc5980faf8d9a6b4ab19243371466a31daf75
+          path: .cli
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .cli/go.mod
+          cache-dependency-path: .cli/go.sum
+      - name: Verify generated clients against the wheel and sdist
+        run: |
+          for package in dist/*.whl dist/*.tar.gz; do
+            .cli/scripts/test-sdk-consumers python "$package"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: holon-sh

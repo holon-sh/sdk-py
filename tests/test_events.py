@@ -25,12 +25,12 @@ from mcp.types import (
     CallToolResult,
     ErrorData,
 )
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import Events, NoCompatibleDeliveryMode, _server
+from holon.ext.events import Events, EventType, NoCompatibleDeliveryMode, _server
 from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
@@ -53,10 +53,13 @@ def asynchronous(test):
     return run
 
 
-def declare(events=None, **hooks):
+def declare(events=None, **hooks) -> tuple[Events, EventType[Board, Change]]:
     events = events or Events()
     return events, events.event(
-        "board.changed", input_schema=Board, payload_schema=Change, **hooks
+        "board.changed",
+        input_schema=Board,
+        payload_schema=Change.model_json_schema(),
+        **hooks,
     )
 
 
@@ -292,6 +295,16 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
 
 @asynchronous
 async def test_the_messages_on_the_wire_are_the_sketchs():
+    recursive = {
+        "$ref": "#/$defs/Node",
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "properties": {"child": {"$ref": "#/$defs/Node"}},
+            }
+        },
+    }
+
     def shaped(context, event, arguments):
         if event.data.text == "bad":
             raise ValueError("cannot be shaped")
@@ -305,14 +318,17 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     events.event(
         "board.locked",
         input_schema=Board,
-        payload_schema=Change,
+        payload_schema=recursive,
         delivery=["poll"],
         authorize=lambda context, arguments: arguments.board != "secret",
     )
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         discovered = await call(http, port, "server/discover", {})
         assert discovered["result"]["capabilities"]["events"] == {"listChanged": False}
-        [listed, _] = (await call(http, port, "events/list", {}))["result"]["events"]
+        [listed, locked] = (await call(http, port, "events/list", {}))["result"][
+            "events"
+        ]
+        assert locked["payloadSchema"] == recursive
         assert listed == {
             "name": "board.changed",
             "description": "A board changed",
@@ -509,8 +525,8 @@ async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
 @asynchronous
 async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
     events, said = Events(), []
-    changed = events.event(
-        "board.changed", input_schema=Board, payload_schema=TypeAdapter(Change)
+    changed: EventType[Board, Change] = events.event(
+        "board.changed", input_schema=Board, payload_schema=Change.model_json_schema()
     )
 
     def tell(text):

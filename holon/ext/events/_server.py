@@ -413,7 +413,7 @@ class Events(Extension):
         name: str,
         *,
         input_schema: type[A] | TypeAdapter[A],
-        payload_schema: type[D] | TypeAdapter[D],
+        payload_schema: dict[str, Any],
         description: str | None = None,
         match: Match[D, A] | None = None,
         transform: Transform[D, A] | None = None,
@@ -424,9 +424,11 @@ class Events(Extension):
     ) -> EventType[A, D]:
         """Declare an event type.
 
+        Annotate the result as ``EventType[Arguments, Data]`` to type ``emit``.
+
         Args:
             input_schema: Type of a subscription's arguments.
-            payload_schema: Type of each occurrence's data.
+            payload_schema: JSON Schema of each occurrence's data.
             match: ``(context, event, arguments)``: whether a subscription receives an event. Defaults to all.
             transform: ``(context, event, arguments)``: the data a subscription receives.
             delivery: The delivery modes offered.
@@ -443,16 +445,11 @@ class Events(Extension):
             if isinstance(input_schema, TypeAdapter)
             else TypeAdapter(input_schema)
         )
-        payload = (
-            payload_schema
-            if isinstance(payload_schema, TypeAdapter)
-            else TypeAdapter(payload_schema)
-        )
         descriptor = {
             "name": name,
             **({"description": description} if description else {}),
             "inputSchema": arguments.json_schema(),
-            "payloadSchema": payload.json_schema(),
+            "payloadSchema": payload_schema,
         }
         declared = EventType(
             name,

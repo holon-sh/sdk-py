@@ -13,9 +13,28 @@ def test_generated_namespace_combines_app_types_with_installed_runtime(tmp_path)
         Path(__file__).parent / "fixtures/caller", tmp_path, dirs_exist_ok=True
     )
     (tmp_path / "check.py").write_text("""from pathlib import Path
+from dataclasses import dataclass
+from pydantic import TypeAdapter
 import holon
 import holon.client
 from holon.apps import apps, Inputs, Outputs
+from holon.ext.events import Events, EventType
+
+@dataclass
+class Board:
+    id: str
+
+@dataclass
+class Change:
+    text: str
+
+def emit() -> None:
+    changed: EventType[Board, Change] = Events().event(
+        "board.changed", input_schema=Board,
+        payload_schema=TypeAdapter(Change).json_schema(),
+    )
+    changed.emit(Change(text="hello"))
+    changed.emit("wrong")  # type: ignore[arg-type]
 
 async def run() -> float:
     arguments: Inputs.orders.read = {

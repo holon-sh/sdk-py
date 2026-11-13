@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   # publish-dev.yml runs this first on every merge to main.
   workflow_call:
+    inputs:
+      version:
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -19,6 +23,11 @@ jobs:
       - run: uv sync
       - run: uv run --no-sync pytest
       - run: uv run --no-sync mypy --strict -p holon
+      - name: Set the package version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: uv version --frozen "$VERSION"
       - run: uv build
       - name: Verify installed wheel and sdist consumers
         run: uv run --no-sync python scripts/verify_distribution.py

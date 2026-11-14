@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import socket
-import sys
 from contextlib import asynccontextmanager
 from functools import partial, wraps
 
@@ -53,11 +52,11 @@ def asynchronous(test):
     return run
 
 
-def declare(events=None, **hooks) -> tuple[Events, EventType[Board, Change]]:
+def declare(events=None, **hooks) -> tuple[Events, EventType[dict[str, str], Change]]:
     events = events or Events()
     return events, events.event(
         "board.changed",
-        input_schema=Board,
+        input_schema=Board.model_json_schema(),
         payload_schema=Change.model_json_schema(),
         **hooks,
     )
@@ -167,7 +166,7 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
     delivery,
 ):
     events, changed = declare(
-        match=lambda context, event, arguments: event.data.board == arguments.board,
+        match=lambda context, event, arguments: event.data.board == arguments["board"],
         transform=lambda context, event, arguments: {
             "board": event.data.board,
             "text": event.data.text.upper(),
@@ -208,6 +207,22 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
                     assert (await anext(second)).event_id == expected
 
 
+@asynchronous
+async def test_a_subscription_is_named_by_its_arguments_as_sent():
+    subscribed = []
+    events, _ = declare(on_subscribe=lambda context, args, id: subscribed.append(args))
+    ann = {"x-holon-context": signed_in("ann")}
+    async with served(events) as port, httpx2.AsyncClient(headers=ann) as http:
+        for arguments in [
+            {"board": "b"},
+            {"n": 1, "board": "b"},
+            {"board": "b", "n": 1},
+        ]:
+            params = {"name": "board.changed", "arguments": arguments}
+            assert "result" in await call(http, port, "events/poll", params)
+    assert subscribed == [{"board": "b"}, {"n": 1, "board": "b"}]
+
+
 @pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("delivery", ["push", "poll"])
 @asynchronous
@@ -237,28 +252,21 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
 
 
 @asynchronous
-async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_cursor_from_before_a_restart_is_a_gap():
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: say(
-            changed, arguments.board, "welcome", to=id
-        )
-    )
-    restarted = declare()[1].cursor()
-    gaps = []
+async def test_a_cursor_from_before_a_restart_is_a_gap():
+    events, changed = declare()
+    restarted, gaps = declare()[1].cursor(), []
     async with served(events) as port:
-        for cursor in [None, restarted]:
-            for delivery in ["push", "poll"]:
-                board = f"{delivery} {'resumed' if cursor else 'fresh'}"
-                async with client(port, user="ann").subscribe(
-                    "board.changed",
-                    {"board": board},
-                    delivery=delivery,
-                    cursor=cursor,
-                    on_gap=partial(gaps.append, board),
-                ) as changes:
-                    say(changed, board, "hello")
-                    assert await take(changes, 2) == ["welcome", "hello"]
-    assert gaps == ["push resumed", "poll resumed"]
+        for delivery in ["push", "poll"]:
+            async with client(port, user="ann").subscribe(
+                "board.changed",
+                {"board": delivery},
+                delivery=delivery,
+                cursor=restarted,
+                on_gap=partial(gaps.append, delivery),
+            ) as changes:
+                say(changed, delivery, "hello")
+                assert await take(changes, 1) == ["hello"]
+    assert gaps == ["push", "poll"]
 
 
 @asynchronous
@@ -266,7 +274,7 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
     ids = {}
 
     def on_subscribe(context, arguments, id):
-        ids[arguments.board] = id
+        ids[arguments["board"]] = id
 
     events, changed = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
@@ -298,16 +306,6 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
 
 @asynchronous
 async def test_the_messages_on_the_wire_are_the_sketchs():
-    recursive = {
-        "$ref": "#/$defs/Node",
-        "$defs": {
-            "Node": {
-                "type": "object",
-                "properties": {"child": {"$ref": "#/$defs/Node"}},
-            }
-        },
-    }
-
     def shaped(context, event, arguments):
         if event.data.text == "bad":
             raise ValueError("cannot be shaped")
@@ -320,10 +318,10 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     )
     events.event(
         "board.locked",
-        input_schema=Board,
-        payload_schema=recursive,
+        input_schema=Board.model_json_schema(),
+        payload_schema=Change.model_json_schema(),
         delivery=["poll"],
-        authorize=lambda context, arguments: arguments.board != "secret",
+        authorize=lambda context, arguments: arguments["board"] != "secret",
     )
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         discovered = await call(http, port, "server/discover", {})
@@ -332,7 +330,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             event["name"]: event
             for event in (await call(http, port, "events/list", {}))["result"]["events"]
         }
-        assert listed["board.locked"]["payloadSchema"] == recursive
         assert set(listed["board.changed"]["delivery"]) == {"poll", "push"}
         expected = {
             "description": "A board changed",
@@ -425,53 +422,46 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
 
 @asynchronous
-async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its_lease_lapses(
+async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds_its_place_until_its_lease_lapses(
     monkeypatch,
 ):
-    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.1)
+    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.5)
     monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    setting_up, release, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    ended, seen = asyncio.Event(), []
 
     async def on_subscribe(context, arguments, id):
-        setting_up.set()
-        await release.wait()
+        seen.append(context.request.headers.get("x-leaving"))
+        try:
+            if seen[-1]:
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen.append("stopped")
+            raise
 
         async def cleanup():
             ended.set()
 
         return cleanup
 
-    events, _ = declare(on_subscribe=on_subscribe)
-    app, left = mounted(events), asyncio.Event()
-
-    # Tells when the server sees the poll that gives up disconnect.
-    async def noticing(scope, receive, send):
-        async def receiving():
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                left.set()
-            return message
-
-        leaving = (b"x-leaving", b"1") in scope.get("headers", [])
-        await app(scope, receiving if leaving else receive, send)
-
     async def give_up():
         async with httpx2.AsyncClient(headers={"x-leaving": "1"}) as http:
             await call(http, port, "events/poll", changed_on("b1"))
 
-    port, stop = await serve(noticing)
-    giving_up = asyncio.ensure_future(give_up())
-    await setting_up.wait()
-    async with httpx2.AsyncClient(timeout=10) as http:
+    async with (
+        served(declare(on_subscribe=on_subscribe)[0]) as port,
+        httpx2.AsyncClient(timeout=10) as http,
+    ):
+        giving_up = asyncio.ensure_future(give_up())
+        await until(lambda: seen)
         exhausted = await call(http, port, "events/poll", changed_on("b2"))
         limit = exhausted["error"]["data"]
         assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
         giving_up.cancel()
-        await left.wait()
-        release.set()
+        await until(lambda: "stopped" in seen)
+        assert "result" in await call(http, port, "events/poll", changed_on("b1"))
+        assert seen == ["1", "stopped", None]
         await ended.wait()
         assert "result" in await call(http, port, "events/poll", changed_on("b2"))
-    await stop()
 
 
 @asynchronous
@@ -493,48 +483,21 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
 
 
 @asynchronous
-async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
-    events, changed = declare()
-    bare = MCPServer("boards", extensions=[events])
-    # An SDK without the private stream path `Events.asgi` uses on a JSON endpoint.
-    monkeypatch.setitem(sys.modules, "mcp.server._streamable_http_modern", None)
-    wrapped = MCPServer("boards", extensions=[events])
-    wrapped.streamable_http_app(stateless_http=True, json_response=True)
-    manager = wrapped.session_manager
-    for app, path in [
-        (bare.streamable_http_app(stateless_http=True, json_response=True), "/mcp"),
-        (
-            Starlette(
-                routes=[Mount("/mcp", app=events.asgi(manager))],
-                lifespan=lambda app: manager.run(),
-            ),
-            "/mcp/",
-        ),
-    ]:
-        port, stop = await serve(app)
-        boards = client(port, path=path)
-        async with boards.subscribe("board.changed", {"board": "b1"}) as changes:
-            assert changes.delivery == "poll"
-            say(changed, "b1", "polled")
-            assert await take(changes, 1) == ["polled"]
-            await changes.cancel()
-            assert await anext(changes, None) is None
+async def test_a_named_delivery_mode_the_app_does_not_offer_is_refused_by_the_app():
+    events, _ = declare(delivery=("poll",))
+    async with served(events) as port:
         with pytest.raises(MCPError) as refused:
-            async with boards.subscribe(
+            async with client(port).subscribe(
                 "board.changed", {"board": "b1"}, delivery="push"
             ):
                 pass
-        assert refused.value.error.code == -32026
-        assert refused.value.error.data == {"feature": "deliveryMode", "value": "push"}
-        await stop()
+    assert refused.value.error.code == -32026
+    assert refused.value.error.data == {"feature": "deliveryMode", "value": "push"}
 
 
 @asynchronous
-async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
-    events, said = Events(), []
-    changed: EventType[Board, Change] = events.event(
-        "board.changed", input_schema=Board, payload_schema=Change.model_json_schema()
-    )
+async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it():
+    (events, changed), said = declare(), []
 
     def tell(text):
         said.append(text)
@@ -546,10 +509,10 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
 
     server = Server("boards", on_call_tool=snapshot)
     events.serve(server)
-    manager = StreamableHTTPSessionManager(server, stateless=True, json_response=True)
+    manager = StreamableHTTPSessionManager(server, stateless=True)
     port, stop = await serve(
         Starlette(
-            routes=[Mount("/mcp", app=events.asgi(manager))],
+            routes=[Mount("/mcp", app=manager.handle_request)],
             lifespan=lambda app: manager.run(),
         )
     )

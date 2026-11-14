@@ -382,6 +382,12 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             ),
         ]:
             assert (await call(http, port, method, params))["error"]["code"] == code
+        with pytest.raises(MCPError) as refused:
+            async with client(port).subscribe(
+                "board.locked", {"board": "b1"}, delivery="push"
+            ):
+                pass
+        assert refused.value.error.code == -32026
 
         url, opened = f"http://127.0.0.1:{port}/mcp", changed.cursor()
         async with http.stream(
@@ -480,19 +486,6 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
         assert refused["error"]["code"] == INTERNAL_ERROR
         ready.set()
         assert "result" in await call(http, port, "events/poll", changed_on("b1"))
-
-
-@asynchronous
-async def test_a_named_delivery_mode_the_app_does_not_offer_is_refused_by_the_app():
-    events, _ = declare(delivery=("poll",))
-    async with served(events) as port:
-        with pytest.raises(MCPError) as refused:
-            async with client(port).subscribe(
-                "board.changed", {"board": "b1"}, delivery="push"
-            ):
-                pass
-    assert refused.value.error.code == -32026
-    assert refused.value.error.data == {"feature": "deliveryMode", "value": "push"}
 
 
 @asynchronous

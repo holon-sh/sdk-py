@@ -1,7 +1,8 @@
 """Files in MCP tool calls.
 
 Clients pass a :class:`File` and read returned files with :func:`downloads`. Servers accept files with
-:class:`FileServer` and a :class:`Storage` such as :class:`LocalStorage`.
+:class:`FileServer` and a :class:`Storage` such as :class:`LocalStorage`; a tool declares each file argument a
+:class:`ReceivedFile`.
 
 https://github.com/modelcontextprotocol/experimental-ext-file-uploads/blob/main/specification/draft/file-uploads.md
 """

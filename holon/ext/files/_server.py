@@ -13,9 +13,9 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol, final
 from urllib.parse import quote
 
 import anyio
@@ -38,6 +38,7 @@ from mcp.types import (
     TextContent,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic_core import CoreSchema, core_schema
 from starlette import status
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, Response
@@ -50,6 +51,7 @@ from holon.ext.files._wire import (
     b64url,
     declared,
     digest_required,
+    file_input_schema,
     media_type,
     sha256,
     walk_files,
@@ -61,22 +63,49 @@ _STATE = "files."
 _TTL = 900.0
 
 
-@dataclass(frozen=True)
+@final
 class ReceivedFile:
-    """A file argument, its bytes checked against its size and any digest.
+    """A file argument of the current call, its bytes checked against its size and any digest.
+
+    A tool takes one by declaring an argument ``ReceivedFile``. ``ReceivedFile(value)`` decodes
+    an argument's value where Pydantic does not, such as in a msgspec ``dec_hook``.
 
     Attributes:
         name: Client-given name. Untrusted.
         mime_type: Client-claimed media type. Untrusted.
         size: Size in bytes.
         digest: Base64url SHA-256, when verified.
+
+    Raises:
+        ValueError: ``value`` is not a file argument of the current call.
     """
 
+    __slots__ = ("_source", "digest", "mime_type", "name", "size")
     name: str | None
     mime_type: str
     size: int
     digest: str | None
     _source: Path | bytes
+
+    def __new__(cls, value: object) -> ReceivedFile:
+        file_id = value.get("id") if isinstance(value, dict) else None
+        found = (
+            (_received.get() or {}).get(file_id) if isinstance(file_id, str) else None
+        )
+        if found is None:
+            raise ValueError("not a file argument of this call")
+        return found
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"ReceivedFile.{name} is read-only")
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, *_: object) -> CoreSchema:
+        return core_schema.no_info_plain_validator_function(cls)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, *_: object) -> dict[str, Any]:
+        return file_input_schema()
 
     async def read(self) -> bytes:
         if isinstance(self._source, bytes):
@@ -153,6 +182,16 @@ class _FileInput(BaseModel):
 class _Refused(Exception): ...
 
 
+def _verified(
+    file: _FileInput, digest: str | None, source: Path | bytes
+) -> ReceivedFile:
+    made = object.__new__(ReceivedFile)
+    values = (source, digest, file.mimeType, file.name, file.size)
+    for slot, value in zip(ReceivedFile.__slots__, values, strict=True):
+        object.__setattr__(made, slot, value)
+    return made
+
+
 _received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
     contextvars.ContextVar("holon_files_received", default=None)
 )
@@ -161,7 +200,7 @@ _received: contextvars.ContextVar[dict[str, ReceivedFile] | None] = (
 class FileServer:
     """Low-level server middleware that accepts file arguments in ``tools/call``.
 
-    Insert it first::
+    Tools declare each file argument as a ``ReceivedFile``. Insert it first::
 
         server.extensions[EXTENSION] = files.settings()
         server.middleware.insert(0, files)
@@ -191,20 +230,6 @@ class FileServer:
         if self._max_inline_bytes:
             return {"upload": {}, "maxInlineBytes": self._max_inline_bytes}
         return {"upload": {}}
-
-    def received(self, file_input: Mapping[str, Any]) -> ReceivedFile:
-        """The checked bytes of a file argument of the current call.
-
-        Raises:
-            LookupError: The argument is not a file of this call.
-        """
-        file_id = file_input.get("id")
-        found = (
-            (_received.get() or {}).get(file_id) if isinstance(file_id, str) else None
-        )
-        if found is None:
-            raise LookupError("not a file argument of this call")
-        return found
 
     async def reply(
         self,
@@ -331,9 +356,7 @@ class FileServer:
                 return _error(
                     f"The bytes of file {file.name or file.id!r} did not arrive intact."
                 )
-            received[file.id] = ReceivedFile(
-                file.name, file.mimeType, file.size, digest, path
-            )
+            received[file.id] = _verified(file, digest, path)
         annotations = definition.get("annotations") or {}
         if annotations.get("idempotentHint") is not True and not (
             await self._storage.consume(record["n"], record["e"])
@@ -441,9 +464,7 @@ def _inspect(
         if digest is not None and sha256(raw) != digest:
             raise _Refused(f"File {label} does not match its digest.")
         inline += file.size
-        received[file.id] = ReceivedFile(
-            file.name, file.mimeType, file.size, digest, raw
-        )
+        received[file.id] = _verified(file, digest, raw)
     if inline > max_inline_bytes:
         raise _Refused("The inline file data is larger than this server accepts.")
     return received, owed

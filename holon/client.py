@@ -23,6 +23,7 @@ from mcp import Client
 from mcp.client import Transport
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
 from mcp.types import (
     LATEST_PROTOCOL_VERSION,
     CallToolRequest,
@@ -139,6 +140,25 @@ class ToolCallError(RuntimeError):
         super().__init__(f"{app}.{tool}: {message}")
 
 
+class _RefusedError(ToolCallError):
+    def __init__(self, app: str, response: httpx2.Response) -> None:
+        detail = " ".join(response.text.split()) or response.headers.get(
+            "www-authenticate", ""
+        )
+        if len(detail) > _DETAIL:
+            detail = detail[:_DETAIL] + "…"
+        message = f"HTTP {response.status_code} {response.reason_phrase}"
+        if detail:
+            message = f"{message}: {detail}"
+        self.result = CallToolResult(
+            is_error=True, content=[TextContent(type="text", text=message)]
+        )
+        RuntimeError.__init__(self, f"{app}: {message}")
+
+
+_DETAIL = 300
+
+
 async def _declare_elicitation(
     context: ClientRequestContext, params: ElicitRequestParams
 ) -> ElicitResult:
@@ -234,6 +254,7 @@ class _App:
             The complete result, or an input-required result for questions left unanswered.
 
         Raises:
+            ToolCallError: The dependency answered with an HTTP error status, named with its body.
             ValueError: The output does not match the contract, or the dependency is undeclared.
             RuntimeError: The dependency has no endpoint.
             holon.ext.files.FileTransferError: A file was not sent; the tool did not run.
@@ -299,9 +320,23 @@ class _App:
         transfers: Transfers | None = None,
     ) -> AsyncIterator[Client]:
         endpoint, http_client = self._connection(timeout)
+        refusals: list[httpx2.Response] = []
+        target = httpx2.URL(endpoint)
+
+        async def note(response: httpx2.Response) -> None:
+            request = response.request
+            if (
+                response.status_code >= 400
+                and request.method == "POST"
+                and request.url == target
+            ):
+                await response.aread()
+                refusals.append(response)
+
         failure: Exception | None = None
         try:
             async with http_client() as http:
+                http.event_hooks["response"].append(note)
                 if transfers is not None:
                     transfers.bind(endpoint, http_client, http)
                 transport: Transport = streamable_http_client(
@@ -322,9 +357,10 @@ class _App:
                         yield client
                     except Exception as error:  # noqa: BLE001
                         failure = error
-        except Exception:
-            if failure is None:
-                raise
+        except Exception as error:  # noqa: BLE001
+            failure = failure or error
+        if refusals and isinstance(failure, MCPError):
+            raise _RefusedError(self._name, refusals[-1]) from failure
         if failure is not None:
             raise failure
 

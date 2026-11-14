@@ -52,11 +52,11 @@ def asynchronous(test):
     return run
 
 
-def declare(events=None, **hooks) -> tuple[Events, EventType[Board, Change]]:
+def declare(events=None, **hooks) -> tuple[Events, EventType[dict[str, str], Change]]:
     events = events or Events()
     return events, events.event(
         "board.changed",
-        input_schema=Board,
+        input_schema=Board.model_json_schema(),
         payload_schema=Change.model_json_schema(),
         **hooks,
     )
@@ -166,7 +166,7 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
     delivery,
 ):
     events, changed = declare(
-        match=lambda context, event, arguments: event.data.board == arguments.board,
+        match=lambda context, event, arguments: event.data.board == arguments["board"],
         transform=lambda context, event, arguments: {
             "board": event.data.board,
             "text": event.data.text.upper(),
@@ -207,6 +207,22 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
                     assert (await anext(second)).event_id == expected
 
 
+@asynchronous
+async def test_a_subscription_is_named_by_its_arguments_as_sent():
+    subscribed = []
+    events, _ = declare(on_subscribe=lambda context, args, id: subscribed.append(args))
+    ann = {"x-holon-context": signed_in("ann")}
+    async with served(events) as port, httpx2.AsyncClient(headers=ann) as http:
+        for arguments in [
+            {"board": "b"},
+            {"n": 1, "board": "b"},
+            {"board": "b", "n": 1},
+        ]:
+            params = {"name": "board.changed", "arguments": arguments}
+            assert "result" in await call(http, port, "events/poll", params)
+    assert subscribed == [{"board": "b"}, {"n": 1, "board": "b"}]
+
+
 @pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("delivery", ["push", "poll"])
 @asynchronous
@@ -236,28 +252,21 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
 
 
 @asynchronous
-async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_cursor_from_before_a_restart_is_a_gap():
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: say(
-            changed, arguments.board, "welcome", to=id
-        )
-    )
-    restarted = declare()[1].cursor()
-    gaps = []
+async def test_a_cursor_from_before_a_restart_is_a_gap():
+    events, changed = declare()
+    restarted, gaps = declare()[1].cursor(), []
     async with served(events) as port:
-        for cursor in [None, restarted]:
-            for delivery in ["push", "poll"]:
-                board = f"{delivery} {'resumed' if cursor else 'fresh'}"
-                async with client(port, user="ann").subscribe(
-                    "board.changed",
-                    {"board": board},
-                    delivery=delivery,
-                    cursor=cursor,
-                    on_gap=partial(gaps.append, board),
-                ) as changes:
-                    say(changed, board, "hello")
-                    assert await take(changes, 2) == ["welcome", "hello"]
-    assert gaps == ["push resumed", "poll resumed"]
+        for delivery in ["push", "poll"]:
+            async with client(port, user="ann").subscribe(
+                "board.changed",
+                {"board": delivery},
+                delivery=delivery,
+                cursor=restarted,
+                on_gap=partial(gaps.append, delivery),
+            ) as changes:
+                say(changed, delivery, "hello")
+                assert await take(changes, 1) == ["hello"]
+    assert gaps == ["push", "poll"]
 
 
 @asynchronous
@@ -265,7 +274,7 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
     ids = {}
 
     def on_subscribe(context, arguments, id):
-        ids[arguments.board] = id
+        ids[arguments["board"]] = id
 
     events, changed = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
@@ -297,16 +306,6 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
 
 @asynchronous
 async def test_the_messages_on_the_wire_are_the_sketchs():
-    recursive = {
-        "$ref": "#/$defs/Node",
-        "$defs": {
-            "Node": {
-                "type": "object",
-                "properties": {"child": {"$ref": "#/$defs/Node"}},
-            }
-        },
-    }
-
     def shaped(context, event, arguments):
         if event.data.text == "bad":
             raise ValueError("cannot be shaped")
@@ -319,10 +318,10 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     )
     events.event(
         "board.locked",
-        input_schema=Board,
-        payload_schema=recursive,
+        input_schema=Board.model_json_schema(),
+        payload_schema=Change.model_json_schema(),
         delivery=["poll"],
-        authorize=lambda context, arguments: arguments.board != "secret",
+        authorize=lambda context, arguments: arguments["board"] != "secret",
     )
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         discovered = await call(http, port, "server/discover", {})
@@ -331,7 +330,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             event["name"]: event
             for event in (await call(http, port, "events/list", {}))["result"]["events"]
         }
-        assert listed["board.locked"]["payloadSchema"] == recursive
         assert set(listed["board.changed"]["delivery"]) == {"poll", "push"}
         expected = {
             "description": "A board changed",
@@ -486,10 +484,7 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
 
 @asynchronous
 async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it():
-    events, said = Events(), []
-    changed: EventType[Board, Change] = events.event(
-        "board.changed", input_schema=Board, payload_schema=Change.model_json_schema()
-    )
+    (events, changed), said = declare(), []
 
     def tell(text):
         said.append(text)

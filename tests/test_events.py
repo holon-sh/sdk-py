@@ -4,7 +4,7 @@ import json
 import socket
 import sys
 from contextlib import asynccontextmanager
-from functools import partial, wraps
+from functools import wraps
 
 import httpx2
 import pytest
@@ -163,7 +163,7 @@ def changed_on(board, cursor=None):
 
 @pytest.mark.parametrize("delivery", ["push", "poll"])
 @asynchronous
-async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_dropped_connection(
+async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_dropped_connection_and_says_it_is_reconnecting(
     delivery,
 ):
     events, changed = declare(
@@ -174,8 +174,12 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
         },
     )
     port, stop = await serve(mounted(events))
+    statuses = []
     async with client(port).subscribe(
-        "board.changed", {"board": "b1"}, delivery=delivery
+        "board.changed",
+        {"board": "b1"},
+        delivery=delivery,
+        on_status=statuses.append,
     ) as changes:
         say(changed, "b2", "elsewhere")
         say(changed, "b1", "one")
@@ -185,6 +189,11 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
         port, stop = await serve(mounted(events), port)
         assert await take(changes, 1) == ["two"]
     await stop()
+    # A poll can fall between the server stopping and starting again.
+    assert statuses in (
+        [["connected", "reconnecting", "connected"]]
+        + ([["connected"]] if delivery == "poll" else [])
+    )
 
 
 @pytest.mark.parametrize("user", ["ann", None])
@@ -226,14 +235,16 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
             "board.changed",
             {"board": "b1"},
             delivery=delivery,
-            on_gap=lambda: heard.append("gap"),
+            on_status=heard.append,
         ) as changes,
     ):
         subscription_id = await subscribed.get()
         for text in ["a", "b", "c", "d"]:
             say(changed, "b1", text, to=subscription_id if targeted else None)
         heard.extend(await take(changes, 2))
-    assert heard == (["a", "b"] if owed else ["gap", "c", "d"])
+    assert heard == (
+        ["connected", "a", "b"] if owed else ["connected", "gap", "c", "d"]
+    )
 
 
 @asynchronous
@@ -254,11 +265,14 @@ async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_
                     {"board": board},
                     delivery=delivery,
                     cursor=cursor,
-                    on_gap=partial(gaps.append, board),
+                    on_status=lambda status, board=board: gaps.append((board, status)),
                 ) as changes:
                     say(changed, board, "hello")
                     assert await take(changes, 2) == ["welcome", "hello"]
-    assert gaps == ["push resumed", "poll resumed"]
+    assert [board for board, status in gaps if status == "gap"] == [
+        "push resumed",
+        "poll resumed",
+    ]
 
 
 @asynchronous

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias
 
 import anyio
 from mcp import Client
@@ -132,7 +132,7 @@ class AppEvents:
         cursor: str | None = None,
         max_age: float | None = None,
         delivery: Delivery | None = None,
-        on_gap: Callable[[], object] | None = None,
+        on_status: Callable[[Status], object] | None = None,
     ) -> Subscription[Any]:
         """Subscribe to an event type.
 
@@ -142,19 +142,25 @@ class AppEvents:
             cursor: Where to resume from. Defaults to now.
             max_age: Seconds; older events are not replayed.
             delivery: ``"push"`` or ``"poll"``. Defaults to push when offered.
-            on_gap: Called when events were skipped.
+            on_status: Called, in order with the events, as the subscription's status changes:
+                ``"connected"`` when the app confirms it, ``"reconnecting"`` when the connection is lost
+                and it reconnects from its cursor, and ``"gap"`` when the app confirms it after skipping
+                events, for example after a restart. On a gap, read the current state again.
 
         Returns:
             A :class:`Subscription` to enter with ``async with`` and iterate.
         """
         return Subscription(
-            self, name, dict(arguments or {}), cursor, max_age, delivery, on_gap
+            self, name, dict(arguments or {}), cursor, max_age, delivery, on_status
         )
 
 
+Status: TypeAlias = Literal["connected", "reconnecting", "gap"]
+
+
 @dataclass(frozen=True)
-class _Gap:
-    pass
+class _Status:
+    status: Status
 
 
 @dataclass(frozen=True)
@@ -182,7 +188,7 @@ class Subscription(Generic[D]):
         cursor: str | None,
         max_age: float | None,
         delivery: Delivery | None,
-        on_gap: Callable[[], object] | None,
+        on_status: Callable[[Status], object] | None,
     ) -> None:
         self.cursor = cursor
         self.delivery = delivery
@@ -192,7 +198,8 @@ class Subscription(Generic[D]):
         self._request: dict[str, Any] = {"name": name, "arguments": arguments}
         if max_age is not None:
             self._request["maxAgeMs"] = round(max_age * 1000)
-        self._on_gap = on_gap
+        self._on_status = on_status
+        self._status: Status | None = None
         # Where the next request resumes, ahead of `cursor`.
         self._reached = cursor
         self._settled = anyio.Event()
@@ -201,7 +208,7 @@ class Subscription(Generic[D]):
         self._seen: dict[str, None] = {}
         # Unbuffered, so a reader that stops reading stops the stream.
         self._send, self._receive = anyio.create_memory_object_stream[
-            Event[Any] | _Gap | _Reached
+            Event[Any] | _Status | _Reached
         ]()
         self._group: anyio.abc.TaskGroup | None = None
         self._running = anyio.CancelScope()
@@ -255,9 +262,9 @@ class Subscription(Generic[D]):
                 if self._failure is not None:
                     raise self._failure from None
                 raise StopAsyncIteration from None
-            if isinstance(item, _Gap):
-                if self._on_gap is not None:
-                    self._on_gap()
+            if isinstance(item, _Status):
+                if self._on_status is not None:
+                    self._on_status(item.status)
             elif isinstance(item, _Reached):
                 self.cursor = item.cursor
             else:
@@ -302,6 +309,12 @@ class Subscription(Generic[D]):
     def _confirm(self) -> None:
         self._active = True
         self._settled.set()
+
+    # A gap is reported each time; a status only when it changes, since every poll confirms the subscription.
+    async def _report(self, status: Status) -> None:
+        if status == "gap" or status != self._status:
+            self._status = status
+            await self._send.send(_Status(status))
 
     async def _reach(self, cursor: str | None) -> None:
         self._reached = cursor
@@ -355,10 +368,10 @@ class Subscription(Generic[D]):
             except Exception as error:
                 if not self._active or _refused(error):
                     raise
+                await self._report("reconnecting")
             else:
                 self._confirm()
-                if result.get("truncated"):
-                    await self._send.send(_Gap())
+                await self._report("gap" if result.get("truncated") else "connected")
                 for occurrence in result.get("events", []):
                     await self._deliver(occurrence)
                 await self._reach(result.get("cursor"))
@@ -386,6 +399,7 @@ class Subscription(Generic[D]):
                 raise TimeoutError(
                     f"{self._app._name} did not confirm the subscription to {self._name}."
                 )
+            await self._report("reconnecting")
             await anyio.sleep(1)
 
     # The stream is not quiet while a notification waits for the reader.
@@ -396,8 +410,7 @@ class Subscription(Generic[D]):
         try:
             if method == "notifications/events/active":
                 self._confirm()
-                if params.get("truncated"):
-                    await self._send.send(_Gap())
+                await self._report("gap" if params.get("truncated") else "connected")
                 await self._reach(params.get("cursor"))
             elif method == "notifications/events/event":
                 await self._deliver(params)

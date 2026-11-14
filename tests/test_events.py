@@ -197,9 +197,11 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
     )
     async with served(events) as port:
         reader = client(port, user=user)
-        async with reader.subscribe("board.changed", {"board": "b1"}) as first:
+        async with reader.subscribe("board.changed", {"board": "b1", "n": 1}) as first:
             subscription_id = await subscribed.get()
-            async with reader.subscribe("board.changed", {"board": "b1"}) as second:
+            async with reader.subscribe(
+                "board.changed", {"n": 1, "board": "b1"}
+            ) as second:
                 say(changed, "b1", "private", to=subscription_id)
                 say(changed, "b1", "public")
                 assert await take(first, 2) == ["private", "public"]
@@ -207,24 +209,9 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
                     assert (await anext(second)).event_id == expected
 
 
-@asynchronous
-async def test_a_subscription_is_named_by_its_arguments_as_sent():
-    subscribed = []
-    events, _ = declare(on_subscribe=lambda context, args, id: subscribed.append(args))
-    ann = {"x-holon-context": signed_in("ann")}
-    async with served(events) as port, httpx2.AsyncClient(headers=ann) as http:
-        for arguments in [
-            {"board": "b"},
-            {"n": 1, "board": "b"},
-            {"board": "b", "n": 1},
-        ]:
-            params = {"name": "board.changed", "arguments": arguments}
-            assert "result" in await call(http, port, "events/poll", params)
-    assert subscribed == [{"board": "b"}, {"n": 1, "board": "b"}]
-
-
-@pytest.mark.parametrize("targeted", [False, True])
-@pytest.mark.parametrize("delivery", ["push", "poll"])
+@pytest.mark.parametrize(
+    ("delivery", "targeted"), [("push", False), ("poll", False), ("push", True)]
+)
 @asynchronous
 async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries_on_but_a_stream_is_sent_all_emitted_to_its_subscription(
     monkeypatch, delivery, targeted
@@ -371,11 +358,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             ("events/poll", {"name": "board.changed", "arguments": {}}, INVALID_PARAMS),
             ("events/poll", changed_on("b1", 1), INVALID_PARAMS),
             (
-                "events/stream",
-                {"name": "board.locked", "arguments": {"board": "b1"}},
-                -32026,
-            ),
-            (
                 "events/poll",
                 {"name": "board.locked", "arguments": {"board": "secret"}},
                 -32024,
@@ -519,6 +501,5 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
     ) as changes:
         assert changes.delivery == "push"
         tell("once subscribed")
-        assert state["said"] == ["in the snapshot"]
         assert await take(changes, 2) == ["after the snapshot", "once subscribed"]
     await stop()

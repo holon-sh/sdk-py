@@ -34,7 +34,11 @@ from holon.ext.events import Events
 
 __all__ = ["App", "load", "serve"]
 
-_MCP = re.compile(r"/mcp(/[^/]+)?")
+# On the path before percent-decoding: a segment that decodes to . or .., holds an encoded slash, or is not valid
+# percent-encoding is not an MCP path.
+_MCP = re.compile(
+    rb"/mcp(/(?!(?:\.|%2[Ee]){1,2}\Z)(?:[^/%]|%(?!2[Ff])[0-9A-Fa-f]{2})+)?"
+)
 _CONTEXT = re.compile(r"[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+")
 _CALLER = re.compile(r"([^/]+)/([^/]+)")
 _MALFORMED = PlainTextResponse(
@@ -120,7 +124,7 @@ def _asgi(app: App) -> ASGIApp:
             for name, value in headers
             if not name.startswith(b"x-holon-") and name != b"authorization"
         ]
-        if not _MCP.fullmatch(scope["path"]):
+        if not _MCP.fullmatch(scope.get("raw_path") or scope["path"].encode()):
             frontend = app.frontend if scope["method"] in ("GET", "HEAD") else None
             await _page(frontend, scope["path"])(scope, receive, send)
             return

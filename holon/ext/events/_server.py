@@ -151,6 +151,7 @@ class _Hold:
     entry: _Entry
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     ended: ErrorData | None = None
+    closing: bool = False
     until: int = 0
     lease: asyncio.TimerHandle | None = None
     seen: int = 0
@@ -374,6 +375,18 @@ class Events(Extension):
         self._sent = asyncio.Event()
         self._leases: dict[str, _Hold] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    def close(self) -> None:
+        """Initiate graceful closure of every open stream.
+
+        Each stream then sends its ``StreamEventsResult`` as its final frame, which tells its client that the
+        server closed the stream and not the subscription: the client opens it again from its cursor. Call it
+        when the server is about to stop. It does not wait for the streams to finish.
+        """
+        for declared in self._types.values():
+            for hold in declared._holds(None):
+                hold.closing = True
+                hold.wake.set()
 
     def event(
         self,
@@ -719,7 +732,7 @@ class Events(Extension):
 
             await active(*declared._resume(params.cursor, params.max_age_ms, hold.seen))
             beat = time.monotonic() + _HEARTBEAT
-            while hold.ended is None:
+            while hold.ended is None and not hold.closing:
                 hold.wake.clear()
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
@@ -740,6 +753,8 @@ class Events(Extension):
                 else:
                     with anyio.move_on_after(beat - time.monotonic()):
                         await hold.wake.wait()
+            if hold.ended is None:
+                return {"_meta": {}}
             while (kept := declared._next(hold.seen)) and kept.sequence <= hold.until:
                 await send(kept)
             ended = MCPError.from_error_data(hold.ended)

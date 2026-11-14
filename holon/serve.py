@@ -8,6 +8,7 @@ import importlib
 import mimetypes
 import os
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -28,6 +29,7 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import _Request, _request
+from holon.ext.events import Events
 
 __all__ = ["App", "load", "serve"]
 
@@ -80,7 +82,15 @@ async def serve(app: App) -> None:
         ws="none",
         timeout_graceful_shutdown=1,
     )
-    await uvicorn.Server(config).serve()
+
+    class Server(uvicorn.Server):
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            for each in app.server.middleware:
+                if isinstance(each, Events):
+                    each.close()
+            await super().shutdown(sockets)
+
+    await Server(config).serve()
 
 
 def _asgi(app: App) -> ASGIApp:

@@ -15,7 +15,16 @@ import uvicorn
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context
+from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.shared.exceptions import MCPError
+from mcp.shared.inbound import MCP_METHOD_HEADER, MCP_PROTOCOL_VERSION_HEADER
+from mcp.types import (
+    CLIENT_CAPABILITIES_META_KEY,
+    CLIENT_INFO_META_KEY,
+    JSONRPC_VERSION,
+    LATEST_PROTOCOL_VERSION,
+    PROTOCOL_VERSION_META_KEY,
+)
 from opentelemetry import propagate
 from starlette.datastructures import Headers
 from starlette.responses import RedirectResponse, Response
@@ -316,7 +325,7 @@ async def test_the_frontend_serves_its_files_and_nothing_hidden_or_outside_it(
         assert (await http.get("/")).status_code == 404
 
 
-def test_python_m_holon_serve_runs_an_entry_with_a_16_kib_context_and_stops_on_sigterm(
+def test_python_m_holon_serve_runs_an_entry_with_a_16_kib_context_and_on_sigterm_closes_its_event_streams_and_stops(
     tmp_path,
 ):
     (tmp_path / "src").mkdir()
@@ -325,8 +334,11 @@ def test_python_m_holon_serve_runs_an_entry_with_a_16_kib_context_and_stops_on_s
     (tmp_path / "src/server.py").write_text(
         """from mcp.server import MCPServer
 from holon.context import get_context
+from holon.ext.events import Events
 
-server = MCPServer("large")
+events = Events()
+events.event("ticked", input_schema={"type": "object"}, payload_schema={"type": "object"})
+server = MCPServer("large", extensions=[events], middleware=[events])
 frontend = "web"
 
 
@@ -370,10 +382,39 @@ def subject() -> str:
         writer.close()
         result = await call(origin + "/mcp", "subject", {"x-holon-context": token})
         assert result.structured_content == {"result": subject}
+        meta = {
+            PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
+            CLIENT_INFO_META_KEY: {"name": "test", "version": "1"},
+            CLIENT_CAPABILITIES_META_KEY: {},
+        }
+        stream = {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 7,
+            "method": "events/stream",
+            "params": {"name": "ticked", "arguments": {}, "_meta": meta},
+        }
+        headers = {
+            "accept": f"{CONTENT_TYPE_JSON}, {CONTENT_TYPE_SSE}",
+            MCP_PROTOCOL_VERSION_HEADER: LATEST_PROTOCOL_VERSION,
+            MCP_METHOD_HEADER: "events/stream",
+            "x-holon-context": token,
+        }
+        async with (
+            httpx2.AsyncClient() as http,
+            http.stream("POST", origin + "/mcp", json=stream, headers=headers) as sent,
+        ):
+            frames = sent.aiter_lines()
+            while not (await anext(frames)).startswith("data: "):
+                pass
+            process.send_signal(signal.SIGTERM)
+            last = [frame async for frame in frames if frame.startswith("data: ")][-1]
+        closed = json.loads(last.removeprefix("data: "))
+        assert closed["id"] == 7 and "result" in closed
 
     try:
         asyncio.run(asyncio.wait_for(exercise(), timeout=20))
-    finally:
-        process.send_signal(signal.SIGTERM)
-        _, errors = process.communicate(timeout=10)
+    except BaseException:
+        process.kill()
+        raise
+    _, errors = process.communicate(timeout=10)
     assert "Application shutdown complete" in errors

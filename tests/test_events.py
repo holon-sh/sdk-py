@@ -429,13 +429,12 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds
 ):
     monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.5)
     monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    setting_up, ended, seen = asyncio.Event(), asyncio.Event(), []
+    ended, seen = asyncio.Event(), []
 
     async def on_subscribe(context, arguments, id):
         seen.append(context.request.headers.get("x-leaving"))
         try:
             if seen[-1]:
-                setting_up.set()
                 await asyncio.Event().wait()
         except asyncio.CancelledError:
             seen.append("stopped")
@@ -446,38 +445,25 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds
 
         return cleanup
 
-    events, _ = declare(on_subscribe=on_subscribe)
-    app, left = mounted(events), asyncio.Event()
-
-    # Tells when the server sees the poll that gives up disconnect.
-    async def noticing(scope, receive, send):
-        async def receiving():
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                left.set()
-            return message
-
-        leaving = (b"x-leaving", b"1") in scope.get("headers", [])
-        await app(scope, receiving if leaving else receive, send)
-
     async def give_up():
         async with httpx2.AsyncClient(headers={"x-leaving": "1"}) as http:
             await call(http, port, "events/poll", changed_on("b1"))
 
-    port, stop = await serve(noticing)
-    giving_up = asyncio.ensure_future(give_up())
-    await setting_up.wait()
-    async with httpx2.AsyncClient(timeout=10) as http:
+    async with (
+        served(declare(on_subscribe=on_subscribe)[0]) as port,
+        httpx2.AsyncClient(timeout=10) as http,
+    ):
+        giving_up = asyncio.ensure_future(give_up())
+        await until(lambda: seen)
         exhausted = await call(http, port, "events/poll", changed_on("b2"))
         limit = exhausted["error"]["data"]
         assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
         giving_up.cancel()
-        await left.wait()
+        await until(lambda: "stopped" in seen)
         assert "result" in await call(http, port, "events/poll", changed_on("b1"))
         assert seen == ["1", "stopped", None]
         await ended.wait()
         assert "result" in await call(http, port, "events/poll", changed_on("b2"))
-    await stop()
 
 
 @asynchronous

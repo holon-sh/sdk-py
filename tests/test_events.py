@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import socket
-import sys
 from contextlib import asynccontextmanager
 from functools import partial, wraps
 
@@ -30,7 +29,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import Events, EventType, NoCompatibleDeliveryMode, _server
+from holon.ext.events import Events, EventType, _server
 from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
@@ -500,42 +499,7 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
 
 
 @asynchronous
-async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
-    events, changed = declare()
-    bare = MCPServer("boards", extensions=[events])
-    # An SDK without the private stream path `Events.asgi` uses on a JSON endpoint.
-    monkeypatch.setitem(sys.modules, "mcp.server._streamable_http_modern", None)
-    wrapped = MCPServer("boards", extensions=[events])
-    wrapped.streamable_http_app(stateless_http=True, json_response=True)
-    manager = wrapped.session_manager
-    for app, path in [
-        (bare.streamable_http_app(stateless_http=True, json_response=True), "/mcp"),
-        (
-            Starlette(
-                routes=[Mount("/mcp", app=events.asgi(manager))],
-                lifespan=lambda app: manager.run(),
-            ),
-            "/mcp/",
-        ),
-    ]:
-        port, stop = await serve(app)
-        boards = client(port, path=path)
-        async with boards.subscribe("board.changed", {"board": "b1"}) as changes:
-            assert changes.delivery == "poll"
-            say(changed, "b1", "polled")
-            assert await take(changes, 1) == ["polled"]
-            await changes.cancel()
-            assert await anext(changes, None) is None
-        with pytest.raises(NoCompatibleDeliveryMode):
-            async with boards.subscribe(
-                "board.changed", {"board": "b1"}, delivery="push"
-            ):
-                pass
-        await stop()
-
-
-@asynchronous
-async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
+async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it():
     events, said = Events(), []
     changed: EventType[Board, Change] = events.event(
         "board.changed", input_schema=Board, payload_schema=Change.model_json_schema()
@@ -551,10 +515,10 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
 
     server = Server("boards", on_call_tool=snapshot)
     events.serve(server)
-    manager = StreamableHTTPSessionManager(server, stateless=True, json_response=True)
+    manager = StreamableHTTPSessionManager(server, stateless=True)
     port, stop = await serve(
         Starlette(
-            routes=[Mount("/mcp", app=events.asgi(manager))],
+            routes=[Mount("/mcp", app=manager.handle_request)],
             lifespan=lambda app: manager.run(),
         )
     )

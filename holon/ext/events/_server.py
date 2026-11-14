@@ -22,10 +22,7 @@ import anyio
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.lowlevel.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.server.transport_security import RequestBodyLimitMiddleware
 from mcp.shared.exceptions import MCPError
-from mcp.shared.inbound import MCP_METHOD_HEADER
 from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
 from mcp.types import (
     INTERNAL_ERROR,
@@ -38,7 +35,6 @@ from mcp.types import (
 )
 from pydantic import Field, StrictInt, StrictStr, TypeAdapter, ValidationError
 from pydantic_core import to_json, to_jsonable_python
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import get_context
 from holon.ext.events._wire import (
@@ -55,8 +51,6 @@ from holon.ext.events._wire import (
 logger = logging.getLogger(__package__)
 
 _MAX_POLL_EVENTS = 1000
-# Set on a request that came through `Events.asgi`, whose answer can be a stream.
-_STREAMS = "holon.ext.events.streams"
 # What each event type keeps of what it emits: seconds, events, and bytes of JSON data.
 _KEEP_AGE = 600.0
 _KEEP_EVENTS = 10_000
@@ -359,42 +353,11 @@ class EventType(Generic[A, D]):
             await asyncio.shield(entry.teardown)
 
 
-# The SDK's private handler, which streams a 2026-07-28 request even on a JSON endpoint, when this SDK has it.
-def _streaming(manager: StreamableHTTPSessionManager) -> ASGIApp | None:
-    try:
-        from mcp.server._streamable_http_modern import handle_modern_request
-    except ImportError:
-        return None
-    expected = ["app", "security_settings", "json_response", "lifespan_state"]
-    expected += ["scope", "receive", "send"]
-    taken = list(inspect.signature(handle_modern_request).parameters)
-    if taken != expected or not hasattr(manager, "_lifespan_state"):
-        return None
-
-    async def stream(scope: Scope, receive: Receive, send: Send) -> None:
-        await handle_modern_request(
-            manager.app,
-            manager.security_settings,
-            False,
-            manager._lifespan_state,
-            scope,
-            receive,
-            send,
-        )
-
-    return RequestBodyLimitMiddleware(stream, manager.max_request_body_size)
-
-
-def _streams(ctx: ServerRequestContext[Any, Any]) -> bool:
-    # Over stdio every request can stream; over HTTP, only one that came through `Events.asgi`.
-    return ctx.request is None or bool(ctx.request.scope.get(_STREAMS))
-
-
 class Events(Extension):
     """The event types an app serves as MCP Events.
 
     Pass it to ``MCPServer(extensions=[events], middleware=[events])``, or call :meth:`serve` on a low-level
-    ``Server``. Over Streamable HTTP, push is offered only on an endpoint mounted through :meth:`asgi`.
+    ``Server``. Push needs an endpoint whose answers can stream: over Streamable HTTP, not ``json_response=True``.
     """
 
     identifier = EVENTS_EXTENSION
@@ -501,25 +464,6 @@ class Events(Extension):
                 }
         return result
 
-    def asgi(self, manager: StreamableHTTPSessionManager) -> ASGIApp:
-        """The endpoint of ``manager``, with push.
-
-        Mount it where ``manager.handle_request`` would be, inside any authentication.
-        """
-        streaming = _streaming(manager)
-
-        async def app(scope: Scope, receive: Receive, send: Send) -> None:
-            method = dict(scope.get("headers", [])).get(MCP_METHOD_HEADER.encode())
-            if scope["type"] == "http" and not manager.json_response:
-                scope = {**scope, _STREAMS: True}
-            elif scope["type"] == "http" and streaming and method is not None:
-                scope = {**scope, _STREAMS: True}
-                if method == b"events/stream":
-                    return await streaming(scope, receive, send)
-            await manager.handle_request(scope, receive, send)
-
-        return app
-
     async def _list(
         self, ctx: ServerRequestContext[Any, Any], params: PaginatedRequestParams
     ) -> HandlerResult:
@@ -528,14 +472,12 @@ class Events(Extension):
         if not cursor.isdigit():
             raise MCPError(INVALID_PARAMS, "Invalid cursor for events/list")
         start = int(cursor)
-        streams = _streams(ctx)
-        listed = []
-        for each in list(self._types.values())[start : start + _LIST_PAGE_SIZE]:
-            if delivery := [
-                mode for mode in each._delivery if streams or mode != "push"
-            ]:
-                listed.append({**each._descriptor, "delivery": delivery})
-        result: dict[str, Any] = {"events": listed}
+        listed = list(self._types.values())[start : start + _LIST_PAGE_SIZE]
+        result: dict[str, Any] = {
+            "events": [
+                {**each._descriptor, "delivery": each._delivery} for each in listed
+            ]
+        }
         if start + _LIST_PAGE_SIZE < len(self._types):
             result["nextCursor"] = str(start + _LIST_PAGE_SIZE)
         return result
@@ -584,9 +526,7 @@ class Events(Extension):
         declared = self._types.get(params.name)
         if declared is None:
             raise MCPError.from_error_data(_NOT_FOUND)
-        if delivery not in declared._delivery or (
-            delivery == "push" and not _streams(ctx)
-        ):
+        if delivery not in declared._delivery:
             raise MCPError(
                 UNSUPPORTED,
                 "Unsupported",

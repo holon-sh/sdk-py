@@ -8,6 +8,7 @@ import importlib
 import mimetypes
 import os
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -18,6 +19,7 @@ from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
+from mcp.server.subscriptions import ListenHandler
 from mcp.server.transport_security import TransportSecuritySettings
 from opentelemetry import context as tracing
 from opentelemetry import propagate
@@ -28,6 +30,7 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import _Request, _request
+from holon.ext.events import Events
 
 __all__ = ["App", "load", "serve"]
 
@@ -80,7 +83,20 @@ async def serve(app: App) -> None:
         ws="none",
         timeout_graceful_shutdown=1,
     )
-    await uvicorn.Server(config).serve()
+
+    class Server(uvicorn.Server):
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            listen = app.server.session_manager.app.get_request_handler(
+                "subscriptions/listen"
+            )
+            if listen is not None and isinstance(listen.handler, ListenHandler):
+                listen.handler.close()
+            for each in app.server.middleware:
+                if isinstance(each, Events):
+                    each.close()
+            await super().shutdown(sockets)
+
+    await Server(config).serve()
 
 
 def _asgi(app: App) -> ASGIApp:

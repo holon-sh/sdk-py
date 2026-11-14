@@ -374,6 +374,21 @@ class Events(Extension):
         self._sent = asyncio.Event()
         self._leases: dict[str, _Hold] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._closed = False
+
+    def close(self) -> None:
+        """Initiate graceful closure of every open stream, and of each one opened from now on.
+
+        Each stream then sends its ``StreamEventsResult`` as its final frame, which tells its client that the
+        server closed the stream and not the subscription: the client opens it again from its cursor. Call it
+        when the server is about to stop, on the event loop that serves the events. It does not wait for the
+        streams to finish.
+        """
+        self._on_loop()
+        self._closed = True
+        for declared in self._types.values():
+            for hold in declared._holds(None):
+                hold.wake.set()
 
     def event(
         self,
@@ -516,8 +531,8 @@ class Events(Extension):
         self._loop = self._loop or running
         if running is None or running is not self._loop:
             raise RuntimeError(
-                "Events are emitted on the event loop that serves them. From another thread, call "
-                "loop.call_soon_threadsafe(event_type.emit, data)."
+                "Events are emitted and closed on the event loop that serves them. From another thread, "
+                "use loop.call_soon_threadsafe."
             )
 
     # Checked in the order of https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#error-codes
@@ -719,7 +734,7 @@ class Events(Extension):
 
             await active(*declared._resume(params.cursor, params.max_age_ms, hold.seen))
             beat = time.monotonic() + _HEARTBEAT
-            while hold.ended is None:
+            while hold.ended is None and not self._closed:
                 hold.wake.clear()
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
@@ -740,6 +755,8 @@ class Events(Extension):
                 else:
                     with anyio.move_on_after(beat - time.monotonic()):
                         await hold.wake.wait()
+            if hold.ended is None:
+                return {"_meta": {}}
             while (kept := declared._next(hold.seen)) and kept.sequence <= hold.until:
                 await send(kept)
             ended = MCPError.from_error_data(hold.ended)

@@ -12,13 +12,15 @@ import secrets
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 import anyio
+import jsonschema
+from jsonschema.protocols import Validator
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.lowlevel.server import Server
@@ -36,8 +38,9 @@ from mcp.types import (
     RequestParams,
     ServerNotification,
 )
-from pydantic import Field, StrictInt, StrictStr, TypeAdapter, ValidationError
+from pydantic import Field, StrictInt, StrictStr
 from pydantic_core import to_json, to_jsonable_python
+from referencing import Registry
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import RequestContext, get_context
@@ -70,7 +73,7 @@ _MAX_SUBSCRIPTIONS_PER_CALLER = 100
 _LIST_PAGE_SIZE = 100
 _SUBSCRIBE_TIMEOUT = 30.0
 
-A = TypeVar("A")
+A = TypeVar("A", bound=Mapping[str, Any])
 T = TypeVar("T")
 
 
@@ -165,7 +168,7 @@ class EventType(Generic[A, D]):
 
     name: str
     _events: Events
-    _input: TypeAdapter[A]
+    _input: Validator
     _descriptor: dict[str, Any]
     _match: Match[D, A] | None
     _transform: Transform[D, A] | None
@@ -412,7 +415,7 @@ class Events(Extension):
         self,
         name: str,
         *,
-        input_schema: type[A] | TypeAdapter[A],
+        input_schema: dict[str, Any],
         payload_schema: dict[str, Any],
         description: str | None = None,
         match: Match[D, A] | None = None,
@@ -423,10 +426,11 @@ class Events(Extension):
     ) -> EventType[A, D]:
         """Declare an event type.
 
-        Annotate the result as ``EventType[Arguments, Data]`` to type ``emit``.
+        Annotate the result as ``EventType[Arguments, Data]`` to type the hooks and ``emit``. Hooks receive the
+        arguments as the subscription sent them, so ``Arguments`` is a ``TypedDict`` or ``dict[str, Any]``.
 
         Args:
-            input_schema: Type of a subscription's arguments.
+            input_schema: JSON Schema of a subscription's arguments. Arguments that do not match are refused.
             payload_schema: JSON Schema of each occurrence's data.
             match: ``(context, event, arguments)``: whether a subscription receives an event. Defaults to all.
             transform: ``(context, event, arguments)``: the data a subscription receives.
@@ -439,21 +443,18 @@ class Events(Extension):
             raise ValueError(f"Event {name} is already declared.")
         if not delivery:
             raise ValueError(f"Event {name} must be delivered by poll, push or both.")
-        arguments = (
-            input_schema
-            if isinstance(input_schema, TypeAdapter)
-            else TypeAdapter(input_schema)
-        )
+        checker = jsonschema.validators.validator_for(input_schema)
+        checker.check_schema(input_schema)
         descriptor = {
             "name": name,
             **({"description": description} if description else {}),
-            "inputSchema": arguments.json_schema(),
+            "inputSchema": input_schema,
             "payloadSchema": payload_schema,
         }
         declared = EventType(
             name,
             self,
-            arguments,
+            checker(input_schema, registry=Registry()),
             descriptor,
             match,
             transform,
@@ -588,16 +589,14 @@ class Events(Extension):
                 "Unsupported",
                 {"feature": "deliveryMode", "value": delivery},
             )
-        try:
-            arguments = declared._input.validate_python(params.arguments or {})
-        except ValidationError as error:
-            problems = "; ".join(
-                f"{'.'.join(map(str, each['loc'])) or 'arguments'}: {each['msg']}"
-                for each in error.errors()
-            )
+        arguments = params.arguments or {}
+        if error := jsonschema.exceptions.best_match(
+            declared._input.iter_errors(arguments)
+        ):
             raise MCPError(
-                INVALID_PARAMS, f"Invalid arguments for {params.name}: {problems}"
-            ) from None
+                INVALID_PARAMS,
+                f"Invalid arguments for {params.name}: {error.json_path}: {error.message}",
+            )
         context = get_context()
         principal = context.principal
         caller = ""
@@ -613,14 +612,7 @@ class Events(Extension):
         if principal is None and delivery == "push":
             id = f"sub_{uuid.uuid4().hex}"
         else:
-            canonical = json.dumps(
-                [
-                    caller,
-                    declared.name,
-                    declared._input.dump_python(arguments, mode="json"),
-                ],
-                sort_keys=True,
-            )
+            canonical = json.dumps([caller, declared.name, arguments], sort_keys=True)
             id = f"sub_{hashlib.sha256(canonical.encode()).hexdigest()[:32]}"
         request = _Request(
             declared,

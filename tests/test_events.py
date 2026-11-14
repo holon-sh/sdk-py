@@ -5,6 +5,7 @@ import socket
 import sys
 from contextlib import asynccontextmanager
 from functools import partial, wraps
+from typing import TypedDict
 
 import httpx2
 import pytest
@@ -36,8 +37,15 @@ from holon.serve import App, _asgi
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 
 
-class Board(BaseModel):
+class Board(TypedDict):
     board: str
+
+
+BOARD = {
+    "type": "object",
+    "properties": {"board": {"type": "string"}},
+    "required": ["board"],
+}
 
 
 class Change(BaseModel):
@@ -57,7 +65,7 @@ def declare(events=None, **hooks) -> tuple[Events, EventType[Board, Change]]:
     events = events or Events()
     return events, events.event(
         "board.changed",
-        input_schema=Board,
+        input_schema=BOARD,
         payload_schema=Change.model_json_schema(),
         **hooks,
     )
@@ -167,7 +175,7 @@ async def test_a_subscription_hears_what_its_arguments_match_as_shaped_across_a_
     delivery,
 ):
     events, changed = declare(
-        match=lambda context, event, arguments: event.data.board == arguments.board,
+        match=lambda context, event, arguments: event.data.board == arguments["board"],
         transform=lambda context, event, arguments: {
             "board": event.data.board,
             "text": event.data.text.upper(),
@@ -208,6 +216,36 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
                     assert (await anext(second)).event_id == expected
 
 
+@asynchronous
+async def test_arguments_name_a_subscription_as_they_were_sent_and_must_match_the_schema():
+    subscribed = []
+    events = Events()
+    events.event(
+        "board.changed",
+        input_schema={
+            **BOARD,
+            "properties": {"board": {"type": "string"}, "limit": {"default": 10}},
+            "additionalProperties": False,
+        },
+        payload_schema=Change.model_json_schema(),
+        on_subscribe=lambda context, arguments, id: subscribed.append(arguments),
+    )
+    ann = {"x-holon-context": signed_in("ann")}
+    async with served(events) as port, httpx2.AsyncClient(headers=ann) as http:
+
+        async def poll(arguments):
+            params = {"name": "board.changed", "arguments": arguments}
+            return await call(http, port, "events/poll", params)
+
+        for arguments in [{"board": "b1"}, {"limit": 10, "board": "b1"}]:
+            assert "result" in await poll(arguments)
+        assert "result" in await poll({"board": "b1", "limit": 10})
+        refused = await poll({"board": "b1", "color": "red"})
+        assert refused["error"]["code"] == INVALID_PARAMS
+        assert "'color' was unexpected" in refused["error"]["message"]
+    assert subscribed == [{"board": "b1"}, {"limit": 10, "board": "b1"}]
+
+
 @pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("delivery", ["push", "poll"])
 @asynchronous
@@ -240,7 +278,7 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
 async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_cursor_from_before_a_restart_is_a_gap():
     events, changed = declare(
         on_subscribe=lambda context, arguments, id: say(
-            changed, arguments.board, "welcome", to=id
+            changed, arguments["board"], "welcome", to=id
         )
     )
     restarted = declare()[1].cursor()
@@ -266,7 +304,7 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
     ids = {}
 
     def on_subscribe(context, arguments, id):
-        ids[arguments.board] = id
+        ids[arguments["board"]] = id
 
     events, changed = declare(on_subscribe=on_subscribe)
     async with served(events) as port:
@@ -320,10 +358,10 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     )
     events.event(
         "board.locked",
-        input_schema=Board,
+        input_schema=BOARD,
         payload_schema=recursive,
         delivery=["poll"],
-        authorize=lambda context, arguments: arguments.board != "secret",
+        authorize=lambda context, arguments: arguments["board"] != "secret",
     )
     async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
         discovered = await call(http, port, "server/discover", {})
@@ -336,7 +374,7 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
         assert set(listed["board.changed"]["delivery"]) == {"poll", "push"}
         expected = {
             "description": "A board changed",
-            "inputSchema": Board.model_json_schema(),
+            "inputSchema": BOARD,
             "payloadSchema": Change.model_json_schema(),
         }
         assert {key: listed["board.changed"][key] for key in expected} == expected
@@ -371,7 +409,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
         for method, params, code in [
             ("events/poll", {"name": "board.moved"}, -32023),
-            ("events/poll", {"name": "board.changed", "arguments": {}}, INVALID_PARAMS),
             ("events/poll", changed_on("b1", 1), INVALID_PARAMS),
             (
                 "events/stream",
@@ -531,7 +568,7 @@ async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
 async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
     events, said = Events(), []
     changed: EventType[Board, Change] = events.event(
-        "board.changed", input_schema=Board, payload_schema=Change.model_json_schema()
+        "board.changed", input_schema=BOARD, payload_schema=Change.model_json_schema()
     )
 
     def tell(text):

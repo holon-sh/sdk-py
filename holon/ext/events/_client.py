@@ -315,7 +315,6 @@ class Subscription(Generic[D]):
         self._active = True
         self._settled.set()
 
-    # A gap is reported each time; a status only when it changes, since every poll confirms the subscription.
     async def _report(self, status: Status) -> None:
         if status == "gap" or status != self._status:
             self._status = status

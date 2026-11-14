@@ -382,6 +382,12 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             ),
         ]:
             assert (await call(http, port, method, params))["error"]["code"] == code
+        with pytest.raises(MCPError) as refused:
+            async with client(port).subscribe(
+                "board.locked", {"board": "b1"}, delivery="push"
+            ):
+                pass
+        assert refused.value.error.code == -32026
 
         url, opened = f"http://127.0.0.1:{port}/mcp", changed.cursor()
         async with http.stream(

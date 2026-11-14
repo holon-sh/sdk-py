@@ -141,7 +141,8 @@ class AppEvents:
             arguments: The subscription's arguments.
             cursor: Where to resume from. Defaults to now.
             max_age: Seconds; older events are not replayed.
-            delivery: ``"push"`` or ``"poll"``. Defaults to push when offered.
+            delivery: ``"push"`` or ``"poll"``, which the app refuses when it does not offer it.
+                Defaults to push when offered.
             on_gap: Called when events were skipped.
 
         Returns:
@@ -279,10 +280,14 @@ class Subscription(Generic[D]):
                 self._send.close()
 
     async def _follow(self, client: Client) -> None:
-        listed = [each for each in await _list(client) if each["name"] == self._name]
-        # An unlisted type is left for the app to refuse.
-        offered = listed[0].get("delivery", []) if listed else ["poll"]
         wanted: list[Delivery] = [self.delivery] if self.delivery else ["push", "poll"]
+        # A named mode, like an unlisted type, is left for the app to refuse.
+        offered: list[str] = list(wanted)
+        if not self.delivery:
+            listed = [
+                each for each in await _list(client) if each["name"] == self._name
+            ]
+            offered = listed[0].get("delivery", []) if listed else ["poll"]
         modes = [mode for mode in wanted if mode in offered]
         if not modes:
             raise NoCompatibleDeliveryMode(

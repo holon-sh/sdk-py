@@ -19,6 +19,7 @@ from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
+from mcp.server.subscriptions import ListenHandler
 from mcp.server.transport_security import TransportSecuritySettings
 from opentelemetry import context as tracing
 from opentelemetry import propagate
@@ -85,6 +86,11 @@ async def serve(app: App) -> None:
 
     class Server(uvicorn.Server):
         async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            listen = app.server.session_manager.app.get_request_handler(
+                "subscriptions/listen"
+            )
+            if listen is not None and isinstance(listen.handler, ListenHandler):
+                listen.handler.close()
             for each in app.server.middleware:
                 if isinstance(each, Events):
                     each.close()

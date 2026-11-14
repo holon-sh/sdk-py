@@ -12,6 +12,7 @@ from functools import wraps
 import httpx2
 import pytest
 import uvicorn
+from mcp import Client
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context
@@ -400,6 +401,8 @@ def subject() -> str:
             "x-holon-context": token,
         }
         async with (
+            Client(origin + "/mcp", mode=LATEST_PROTOCOL_VERSION) as client,
+            client.listen(tools_list_changed=True) as subscription,
             httpx2.AsyncClient() as http,
             http.stream("POST", origin + "/mcp", json=stream, headers=headers) as sent,
         ):
@@ -408,6 +411,8 @@ def subject() -> str:
                 pass
             process.send_signal(signal.SIGTERM)
             last = [frame async for frame in frames if frame.startswith("data: ")][-1]
+            async for _ in subscription:
+                pass
         closed = json.loads(last.removeprefix("data: "))
         assert closed["id"] == 7 and "result" in closed
 

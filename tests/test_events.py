@@ -425,16 +425,22 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
 
 @asynchronous
-async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its_lease_lapses(
+async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds_its_place_until_its_lease_lapses(
     monkeypatch,
 ):
-    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.1)
+    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.5)
     monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    setting_up, release, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    setting_up, ended, seen = asyncio.Event(), asyncio.Event(), []
 
     async def on_subscribe(context, arguments, id):
-        setting_up.set()
-        await release.wait()
+        seen.append(context.request.headers.get("x-leaving"))
+        try:
+            if seen[-1]:
+                setting_up.set()
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen.append("stopped")
+            raise
 
         async def cleanup():
             ended.set()
@@ -468,7 +474,8 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its
         assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
         giving_up.cancel()
         await left.wait()
-        release.set()
+        assert "result" in await call(http, port, "events/poll", changed_on("b1"))
+        assert seen == ["1", "stopped", None]
         await ended.wait()
         assert "result" in await call(http, port, "events/poll", changed_on("b2"))
     await stop()

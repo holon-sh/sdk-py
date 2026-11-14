@@ -20,7 +20,7 @@ from holon.ext.events import Events, EventType
 
 def emit() -> None:
     changed: EventType[dict[str, str], dict[str, str]] = Events().event(
-        "board.changed", input_schema=dict[str, str],
+        "board.changed", input_schema={"type": "object"},
         payload_schema={"type": "object", "additionalProperties": {"type": "string"}},
     )
     changed.emit({"text": "hello"})

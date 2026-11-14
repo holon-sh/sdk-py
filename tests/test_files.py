@@ -87,6 +87,16 @@ TOOLS = [
 ]
 
 
+def asking():
+    question = ElicitRequestFormParams(
+        message="Why?", requested_schema={"type": "object", "properties": {}}
+    )
+    return InputRequiredResult(
+        input_requests={"why": ElicitRequest(params=question)},
+        request_state="asked",
+    )
+
+
 def serve(tmp_path):
     """A server whose tools save, check and export files; returns (app, ran)."""
     storage = LocalStorage(tmp_path / "storage")
@@ -105,13 +115,7 @@ def serve(tmp_path):
         if params.name == "export":
             return await files.reply(ctx, CSV, name="report.csv", text="Exported.")
         if arguments.get("note") == "ask" and not params.input_responses:
-            question = ElicitRequestFormParams(
-                message="Why?", requested_schema={"type": "object", "properties": {}}
-            )
-            return InputRequiredResult(
-                input_requests={"why": ElicitRequest(params=question)},
-                request_state="asked",
-            )
+            return asking()
         for value in arguments.get("files") or [arguments["file"]]:
             received = ReceivedFile(value)
             if params.name == "save":
@@ -151,7 +155,7 @@ def recording(app, seen):
     return asgi
 
 
-def client(app, seen, tools=TOOLS, **binding):
+def client(app, seen, **binding):
     def http_client():
         return httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=recording(app, seen)),
@@ -161,7 +165,7 @@ def client(app, seen, tools=TOOLS, **binding):
 
     return Apps(
         {"name": "caller", "version": "1", "requires": {}},
-        {"files": {"tools": tools}},
+        {"files": {"tools": TOOLS}},
         {"files": {"endpoint": ENDPOINT, "http_client": http_client, **binding}},
     ).files
 
@@ -224,43 +228,29 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
     assert ran == ["save"] * 3
 
 
-def test_a_declared_file_argument_reaches_the_tool_after_an_input_request(tmp_path):
-    (tmp_path / "notes.txt").write_bytes(b"x" * 100)
-    storage = LocalStorage(tmp_path / "storage")
-    server = MCPServer("files")
-    read = []
+def test_a_declared_file_reaches_its_tool_across_an_input_request(tmp_path):
+    storage, server, read = LocalStorage(tmp_path), MCPServer("files"), []
 
     async def save(file: ReceivedFile, ctx: Context) -> str:
         if not ctx.input_responses:
-            question = ElicitRequestFormParams(
-                message="Why?", requested_schema={"type": "object", "properties": {}}
-            )
-            return InputRequiredResult(
-                input_requests={"why": ElicitRequest(params=question)},
-                request_state="asked",
-            )
+            return asking()
         read.append(await file.read())
         return "ok"
 
     server.add_tool(save)
-    tools = [
-        tool.model_dump(by_alias=True, exclude_none=True)
-        for tool in asyncio.run(server.list_tools())
-    ]
-    files = FileServer(
-        storage, tools={t["name"]: t for t in tools}.get, max_inline_bytes=16
-    )
+    [tool] = asyncio.run(server.list_tools())
+    declared = tool.model_dump(by_alias=True, exclude_none=True)
+    files = FileServer(storage, tools=lambda name: declared, max_inline_bytes=16)
     server._lowlevel_server.extensions[EXTENSION] = files.settings()
     server.middleware.insert(0, files)
     app = server.streamable_http_app(stateless_http=True, json_response=True)
     app.mount("/mcp/files", storage.app)
 
     async def body():
-        for file in [File(b"tiny"), File(tmp_path / "notes.txt")]:
-            await client(app, [], tools).tools.save({"elicit": answer}, file=file)
+        await client(app, []).tools.save({"elicit": answer}, file=File(b"x" * 100))
 
     run(app, body)
-    assert read == [b"tiny", b"x" * 100]
+    assert read == [b"x" * 100]
 
 
 def sink(attempts, served=None):

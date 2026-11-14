@@ -24,10 +24,7 @@ from jsonschema.protocols import Validator
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.lowlevel.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.server.transport_security import RequestBodyLimitMiddleware
 from mcp.shared.exceptions import MCPError
-from mcp.shared.inbound import MCP_METHOD_HEADER
 from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
 from mcp.types import (
     INTERNAL_ERROR,
@@ -41,9 +38,8 @@ from mcp.types import (
 from pydantic import Field, StrictInt, StrictStr
 from pydantic_core import to_json, to_jsonable_python
 from referencing import Registry
-from starlette.types import ASGIApp, Receive, Scope, Send
 
-from holon.context import RequestContext, get_context
+from holon.context import get_context
 from holon.ext.events._wire import (
     EVENTS_EXTENSION,
     FORBIDDEN,
@@ -58,8 +54,6 @@ from holon.ext.events._wire import (
 logger = logging.getLogger(__package__)
 
 _MAX_POLL_EVENTS = 1000
-# Set on a request that came through `Events.asgi`, whose answer can be a stream.
-_STREAMS = "holon.ext.events.streams"
 # What each event type keeps of what it emits: seconds, events, and bytes of JSON data.
 _KEEP_AGE = 600.0
 _KEEP_EVENTS = 10_000
@@ -77,12 +71,13 @@ A = TypeVar("A", bound=Mapping[str, Any])
 T = TypeVar("T")
 
 
-Match: TypeAlias = Callable[[RequestContext, Event[D], A], bool]
-Transform: TypeAlias = Callable[[RequestContext, Event[D], A], object]
-Authorize: TypeAlias = Callable[[RequestContext, A], bool | Awaitable[bool]]
+Context: TypeAlias = ServerRequestContext[Any, Any]
+Match: TypeAlias = Callable[[Context, Event[D], A], bool]
+Transform: TypeAlias = Callable[[Context, Event[D], A], object]
+Authorize: TypeAlias = Callable[[Context, A], bool | Awaitable[bool]]
 Cleanup: TypeAlias = Callable[[], None | Awaitable[None]]
 SubscriptionHook: TypeAlias = Callable[
-    [RequestContext, A, str], Cleanup | None | Awaitable[Cleanup | None]
+    [Context, A, str], Cleanup | None | Awaitable[Cleanup | None]
 ]
 
 
@@ -125,7 +120,6 @@ class _Request:
 
     type: EventType[Any, Any]
     id: str
-    context: RequestContext
     caller: str
     arguments: Any
     targetable: bool
@@ -144,8 +138,8 @@ class _Kept:
 class _Entry:
     """A subscription, held by one or more streams or poll leases."""
 
-    setup: asyncio.Future[Cleanup | None]
     holds: set[_Hold] = field(default_factory=set)
+    setup: asyncio.Future[Cleanup | None] | None = None
     teardown: asyncio.Future[None] | None = None
 
 
@@ -304,16 +298,18 @@ class EventType(Generic[A, D]):
         return sequence, truncated
 
     # The occurrence as `request` receives it, or None when it is not for it.
-    def _shape(self, kept: _Kept, request: _Request) -> dict[str, Any] | None:
+    def _shape(
+        self, kept: _Kept, request: _Request, ctx: Context
+    ) -> dict[str, Any] | None:
         if kept.target is not None:
             if not request.targetable or kept.target != request.id:
                 return None
         elif self._match is not None and not self._match(
-            request.context, kept.event, request.arguments
+            ctx, kept.event, request.arguments
         ):
             return None
         data = (
-            self._transform(request.context, kept.event, request.arguments)
+            self._transform(ctx, kept.event, request.arguments)
             if self._transform
             else kept.event.data
         )
@@ -328,6 +324,7 @@ class EventType(Generic[A, D]):
     def _since(
         self,
         request: _Request,
+        ctx: Context,
         cursor: str,
         max_age_ms: int | None,
         limit: int,
@@ -338,7 +335,7 @@ class EventType(Generic[A, D]):
         while len(events) < limit and (kept := self._next(reached)) is not None:
             reached = kept.sequence
             try:
-                occurrence = self._shape(kept, request)
+                occurrence = self._shape(kept, request, ctx)
             except Exception as error:  # noqa: BLE001
                 _described(error)
                 continue
@@ -351,52 +348,19 @@ class EventType(Generic[A, D]):
             "hasMore": self._next(reached) is not None,
         }
 
-    async def _allows(self, context: RequestContext, arguments: Any) -> bool:
-        return self._authorize is None or await _settle(
-            self._authorize(context, arguments)
-        )
+    async def _allows(self, ctx: Context, arguments: Any) -> bool:
+        return self._authorize is None or await _settle(self._authorize(ctx, arguments))
 
     async def _settled(self, id: str) -> None:
         while (entry := self._subscriptions.get(id)) and entry.teardown is not None:
             await asyncio.shield(entry.teardown)
 
 
-# The SDK's private handler, which streams a 2026-07-28 request even on a JSON endpoint, when this SDK has it.
-def _streaming(manager: StreamableHTTPSessionManager) -> ASGIApp | None:
-    try:
-        from mcp.server._streamable_http_modern import handle_modern_request
-    except ImportError:
-        return None
-    expected = ["app", "security_settings", "json_response", "lifespan_state"]
-    expected += ["scope", "receive", "send"]
-    taken = list(inspect.signature(handle_modern_request).parameters)
-    if taken != expected or not hasattr(manager, "_lifespan_state"):
-        return None
-
-    async def stream(scope: Scope, receive: Receive, send: Send) -> None:
-        await handle_modern_request(
-            manager.app,
-            manager.security_settings,
-            False,
-            manager._lifespan_state,
-            scope,
-            receive,
-            send,
-        )
-
-    return RequestBodyLimitMiddleware(stream, manager.max_request_body_size)
-
-
-def _streams(ctx: ServerRequestContext[Any, Any]) -> bool:
-    # Over stdio every request can stream; over HTTP, only one that came through `Events.asgi`.
-    return ctx.request is None or bool(ctx.request.scope.get(_STREAMS))
-
-
 class Events(Extension):
     """The event types an app serves as MCP Events.
 
     Pass it to ``MCPServer(extensions=[events], middleware=[events])``, or call :meth:`serve` on a low-level
-    ``Server``. Over Streamable HTTP, push is offered only on an endpoint mounted through :meth:`asgi`.
+    ``Server``. Push needs an endpoint whose answers can stream: over Streamable HTTP, not ``json_response=True``.
     """
 
     identifier = EVENTS_EXTENSION
@@ -427,7 +391,10 @@ class Events(Extension):
         """Declare an event type.
 
         Annotate the result as ``EventType[Arguments, Data]`` to type the hooks and ``emit``. Hooks receive the
-        arguments as the subscription sent them, so ``Arguments`` is a ``TypedDict`` or ``dict[str, Any]``.
+        arguments as the subscription sent them, so ``Arguments`` is a ``TypedDict`` or ``dict[str, Any]``. Each
+        hook's ``context`` is the server's context of the request it runs in. A subscription outlives the first
+        request to name it, where ``on_subscribe`` runs, and other requests may share it: keep what the hook reads
+        from ``context``, not ``context``.
 
         Args:
             input_schema: JSON Schema of a subscription's arguments. Arguments that do not match are refused.
@@ -499,25 +466,6 @@ class Events(Extension):
                 }
         return result
 
-    def asgi(self, manager: StreamableHTTPSessionManager) -> ASGIApp:
-        """The endpoint of ``manager``, with push.
-
-        Mount it where ``manager.handle_request`` would be, inside any authentication.
-        """
-        streaming = _streaming(manager)
-
-        async def app(scope: Scope, receive: Receive, send: Send) -> None:
-            method = dict(scope.get("headers", [])).get(MCP_METHOD_HEADER.encode())
-            if scope["type"] == "http" and not manager.json_response:
-                scope = {**scope, _STREAMS: True}
-            elif scope["type"] == "http" and streaming and method is not None:
-                scope = {**scope, _STREAMS: True}
-                if method == b"events/stream":
-                    return await streaming(scope, receive, send)
-            await manager.handle_request(scope, receive, send)
-
-        return app
-
     async def _list(
         self, ctx: ServerRequestContext[Any, Any], params: PaginatedRequestParams
     ) -> HandlerResult:
@@ -526,25 +474,21 @@ class Events(Extension):
         if not cursor.isdigit():
             raise MCPError(INVALID_PARAMS, "Invalid cursor for events/list")
         start = int(cursor)
-        streams = _streams(ctx)
-        listed = []
-        for each in list(self._types.values())[start : start + _LIST_PAGE_SIZE]:
-            if delivery := [
-                mode for mode in each._delivery if streams or mode != "push"
-            ]:
-                listed.append({**each._descriptor, "delivery": delivery})
-        result: dict[str, Any] = {"events": listed}
+        listed = list(self._types.values())[start : start + _LIST_PAGE_SIZE]
+        result: dict[str, Any] = {
+            "events": [
+                {**each._descriptor, "delivery": each._delivery} for each in listed
+            ]
+        }
         if start + _LIST_PAGE_SIZE < len(self._types):
             result["nextCursor"] = str(start + _LIST_PAGE_SIZE)
         return result
 
-    async def _poll(
-        self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
-    ) -> HandlerResult:
-        request = await self._subscription(params, "poll", _streams(ctx))
+    async def _poll(self, ctx: Context, params: _SubscribeParams) -> HandlerResult:
+        request = await self._subscription(ctx, params, "poll")
         declared = request.type
         opened = declared._sequence
-        await self._lease(request)
+        await self._lease(request, ctx)
         if params.cursor is None:
             answer = {
                 "events": [],
@@ -555,6 +499,7 @@ class Events(Extension):
         else:
             answer = declared._since(
                 request,
+                ctx,
                 params.cursor,
                 params.max_age_ms,
                 params.max_events or _MAX_POLL_EVENTS,
@@ -577,13 +522,13 @@ class Events(Extension):
 
     # Checked in the order of https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#error-codes
     async def _subscription(
-        self, params: _SubscribeParams, delivery: Delivery, streams: bool
+        self, ctx: Context, params: _SubscribeParams, delivery: Delivery
     ) -> _Request:
         self._loop = self._loop or asyncio.get_running_loop()
         declared = self._types.get(params.name)
         if declared is None:
             raise MCPError.from_error_data(_NOT_FOUND)
-        if delivery not in declared._delivery or (delivery == "push" and not streams):
+        if delivery not in declared._delivery:
             raise MCPError(
                 UNSUPPORTED,
                 "Unsupported",
@@ -597,8 +542,7 @@ class Events(Extension):
                 INVALID_PARAMS,
                 f"Invalid arguments for {params.name}: {error.json_path}: {error.message}",
             )
-        context = get_context()
-        principal = context.principal
+        principal = get_context().principal
         caller = ""
         if principal is not None:
             who = [
@@ -617,12 +561,11 @@ class Events(Extension):
         request = _Request(
             declared,
             id,
-            context,
             caller,
             arguments,
             targetable=principal is not None or delivery == "push",
         )
-        if not await declared._allows(context, arguments):
+        if not await declared._allows(ctx, arguments):
             declared.terminate(id, _FORBIDDEN)
             if lease := self._leases.get(id):
                 self._stop(lease)
@@ -647,27 +590,26 @@ class Events(Extension):
                 },
             )
         self._held[request.caller] += 1
-        subscriptions = request.type._subscriptions
-        entry = subscriptions.get(request.id)
-        if entry is None:
-            setup = asyncio.ensure_future(self._set_up(request))
-            entry = subscriptions[request.id] = _Entry(setup)
+        entry = request.type._subscriptions.setdefault(request.id, _Entry())
         hold = _Hold(request, entry)
         entry.holds.add(hold)
         return hold
 
-    async def _set_up(self, request: _Request) -> Cleanup | None:
+    async def _set_up(self, request: _Request, ctx: Context) -> Cleanup | None:
         if request.type._on_subscribe is None:
             return None
         async with asyncio.timeout(_SUBSCRIBE_TIMEOUT):
             return await _settle(
-                request.type._on_subscribe(
-                    request.context, request.arguments, request.id
-                )
+                request.type._on_subscribe(ctx, request.arguments, request.id)
             )
 
-    async def _ready(self, hold: _Hold) -> None:
-        await asyncio.shield(hold.entry.setup)
+    async def _ready(self, hold: _Hold, ctx: Context) -> None:
+        entry = hold.entry
+        while entry.setup is not None and not entry.setup.done():
+            await asyncio.wait([entry.setup])
+        if entry.setup is None or entry.setup.cancelled():
+            entry.setup = asyncio.ensure_future(self._set_up(hold.request, ctx))
+        await entry.setup
         if hold.ended is not None:
             raise MCPError.from_error_data(hold.ended)
 
@@ -682,18 +624,20 @@ class Events(Extension):
 
     # Cleanup follows only a setup that succeeded; a failing hook is logged.
     async def _tear_down(self, hold: _Hold) -> None:
-        request = hold.request
+        request, setup = hold.request, hold.entry.setup
         try:
-            cleanup = await hold.entry.setup
-            if cleanup is not None:
-                await _settle(cleanup())
+            if setup is not None:
+                await asyncio.wait([setup])
+                cleanup = None if setup.cancelled() else setup.result()
+                if cleanup is not None:
+                    await _settle(cleanup())
         except Exception:
             logger.exception("An event subscription's setup or cleanup failed")
         finally:
             del request.type._subscriptions[request.id]
 
     # A poll lease begins with the first poll, is renewed by each, and lapses when polls stop.
-    async def _lease(self, request: _Request) -> None:
+    async def _lease(self, request: _Request, ctx: Context) -> None:
         await request.type._settled(request.id)
         hold = self._leases.get(request.id)
         if hold is None:
@@ -705,7 +649,7 @@ class Events(Extension):
             _POLL_SUBSCRIPTION_TTL, self._stop, hold
         )
         try:
-            await self._ready(hold)
+            await self._ready(hold, ctx)
         except Exception:
             self._stop(hold)
             raise
@@ -734,16 +678,14 @@ class Events(Extension):
             self._sent.set()
             self._sent = asyncio.Event()
 
-    async def _stream(
-        self, ctx: ServerRequestContext[Any, Any], params: _SubscribeParams
-    ) -> HandlerResult:
-        request = await self._subscription(params, "push", _streams(ctx))
+    async def _stream(self, ctx: Context, params: _SubscribeParams) -> HandlerResult:
+        request = await self._subscription(ctx, params, "push")
         declared = request.type
         await declared._settled(request.id)
         hold = self._open(request)
         hold.seen = declared._sequence
         try:
-            await self._ready(hold)
+            await self._ready(hold, ctx)
 
             async def say(method: str, body: dict[str, Any], size: int = 0) -> None:
                 body["_meta"] = {SUBSCRIPTION_ID_META_KEY: ctx.request_id}
@@ -767,7 +709,7 @@ class Events(Extension):
             async def send(kept: _Kept) -> None:
                 hold.seen = kept.sequence
                 try:
-                    shaped = declared._shape(kept, request)
+                    shaped = declared._shape(kept, request, ctx)
                 except Exception as error:  # noqa: BLE001
                     await say("error", {"error": _described(error)})
                     return
@@ -782,9 +724,7 @@ class Events(Extension):
                 if time.monotonic() >= beat:
                     beat = time.monotonic() + _HEARTBEAT
                     try:
-                        allowed = await declared._allows(
-                            request.context, request.arguments
-                        )
+                        allowed = await declared._allows(ctx, request.arguments)
                     except Exception as error:  # noqa: BLE001
                         await say("error", {"error": _described(error)})
                         continue

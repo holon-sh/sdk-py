@@ -28,7 +28,6 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from holon.context import _Request, _request
-from holon.ext.events import Events
 
 __all__ = ["App", "load", "serve"]
 
@@ -92,13 +91,7 @@ def _asgi(app: App) -> ASGIApp:
             enable_dns_rebinding_protection=False
         ),
     )
-    manager = server.session_manager
-    events = next(
-        (each for each in server.middleware if isinstance(each, Events)), None
-    )
-    mcp = AuthContextMiddleware(
-        manager.handle_request if events is None else events.asgi(manager)
-    )
+    mcp = AuthContextMiddleware(server.session_manager.handle_request)
     platform = os.environ.get("HOLON_PLATFORM") == "1"
 
     async def dispatch(scope: Scope, receive: Receive, send: Send) -> None:

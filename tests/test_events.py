@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import socket
-import sys
 from contextlib import asynccontextmanager
 from functools import partial, wraps
 
@@ -30,7 +29,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import Events, EventType, NoCompatibleDeliveryMode, _server
+from holon.ext.events import Events, EventType, _server
 from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
@@ -423,53 +422,46 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
 
 @asynchronous
-async def test_a_poll_that_gives_up_while_it_is_set_up_holds_its_place_until_its_lease_lapses(
+async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds_its_place_until_its_lease_lapses(
     monkeypatch,
 ):
-    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.1)
+    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.5)
     monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    setting_up, release, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    ended, seen = asyncio.Event(), []
 
     async def on_subscribe(context, arguments, id):
-        setting_up.set()
-        await release.wait()
+        seen.append(context.request.headers.get("x-leaving"))
+        try:
+            if seen[-1]:
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen.append("stopped")
+            raise
 
         async def cleanup():
             ended.set()
 
         return cleanup
 
-    events, _ = declare(on_subscribe=on_subscribe)
-    app, left = mounted(events), asyncio.Event()
-
-    # Tells when the server sees the poll that gives up disconnect.
-    async def noticing(scope, receive, send):
-        async def receiving():
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                left.set()
-            return message
-
-        leaving = (b"x-leaving", b"1") in scope.get("headers", [])
-        await app(scope, receiving if leaving else receive, send)
-
     async def give_up():
         async with httpx2.AsyncClient(headers={"x-leaving": "1"}) as http:
             await call(http, port, "events/poll", changed_on("b1"))
 
-    port, stop = await serve(noticing)
-    giving_up = asyncio.ensure_future(give_up())
-    await setting_up.wait()
-    async with httpx2.AsyncClient(timeout=10) as http:
+    async with (
+        served(declare(on_subscribe=on_subscribe)[0]) as port,
+        httpx2.AsyncClient(timeout=10) as http,
+    ):
+        giving_up = asyncio.ensure_future(give_up())
+        await until(lambda: seen)
         exhausted = await call(http, port, "events/poll", changed_on("b2"))
         limit = exhausted["error"]["data"]
         assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
         giving_up.cancel()
-        await left.wait()
-        release.set()
+        await until(lambda: "stopped" in seen)
+        assert "result" in await call(http, port, "events/poll", changed_on("b1"))
+        assert seen == ["1", "stopped", None]
         await ended.wait()
         assert "result" in await call(http, port, "events/poll", changed_on("b2"))
-    await stop()
 
 
 @asynchronous
@@ -491,42 +483,7 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
 
 
 @asynchronous
-async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
-    events, changed = declare()
-    bare = MCPServer("boards", extensions=[events])
-    # An SDK without the private stream path `Events.asgi` uses on a JSON endpoint.
-    monkeypatch.setitem(sys.modules, "mcp.server._streamable_http_modern", None)
-    wrapped = MCPServer("boards", extensions=[events])
-    wrapped.streamable_http_app(stateless_http=True, json_response=True)
-    manager = wrapped.session_manager
-    for app, path in [
-        (bare.streamable_http_app(stateless_http=True, json_response=True), "/mcp"),
-        (
-            Starlette(
-                routes=[Mount("/mcp", app=events.asgi(manager))],
-                lifespan=lambda app: manager.run(),
-            ),
-            "/mcp/",
-        ),
-    ]:
-        port, stop = await serve(app)
-        boards = client(port, path=path)
-        async with boards.subscribe("board.changed", {"board": "b1"}) as changes:
-            assert changes.delivery == "poll"
-            say(changed, "b1", "polled")
-            assert await take(changes, 1) == ["polled"]
-            await changes.cancel()
-            assert await anext(changes, None) is None
-        with pytest.raises(NoCompatibleDeliveryMode):
-            async with boards.subscribe(
-                "board.changed", {"board": "b1"}, delivery="push"
-            ):
-                pass
-        await stop()
-
-
-@asynchronous
-async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
+async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it():
     (events, changed), said = declare(), []
 
     def tell(text):
@@ -539,10 +496,10 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
 
     server = Server("boards", on_call_tool=snapshot)
     events.serve(server)
-    manager = StreamableHTTPSessionManager(server, stateless=True, json_response=True)
+    manager = StreamableHTTPSessionManager(server, stateless=True)
     port, stop = await serve(
         Starlette(
-            routes=[Mount("/mcp", app=events.asgi(manager))],
+            routes=[Mount("/mcp", app=manager.handle_request)],
             lifespan=lambda app: manager.run(),
         )
     )

@@ -16,19 +16,14 @@ from mcp import Client
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context
-from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.shared.exceptions import MCPError
-from mcp.shared.inbound import MCP_METHOD_HEADER, MCP_PROTOCOL_VERSION_HEADER
 from mcp.types import (
-    CLIENT_CAPABILITIES_META_KEY,
-    CLIENT_INFO_META_KEY,
-    JSONRPC_VERSION,
     LATEST_PROTOCOL_VERSION,
-    PROTOCOL_VERSION_META_KEY,
 )
 from opentelemetry import propagate
 from starlette.datastructures import Headers
 from starlette.responses import RedirectResponse, Response
+from test_events import request
 
 from holon.client import Apps
 from holon.context import Caller, Principal, RequestContext, _request, get_context
@@ -333,27 +328,12 @@ frontend = "web"
         writer.write(b"\r\n")
         assert (await reader.readline()).startswith(b"HTTP/1.1 200")
         writer.close()
-        meta = {
-            PROTOCOL_VERSION_META_KEY: LATEST_PROTOCOL_VERSION,
-            CLIENT_INFO_META_KEY: {"name": "test", "version": "1"},
-            CLIENT_CAPABILITIES_META_KEY: {},
-        }
-        stream = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": 7,
-            "method": "events/stream",
-            "params": {"name": "ticked", "arguments": {}, "_meta": meta},
-        }
-        headers = {
-            "accept": f"{CONTENT_TYPE_JSON}, {CONTENT_TYPE_SSE}",
-            MCP_PROTOCOL_VERSION_HEADER: LATEST_PROTOCOL_VERSION,
-            MCP_METHOD_HEADER: "events/stream",
-        }
+        ticked = request("events/stream", {"name": "ticked", "arguments": {}}, id=7)
         async with (
             Client(origin + "/mcp", mode=LATEST_PROTOCOL_VERSION) as client,
             client.listen(tools_list_changed=True) as subscription,
             httpx2.AsyncClient() as http,
-            http.stream("POST", origin + "/mcp", json=stream, headers=headers) as sent,
+            http.stream("POST", origin + "/mcp", **ticked) as sent,
         ):
             frames = sent.aiter_lines()
             while not (await anext(frames)).startswith("data: "):
@@ -362,8 +342,7 @@ frontend = "web"
             last = [frame async for frame in frames if frame.startswith("data: ")][-1]
             async for _ in subscription:
                 pass
-        closed = json.loads(last.removeprefix("data: "))
-        assert closed["id"] == 7 and "result" in closed
+        assert "result" in json.loads(last.removeprefix("data: "))
 
     try:
         asyncio.run(asyncio.wait_for(exercise(), timeout=20))

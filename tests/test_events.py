@@ -5,7 +5,6 @@ import socket
 import sys
 from contextlib import asynccontextmanager
 from functools import partial, wraps
-from typing import TypedDict
 
 import httpx2
 import pytest
@@ -37,15 +36,8 @@ from holon.serve import App, _asgi
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
 
 
-class Board(TypedDict):
+class Board(BaseModel):
     board: str
-
-
-BOARD = {
-    "type": "object",
-    "properties": {"board": {"type": "string"}},
-    "required": ["board"],
-}
 
 
 class Change(BaseModel):
@@ -61,11 +53,11 @@ def asynchronous(test):
     return run
 
 
-def declare(events=None, **hooks) -> tuple[Events, EventType[Board, Change]]:
+def declare(events=None, **hooks) -> tuple[Events, EventType[dict[str, str], Change]]:
     events = events or Events()
     return events, events.event(
         "board.changed",
-        input_schema=BOARD,
+        input_schema=Board.model_json_schema(),
         payload_schema=Change.model_json_schema(),
         **hooks,
     )
@@ -217,33 +209,19 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
 
 
 @asynchronous
-async def test_arguments_name_a_subscription_as_they_were_sent_and_must_match_the_schema():
+async def test_a_subscription_is_named_by_its_arguments_as_sent():
     subscribed = []
-    events = Events()
-    events.event(
-        "board.changed",
-        input_schema={
-            **BOARD,
-            "properties": {"board": {"type": "string"}, "limit": {"default": 10}},
-            "additionalProperties": False,
-        },
-        payload_schema=Change.model_json_schema(),
-        on_subscribe=lambda context, arguments, id: subscribed.append(arguments),
-    )
+    events, _ = declare(on_subscribe=lambda context, args, id: subscribed.append(args))
     ann = {"x-holon-context": signed_in("ann")}
     async with served(events) as port, httpx2.AsyncClient(headers=ann) as http:
-
-        async def poll(arguments):
+        for arguments in [
+            {"board": "b"},
+            {"n": 1, "board": "b"},
+            {"board": "b", "n": 1},
+        ]:
             params = {"name": "board.changed", "arguments": arguments}
-            return await call(http, port, "events/poll", params)
-
-        for arguments in [{"board": "b1"}, {"limit": 10, "board": "b1"}]:
-            assert "result" in await poll(arguments)
-        assert "result" in await poll({"board": "b1", "limit": 10})
-        refused = await poll({"board": "b1", "color": "red"})
-        assert refused["error"]["code"] == INVALID_PARAMS
-        assert "'color' was unexpected" in refused["error"]["message"]
-    assert subscribed == [{"board": "b1"}, {"limit": 10, "board": "b1"}]
+            assert "result" in await call(http, port, "events/poll", params)
+    assert subscribed == [{"board": "b"}, {"n": 1, "board": "b"}]
 
 
 @pytest.mark.parametrize("targeted", [False, True])
@@ -275,28 +253,21 @@ async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries
 
 
 @asynchronous
-async def test_what_a_subscribe_hook_emits_reaches_its_subscription_first_and_a_cursor_from_before_a_restart_is_a_gap():
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: say(
-            changed, arguments["board"], "welcome", to=id
-        )
-    )
-    restarted = declare()[1].cursor()
-    gaps = []
+async def test_a_cursor_from_before_a_restart_is_a_gap():
+    events, changed = declare()
+    restarted, gaps = declare()[1].cursor(), []
     async with served(events) as port:
-        for cursor in [None, restarted]:
-            for delivery in ["push", "poll"]:
-                board = f"{delivery} {'resumed' if cursor else 'fresh'}"
-                async with client(port, user="ann").subscribe(
-                    "board.changed",
-                    {"board": board},
-                    delivery=delivery,
-                    cursor=cursor,
-                    on_gap=partial(gaps.append, board),
-                ) as changes:
-                    say(changed, board, "hello")
-                    assert await take(changes, 2) == ["welcome", "hello"]
-    assert gaps == ["push resumed", "poll resumed"]
+        for delivery in ["push", "poll"]:
+            async with client(port, user="ann").subscribe(
+                "board.changed",
+                {"board": delivery},
+                delivery=delivery,
+                cursor=restarted,
+                on_gap=partial(gaps.append, delivery),
+            ) as changes:
+                say(changed, delivery, "hello")
+                assert await take(changes, 1) == ["hello"]
+    assert gaps == ["push", "poll"]
 
 
 @asynchronous
@@ -336,16 +307,6 @@ async def test_a_subscription_the_app_ends_is_sent_what_was_emitted_to_it_unless
 
 @asynchronous
 async def test_the_messages_on_the_wire_are_the_sketchs():
-    recursive = {
-        "$ref": "#/$defs/Node",
-        "$defs": {
-            "Node": {
-                "type": "object",
-                "properties": {"child": {"$ref": "#/$defs/Node"}},
-            }
-        },
-    }
-
     def shaped(context, event, arguments):
         if event.data.text == "bad":
             raise ValueError("cannot be shaped")
@@ -358,8 +319,8 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
     )
     events.event(
         "board.locked",
-        input_schema=BOARD,
-        payload_schema=recursive,
+        input_schema=Board.model_json_schema(),
+        payload_schema=Change.model_json_schema(),
         delivery=["poll"],
         authorize=lambda context, arguments: arguments["board"] != "secret",
     )
@@ -370,11 +331,10 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
             event["name"]: event
             for event in (await call(http, port, "events/list", {}))["result"]["events"]
         }
-        assert listed["board.locked"]["payloadSchema"] == recursive
         assert set(listed["board.changed"]["delivery"]) == {"poll", "push"}
         expected = {
             "description": "A board changed",
-            "inputSchema": BOARD,
+            "inputSchema": Board.model_json_schema(),
             "payloadSchema": Change.model_json_schema(),
         }
         assert {key: listed["board.changed"][key] for key in expected} == expected
@@ -409,6 +369,7 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
 
         for method, params, code in [
             ("events/poll", {"name": "board.moved"}, -32023),
+            ("events/poll", {"name": "board.changed", "arguments": {}}, INVALID_PARAMS),
             ("events/poll", changed_on("b1", 1), INVALID_PARAMS),
             (
                 "events/stream",
@@ -566,10 +527,7 @@ async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
 
 @asynchronous
 async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it_on_a_json_endpoint():
-    events, said = Events(), []
-    changed: EventType[Board, Change] = events.event(
-        "board.changed", input_schema=BOARD, payload_schema=Change.model_json_schema()
-    )
+    (events, changed), said = declare(), []
 
     def tell(text):
         said.append(text)

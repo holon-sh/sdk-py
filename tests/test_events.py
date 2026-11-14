@@ -30,7 +30,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import Events, EventType, NoCompatibleDeliveryMode, _server
+from holon.ext.events import Events, EventType, _server
 from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
@@ -519,11 +519,13 @@ async def test_where_push_cannot_be_served_a_subscription_polls(monkeypatch):
             assert await take(changes, 1) == ["polled"]
             await changes.cancel()
             assert await anext(changes, None) is None
-        with pytest.raises(NoCompatibleDeliveryMode):
+        with pytest.raises(MCPError) as refused:
             async with boards.subscribe(
                 "board.changed", {"board": "b1"}, delivery="push"
             ):
                 pass
+        assert refused.value.error.code == -32026
+        assert refused.value.error.data == {"feature": "deliveryMode", "value": "push"}
         await stop()
 
 

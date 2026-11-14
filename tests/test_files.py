@@ -13,7 +13,9 @@ from pathlib import Path
 import httpx2
 import pytest
 import uvicorn
+from mcp.server import MCPServer
 from mcp.server.lowlevel import Server
+from mcp.server.mcpserver import Context
 from mcp.server.streamable_http import CONTENT_TYPE_JSON, CONTENT_TYPE_SSE
 from mcp.shared.inbound import (
     MCP_METHOD_HEADER,
@@ -48,6 +50,7 @@ from holon.ext.files import (
     FileTransferError,
     LocalStorage,
     OutcomeUnknownError,
+    ReceivedFile,
     downloads,
     file_input_schema,
 )
@@ -110,7 +113,7 @@ def serve(tmp_path):
                 request_state="asked",
             )
         for value in arguments.get("files") or [arguments["file"]]:
-            received = files.received(value)
+            received = ReceivedFile(value)
             if params.name == "save":
                 await received.save(tmp_path / "saved" / Path(received.name).name)
         return CallToolResult(content=[TextContent(type="text", text="ok")])
@@ -148,7 +151,7 @@ def recording(app, seen):
     return asgi
 
 
-def client(app, seen, **binding):
+def client(app, seen, tools=TOOLS, **binding):
     def http_client():
         return httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=recording(app, seen)),
@@ -158,7 +161,7 @@ def client(app, seen, **binding):
 
     return Apps(
         {"name": "caller", "version": "1", "requires": {}},
-        {"files": {"tools": TOOLS}},
+        {"files": {"tools": tools}},
         {"files": {"endpoint": ENDPOINT, "http_client": http_client, **binding}},
     ).files
 
@@ -176,14 +179,15 @@ def run(app, body):
     asyncio.run(asyncio.wait_for(main(), timeout=20))
 
 
+async def answer(params):
+    return ElicitResult(action="accept", content={})
+
+
 def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
     (tmp_path / "notes.txt").write_bytes(b"x" * 100)
     app, ran = serve(tmp_path)
     seen = []
     files = client(app, seen)
-
-    async def answer(params):
-        return ElicitResult(action="accept", content={})
 
     async def body():
         await files.tools.save(file=File(b"tiny", name="a.txt"), cover=None)
@@ -218,6 +222,45 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
     assert (tmp_path / "saved/a.txt").read_bytes() == b"tiny"
     assert (tmp_path / "saved/notes.txt").read_bytes() == b"x" * 100
     assert ran == ["save"] * 3
+
+
+def test_a_declared_file_argument_reaches_the_tool_after_an_input_request(tmp_path):
+    (tmp_path / "notes.txt").write_bytes(b"x" * 100)
+    storage = LocalStorage(tmp_path / "storage")
+    server = MCPServer("files")
+    read = []
+
+    async def save(file: ReceivedFile, ctx: Context) -> str:
+        if not ctx.input_responses:
+            question = ElicitRequestFormParams(
+                message="Why?", requested_schema={"type": "object", "properties": {}}
+            )
+            return InputRequiredResult(
+                input_requests={"why": ElicitRequest(params=question)},
+                request_state="asked",
+            )
+        read.append(await file.read())
+        return "ok"
+
+    server.add_tool(save)
+    tools = [
+        tool.model_dump(by_alias=True, exclude_none=True)
+        for tool in asyncio.run(server.list_tools())
+    ]
+    files = FileServer(
+        storage, tools={t["name"]: t for t in tools}.get, max_inline_bytes=16
+    )
+    server._lowlevel_server.extensions[EXTENSION] = files.settings()
+    server.middleware.insert(0, files)
+    app = server.streamable_http_app(stateless_http=True, json_response=True)
+    app.mount("/mcp/files", storage.app)
+
+    async def body():
+        for file in [File(b"tiny"), File(tmp_path / "notes.txt")]:
+            await client(app, [], tools).tools.save({"elicit": answer}, file=file)
+
+    run(app, body)
+    assert read == [b"tiny", b"x" * 100]
 
 
 def sink(attempts, served=None):

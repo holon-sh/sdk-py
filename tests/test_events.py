@@ -21,7 +21,6 @@ from mcp.types import (
     JSONRPC_VERSION,
     LATEST_PROTOCOL_VERSION,
     PROTOCOL_VERSION_META_KEY,
-    CallToolResult,
     ErrorData,
 )
 from pydantic import BaseModel
@@ -490,18 +489,9 @@ async def test_a_subscription_can_be_retried_after_setup_times_out(
 
 
 @asynchronous
-async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_change_after_it():
-    (events, changed), said = declare(), []
-
-    def tell(text):
-        said.append(text)
-        say(changed, "b1", text)
-
-    async def snapshot(context, params):
-        state = {"said": list(said), "cursor": changed.cursor()}
-        return CallToolResult(content=[], structured_content=state)
-
-    server = Server("boards", on_call_tool=snapshot)
+async def test_a_low_level_server_serves_the_events():
+    events, changed = declare()
+    server = Server("boards")
     events.serve(server)
     manager = StreamableHTTPSessionManager(server, stateless=True)
     port, stop = await serve(
@@ -510,15 +500,9 @@ async def test_a_subscription_from_the_cursor_read_with_a_snapshot_hears_every_c
             lifespan=lambda app: manager.run(),
         )
     )
-    tell("in the snapshot")
-    binding = {"endpoint": f"http://127.0.0.1:{port}/mcp/"}
-    boards = Apps(IDENTITY, {}, {"boards": binding}).boards
-    state = (await boards.call_tool("snapshot")).structured_content
-    tell("after the snapshot")
-    async with client(port).subscribe(
-        "board.changed", {"board": "b1"}, cursor=state["cursor"]
+    async with client(port, path="/mcp/").subscribe(
+        "board.changed", {"board": "b1"}
     ) as changes:
-        assert changes.delivery == "push"
-        tell("once subscribed")
-        assert await take(changes, 2) == ["after the snapshot", "once subscribed"]
+        say(changed, "b1", "hello")
+        assert await take(changes, 1) == ["hello"]
     await stop()

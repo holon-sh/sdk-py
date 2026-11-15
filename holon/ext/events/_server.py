@@ -370,7 +370,7 @@ class Events(Extension):
         self._epoch = secrets.token_hex(6)
         self._types: dict[str, EventType[Any, Any]] = {}
         self._held: Counter[str] = Counter()
-        self._sending: Counter[str] = Counter()
+        self._sending = 0
         self._sent = asyncio.Event()
         self._leases: dict[str, _Hold] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -595,7 +595,10 @@ class Events(Extension):
                 "ResourceExhausted",
                 {"limit": "subscriptions", "max": _MAX_SUBSCRIPTIONS},
             )
-        if self._held[request.caller] >= _MAX_SUBSCRIPTIONS_PER_CALLER:
+        if (
+            request.caller
+            and self._held[request.caller] >= _MAX_SUBSCRIPTIONS_PER_CALLER
+        ):
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",
@@ -676,20 +679,16 @@ class Events(Extension):
             hold.lease.cancel()
         self._close(hold)
 
-    # Waits for room to send `size` bytes. One caller may use a quarter of the budget.
+    # Waits for room to send `size` bytes.
     @asynccontextmanager
-    async def _send_budget(self, size: int, caller: str) -> AsyncIterator[None]:
-        while (
-            (sending := self._sending.total()) and sending + size > _MAX_SENDING_BYTES
-        ) or (
-            (mine := self._sending[caller]) and mine + size > _MAX_SENDING_BYTES // 4
-        ):
+    async def _send_budget(self, size: int) -> AsyncIterator[None]:
+        while self._sending and self._sending + size > _MAX_SENDING_BYTES:
             await self._sent.wait()
-        self._sending[caller] += size
+        self._sending += size
         try:
             yield
         finally:
-            _release(self._sending, caller, size)
+            self._sending -= size
             self._sent.set()
             self._sent = asyncio.Event()
 
@@ -708,7 +707,7 @@ class Events(Extension):
                     method=f"notifications/events/{method}", params=body
                 )
                 with anyio.move_on_after(2 * _HEARTBEAT) as waited:
-                    async with self._send_budget(size, request.caller):
+                    async with self._send_budget(size):
                         await ctx.session.send_notification(
                             cast(ServerNotification, notification),
                             related_request_id=ctx.request_id,

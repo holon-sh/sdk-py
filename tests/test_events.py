@@ -453,6 +453,25 @@ async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds
 
 
 @asynchronous
+async def test_a_signed_in_caller_is_held_to_its_limit_and_callers_without_an_identity_only_to_the_limit_in_all(
+    monkeypatch,
+):
+    monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS_PER_CALLER", 1)
+    async with (
+        served(declare()[0]) as port,
+        httpx2.AsyncClient(headers={"x-holon-context": signed_in("ann")}) as ann,
+        httpx2.AsyncClient() as anonymous,
+    ):
+        assert "result" in await call(ann, port, "events/poll", changed_on("b1"))
+        refused = await call(ann, port, "events/poll", changed_on("b2"))
+        assert refused["error"]["data"] == {"limit": "subscriptionsPerCaller", "max": 1}
+        for board in ("b1", "b2"):
+            assert "result" in await call(
+                anonymous, port, "events/poll", changed_on(board)
+            )
+
+
+@asynchronous
 async def test_a_subscription_can_be_retried_after_setup_times_out(
     monkeypatch,
 ):

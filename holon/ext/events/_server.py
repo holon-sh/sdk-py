@@ -595,7 +595,10 @@ class Events(Extension):
                 "ResourceExhausted",
                 {"limit": "subscriptions", "max": _MAX_SUBSCRIPTIONS},
             )
-        if self._held[request.caller] >= _MAX_SUBSCRIPTIONS_PER_CALLER:
+        if (
+            request.caller
+            and self._held[request.caller] >= _MAX_SUBSCRIPTIONS_PER_CALLER
+        ):
             raise MCPError(
                 RESOURCE_EXHAUSTED,
                 "ResourceExhausted",

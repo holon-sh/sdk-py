@@ -66,28 +66,6 @@ await apps.huggingface.tools.hub_search(query="llama")
 # error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
-## A page in MCP Apps hosts
-
-`holon.page` offers an app's page, built as one HTML file, as the view an MCP Apps host shows with a tool's result:
-
-```python
-from pathlib import Path
-
-from mcp.server import MCPServer
-
-from holon.page import create_page
-
-server = MCPServer("foo")
-page = create_page(Path(__file__).parent / "dist/mcp/index.html")
-
-
-@server.tool(description="Opens the page", meta=page.meta)
-def open() -> None: ...
-
-
-page.serve(server)
-```
-
 ## Community
 
 Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

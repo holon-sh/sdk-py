@@ -369,9 +369,9 @@ class Apps:
     """An application's dependencies, as generated clients use them.
 
     Applications use ``apps`` or ``create_apps`` from ``holon.apps``. Each dependency is ``apps.<name>``
-    or ``apps[name]``: its ``tools.<name>`` return structured output, or for a tool the contract names
-    under ``responses`` the first text block parsed as JSON without checking it (``None`` when there is
-    none), or raise :class:`ToolCallError`, and its ``call_tool`` returns the full result.
+    or ``apps[name]``: its ``tools.<name>`` return structured output, or the parsed JSON text of a tool
+    the contract lists under ``responses``, or raise :class:`ToolCallError`, and its ``call_tool``
+    returns the full result.
 
     Args:
         identity: Application name, version, and ``requires``.

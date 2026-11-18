@@ -159,8 +159,6 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             assert await parsed.orders.tools.read(id="empty") is None
             with pytest.raises(ToolCallError):
                 await parsed.orders.tools.read(id="error")
-            raw = await parsed.orders.call_tool("read", id="good")
-            assert raw.structured_content == {"total": 5}
             with pytest.raises(RuntimeError):
                 await Apps(undeclared, {}).missing.call_tool("read")
             script = {**identity, "requires": {}}

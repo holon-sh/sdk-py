@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -110,6 +111,12 @@ class CallOptions(TypedDict, total=False):
     elicit: Callable[[ElicitRequestParams], Awaitable[ElicitResult]]
 
 
+def _text(result: CallToolResult) -> str | None:
+    return next(
+        (part.text for part in result.content if isinstance(part, TextContent)), None
+    )
+
+
 class ToolCallError(RuntimeError):
     """Raised by ``tools.<name>`` when a tool fails or needs input.
 
@@ -130,10 +137,7 @@ class ToolCallError(RuntimeError):
             )
         else:
             message = "tool failed"
-            detail = next(
-                (part.text for part in result.content if isinstance(part, TextContent)),
-                "",
-            )
+            detail = _text(result) or ""
         if detail:
             message = f"{message}: {detail}"
         super().__init__(f"{app}.{tool}: {message}")
@@ -207,9 +211,10 @@ class _App:
             if contract is None
             else {tool["name"]: tool for tool in contract["tools"]}
         )
+        parsed = set((contract or {}).get("responses", ()))
         self.tools = SimpleNamespace(
             **{
-                name: partial(self._call_tool, tool)
+                name: partial(self._call_tool, tool, name in parsed)
                 for name, tool in self._definitions.items()
                 if not name.startswith("_")
             }
@@ -346,6 +351,7 @@ class _App:
     async def _call_tool(
         self,
         tool: dict[str, Any],
+        parsed: bool,
         options: CallOptions | None = None,
         /,
         **arguments: object,
@@ -353,6 +359,9 @@ class _App:
         result = await self.call_tool(tool["name"], options, **arguments)
         if isinstance(result, InputRequiredResult) or result.is_error:
             raise ToolCallError(self._name, tool["name"], result)
+        if parsed:
+            text = _text(result)
+            return None if text is None else json.loads(text)
         return result.structured_content if "outputSchema" in tool else result
 
 
@@ -360,8 +369,9 @@ class Apps:
     """An application's dependencies, as generated clients use them.
 
     Applications use ``apps`` or ``create_apps`` from ``holon.apps``. Each dependency is ``apps.<name>``
-    or ``apps[name]``: its ``tools.<name>`` return structured output or raise :class:`ToolCallError`,
-    and its ``call_tool`` returns the full result.
+    or ``apps[name]``: its ``tools.<name>`` return structured output, or the parsed JSON text of a tool
+    the contract lists under ``responses``, or raise :class:`ToolCallError`, and its ``call_tool``
+    returns the full result.
 
     Args:
         identity: Application name, version, and ``requires``.

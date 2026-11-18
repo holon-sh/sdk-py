@@ -66,6 +66,16 @@ await apps.huggingface.tools.hub_search(query="llama")
 # error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
+## Reading your own calls
+
+Every app can read the MCP calls made to it, newest first, with nothing to declare:
+
+```python
+from holon.system import control
+
+page = await control.tools.get_traces(since="24h", limit=200)
+```
+
 ## Community
 
 Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

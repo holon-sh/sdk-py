@@ -17,6 +17,7 @@ import holon
 import holon.client
 from holon.apps import apps, Inputs, Outputs
 from holon.ext.events import Events, EventType
+from holon.system import control, create_control
 
 def emit() -> None:
     changed: EventType[dict[str, str], dict[str, str]] = Events().event(
@@ -39,6 +40,16 @@ async def run() -> float:
     await apps.orders.tools.find(id="order-1")
     await apps.orders.call_tool("find", email="user@example.com")
     return output["total"]
+
+async def traces() -> str:
+    page = await control.tools.get_traces(since="24h", limit=200, status="error")
+    await create_control({"endpoint": "http://localhost:3000/mcp"}).tools.get_traces()
+    await control.call_tool("get_traces", {"timeout": 5}, tool="read")
+    await control.tools.get_traces(limit="200")  # type: ignore
+    await control.tools.get_traces(status="failed")  # type: ignore
+    await control.tools.get_trace()  # type: ignore
+    page["traces"][0]["status"] = "failed"  # type: ignore
+    return page["session"]
 
 async def invalid() -> None:
     await apps.orders.tools.read(id=1)  # type: ignore

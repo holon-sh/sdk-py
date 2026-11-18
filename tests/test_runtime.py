@@ -58,8 +58,10 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 return InputRequiredResult(
                     request_state="opaque", _meta={"preserved": True}
                 )
+            if id == "empty":
+                return CallToolResult(content=[])
             return CallToolResult(
-                content=[TextContent(type="text", text="Order")],
+                content=[TextContent(type="text", text='{"order": "unchecked"}')],
                 structured_content={"total": "bad" if id == "bad" else limit},
             )
 
@@ -147,7 +149,18 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 k: v for k, v in CONTRACT["tools"][0].items() if k != "outputSchema"
             }
             plain = Apps(identity, {"orders": {"tools": [tool]}}, bindings)
-            assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
+            assert (await plain.orders.tools.read(id="good")).content[0].text == (
+                '{"order": "unchecked"}'
+            )
+            parsed = Apps(
+                identity, {"orders": {"tools": [tool], "responses": ["read"]}}, bindings
+            )
+            assert await parsed.orders.tools.read(id="good") == {"order": "unchecked"}
+            assert await parsed.orders.tools.read(id="empty") is None
+            with pytest.raises(ToolCallError):
+                await parsed.orders.tools.read(id="error")
+            raw = await parsed.orders.call_tool("read", id="good")
+            assert raw.structured_content == {"total": 5}
             with pytest.raises(RuntimeError):
                 await Apps(undeclared, {}).missing.call_tool("read")
             script = {**identity, "requires": {}}

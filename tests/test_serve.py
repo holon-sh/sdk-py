@@ -8,6 +8,9 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from functools import wraps
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
+from typing import ClassVar
 
 import httpx2
 import pytest
@@ -21,6 +24,9 @@ from mcp.types import (
     LATEST_PROTOCOL_VERSION,
 )
 from opentelemetry import propagate
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest,
+)
 from starlette.datastructures import Headers
 from starlette.responses import RedirectResponse, Response
 from test_events import request
@@ -285,7 +291,19 @@ async def test_the_frontend_serves_its_files_and_nothing_hidden_or_outside_it(
         assert (await http.post("/")).status_code == 404
 
 
-def test_python_m_holon_serve_runs_an_entry_with_a_16_kib_context_and_on_sigterm_closes_its_streams_and_stops(
+class _Collector(BaseHTTPRequestHandler):
+    exports: ClassVar[list[bytes]] = []
+
+    def do_POST(self):
+        _Collector.exports.append(self.rfile.read(int(self.headers["content-length"])))
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_python_m_holon_serve_runs_an_entry_with_a_16_kib_context_exports_its_spans_and_on_sigterm_closes_its_streams_and_stops(
     tmp_path,
 ):
     (tmp_path / "src").mkdir()
@@ -304,10 +322,18 @@ frontend = "web"
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
         port = reserved.getsockname()[1]
+    collector = HTTPServer(("127.0.0.1", 0), _Collector)
+    Thread(target=collector.serve_forever, daemon=True).start()
     process = subprocess.Popen(
         [sys.executable, "-m", "holon.serve", "src/server.py"],
         cwd=tmp_path,
-        env={**os.environ, "PORT": str(port)},
+        env={
+            **os.environ,
+            "PORT": str(port),
+            "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{collector.server_port}",
+            "OTEL_SERVICE_NAME": "large",
+            "OTEL_RESOURCE_ATTRIBUTES": "holon.session=production",
+        },
     )
 
     async def exercise():
@@ -349,3 +375,14 @@ frontend = "web"
         process.wait(timeout=10)
     finally:
         process.kill()
+        collector.shutdown()
+    exported = {}
+    for body in _Collector.exports:
+        for spans in ExportTraceServiceRequest.FromString(body).resource_spans:
+            resource = {
+                each.key: each.value.string_value for each in spans.resource.attributes
+            }
+            for scoped in spans.scope_spans:
+                exported |= {span.name: resource for span in scoped.spans}
+    resource = {"service.name": "large", "holon.session": "production"}
+    assert resource.items() <= exported["events/stream ticked"].items()

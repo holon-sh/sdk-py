@@ -22,7 +22,10 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.subscriptions import ListenHandler
 from mcp.server.transport_security import TransportSecuritySettings
 from opentelemetry import context as tracing
-from opentelemetry import propagate
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
 from starlette.authentication import AuthCredentials, UnauthenticatedUser
 from starlette.datastructures import Headers
@@ -74,8 +77,14 @@ def load(entry: str) -> App:
 async def serve(app: App) -> None:
     """Serve ``app`` on ``HOST`` and ``PORT``, or else on 127.0.0.1:3000.
 
-    The MCP endpoint is at ``/mcp`` and ``/mcp/<app>``, and the frontend's files are everywhere else.
+    The MCP endpoint is at ``/mcp`` and ``/mcp/<app>``, and the frontend's files are everywhere else. With
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` set, as Holon sets it, the MCP SDK's spans for each request and each call to a
+    dependency are exported there, the last of them as the server stops.
     """
+    provider = TracerProvider()
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        trace.set_tracer_provider(provider)
     config = uvicorn.Config(
         _asgi(app),
         host=os.environ.get("HOST", "127.0.0.1"),
@@ -99,6 +108,7 @@ async def serve(app: App) -> None:
                 if isinstance(each, Events):
                     each.close()
             await super().shutdown(sockets)
+            provider.shutdown()
 
     await Server(config).serve()
 

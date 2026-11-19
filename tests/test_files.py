@@ -6,13 +6,11 @@ import base64
 import hashlib
 import json
 import os
-import socket
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx2
 import pytest
-import uvicorn
+from http_server import listening
 from mcp.server import MCPServer
 from mcp.server.lowlevel import Server
 from mcp.server.mcpserver import Context
@@ -285,19 +283,6 @@ def scripted(replies, transfers):
         json_response=True,
         custom_starlette_routes=[Mount("/mcp/files", app=transfers)],
     )
-
-
-@asynccontextmanager
-async def listening(app):
-    """Serves ``app`` on a loopback port, for url targets; yields its origin."""
-    sock = socket.create_server(("127.0.0.1", 0))
-    http = uvicorn.Server(uvicorn.Config(app, lifespan="off", log_level="warning"))
-    serving = asyncio.create_task(http.serve(sockets=[sock]))
-    try:
-        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
-    finally:
-        http.should_exit = True
-        await serving
 
 
 def upload(requestState="s", **target):

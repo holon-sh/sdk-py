@@ -1,10 +1,9 @@
 import asyncio
 import json
-import socket
 
 import httpx2
 import pytest
-import uvicorn
+from http_server import listening
 from mcp.server import MCPServer
 from mcp.types import (
     CLIENT_INFO_META_KEY,
@@ -169,16 +168,9 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             with pytest.raises(ValueError):
                 await Apps(script, {"orders": CONTRACT}).orders.tools.read(id="good")
             assert set(headers) == {b"Bearer external"}
-            sock = socket.create_server(("127.0.0.1", 0))
-            monkeypatch.setenv(
-                "ORDERS_MCP_URL", f"http://127.0.0.1:{sock.getsockname()[1]}/mcp"
-            )
-            http = uvicorn.Server(
-                uvicorn.Config(listen, lifespan="off", log_level="warning")
-            )
-            serving = asyncio.create_task(http.serve(sockets=[sock]))
-            apps = Apps(identity, {"orders": CONTRACT})
-            try:
+            async with listening(listen) as origin:
+                monkeypatch.setenv("ORDERS_MCP_URL", origin + "/mcp")
+                apps = Apps(identity, {"orders": CONTRACT})
                 headers.clear()
                 assert await apps.orders.tools.read(id="good") == {"total": 5}
                 assert set(headers) == {b"Bearer secret"}
@@ -186,9 +178,6 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 headers.clear()
                 await apps.orders.tools.read(id="good")
                 assert set(headers) == {None}
-            finally:
-                http.should_exit = True
-                await serving
         assert all(client.is_closed for client in clients)
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=15))

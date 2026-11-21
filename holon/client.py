@@ -212,6 +212,9 @@ class _App:
             else {tool["name"]: tool for tool in contract["tools"]}
         )
         parsed = set((contract or {}).get("responses", ()))
+        self._responses: dict[str, dict[str, Any]] = (contract or {}).get(
+            "responseSchemas", {}
+        )
         self.tools = SimpleNamespace(
             **{
                 name: partial(self._call_tool, tool, name in parsed)
@@ -230,6 +233,9 @@ class _App:
     ) -> CallToolResult | InputRequiredResult:
         """Call a tool and return its full MCP result.
 
+        Unlike ``tools.<name>``, it does not check the text of a tool the contract lists under
+        ``responses``.
+
         Args:
             name: Tool name.
             options: Timeout, input responses, request state, metadata, and ``elicit``.
@@ -239,7 +245,8 @@ class _App:
             The complete result, or an input-required result for questions left unanswered.
 
         Raises:
-            ValueError: The output does not match the contract, or the dependency is undeclared.
+            ValueError: The structured output does not match the contract, or the dependency is
+                undeclared.
             RuntimeError: The dependency has no endpoint.
             holon.ext.files.FileTransferError: A file was not sent; the tool did not run.
             holon.ext.files.OutcomeUnknownError: The call failed after its files were sent.
@@ -259,7 +266,6 @@ class _App:
             remember(result, transfers)
             if not result.is_error and "outputSchema" in definition:
                 self._validate(
-                    name,
                     definition["outputSchema"],
                     result.structured_content,
                     f"structured output from {self._name}.{name}",
@@ -333,14 +339,13 @@ class _App:
         if failure is not None:
             raise failure
 
-    def _validate(
-        self, name: str, schema: dict[str, Any], value: Any, label: str
-    ) -> None:
-        validator = self._validators.get(name)
+    # Each label names one schema's kind and owner, so it keys that schema's validator.
+    def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
+        validator = self._validators.get(label)
         if validator is None:
             cls = jsonschema.validators.validator_for(schema)
             cls.check_schema(schema)
-            validator = self._validators[name] = cls(
+            validator = self._validators[label] = cls(
                 schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
             )
         if (
@@ -361,7 +366,14 @@ class _App:
             raise ToolCallError(self._name, tool["name"], result)
         if parsed:
             text = _text(result)
-            return None if text is None else json.loads(text)
+            if text is None:
+                return None
+            value = json.loads(text)
+            if (schema := self._responses.get(tool["name"])) is not None:
+                self._validate(
+                    schema, value, f"response from {self._name}.{tool['name']}"
+                )
+            return value
         return result.structured_content if "outputSchema" in tool else result
 
 
@@ -370,8 +382,8 @@ class Apps:
 
     Applications use ``apps`` or ``create_apps`` from ``holon.apps``. Each dependency is ``apps.<name>``
     or ``apps[name]``: its ``tools.<name>`` return structured output, or the parsed JSON text of a tool
-    the contract lists under ``responses``, or raise :class:`ToolCallError`, and its ``call_tool``
-    returns the full result.
+    the contract lists under ``responses``, checked against the tool's ``responseSchemas`` entry when
+    it has one, or raise :class:`ToolCallError`, and its ``call_tool`` returns the full result.
 
     Args:
         identity: Application name, version, and ``requires``.

@@ -37,8 +37,8 @@ from mcp.types import (
 )
 from pydantic import Field, StrictInt, StrictStr
 from pydantic_core import to_json, to_jsonable_python
-from referencing import Registry
 
+from holon._schema import exact
 from holon.context import get_context
 from holon.ext.events._wire import (
     EVENTS_EXTENSION,
@@ -425,8 +425,6 @@ class Events(Extension):
             raise ValueError(f"Event {name} is already declared.")
         if not delivery:
             raise ValueError(f"Event {name} must be delivered by poll, push or both.")
-        checker = jsonschema.validators.validator_for(input_schema)
-        checker.check_schema(input_schema)
         descriptor = {
             "name": name,
             **({"description": description} if description else {}),
@@ -436,7 +434,7 @@ class Events(Extension):
         declared = EventType(
             name,
             self,
-            checker(input_schema, registry=Registry()),
+            exact(input_schema),
             descriptor,
             match,
             transform,

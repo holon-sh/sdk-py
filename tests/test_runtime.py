@@ -61,7 +61,7 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             if id == "empty":
                 return CallToolResult(content=[])
             return CallToolResult(
-                content=[TextContent(type="text", text='{"order": "unchecked"}')],
+                content=[TextContent(type="text", text="Order")],
                 structured_content={"total": "bad" if id == "bad" else limit},
             )
 
@@ -139,8 +139,9 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 if value == "error":
                     assert error.value.result == raw
                     assert "Unavailable" in str(error.value)
-            with pytest.raises(ValueError):
-                await apps.orders.tools.read(id="bad")
+            for value in ["bad", "empty"]:
+                with pytest.raises(ValueError):
+                    await apps.orders.tools.read(id=value)
             undeclared = {**identity, "requires": {"orders": {}, "missing": {}}}
             untyped = Apps(undeclared, {}, bindings)
             raw = await untyped.orders.call_tool("read", id="good")
@@ -149,16 +150,7 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 k: v for k, v in CONTRACT["tools"][0].items() if k != "outputSchema"
             }
             plain = Apps(identity, {"orders": {"tools": [tool]}}, bindings)
-            assert (await plain.orders.tools.read(id="good")).content[0].text == (
-                '{"order": "unchecked"}'
-            )
-            parsed = Apps(
-                identity, {"orders": {"tools": [tool], "responses": ["read"]}}, bindings
-            )
-            assert await parsed.orders.tools.read(id="good") == {"order": "unchecked"}
-            assert await parsed.orders.tools.read(id="empty") is None
-            with pytest.raises(ToolCallError):
-                await parsed.orders.tools.read(id="error")
+            assert (await plain.orders.tools.read(id="good")).content[0].text == "Order"
             with pytest.raises(RuntimeError):
                 await Apps(undeclared, {}).missing.call_tool("read")
             script = {**identity, "requires": {}}

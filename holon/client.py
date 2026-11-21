@@ -2,17 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Iterator,
-    Mapping,
-    Sequence,
-)
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from fractions import Fraction
-from functools import cache, partial
+from functools import partial
 from types import SimpleNamespace
 from typing import (
     Any,
@@ -49,6 +41,7 @@ from mcp.types import (
 )
 from referencing import Registry
 
+from holon._schema import exact
 from holon.context import _request
 from holon.ext.events import AppEvents
 from holon.ext.files._client import (
@@ -123,27 +116,6 @@ def _text(result: CallToolResult) -> str | None:
     return next(
         (part.text for part in result.content if isinstance(part, TextContent)), None
     )
-
-
-def _fraction(number: float) -> Fraction:
-    return Fraction(repr(number)) if isinstance(number, float) else Fraction(number)
-
-
-def _multiple_of(
-    validator: Validator, divisor: float, instance: Any, schema: object
-) -> Iterator[jsonschema.ValidationError]:
-    if validator.is_type(instance, "number") and (
-        _fraction(instance) % _fraction(divisor)
-    ):
-        yield jsonschema.ValidationError(f"{instance!r} is not a multiple of {divisor}")
-
-
-@cache
-def _exact(cls: type[Validator]) -> type[Validator]:
-    exact: type[Validator] = jsonschema.validators.extend(
-        cls, {"multipleOf": _multiple_of}
-    )
-    return exact
 
 
 class ToolCallError(RuntimeError):
@@ -370,7 +342,7 @@ class _App:
     def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
         validator = self._validators.get(id(schema))
         if validator is None:
-            cls = _exact(jsonschema.validators.validator_for(schema))
+            cls = exact(jsonschema.validators.validator_for(schema))
             cls.check_schema(schema)
             validator = self._validators[id(schema)] = cls(
                 schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
@@ -390,16 +362,16 @@ class _App:
         result = await self.call_tool(tool["name"], options, **arguments)
         if isinstance(result, InputRequiredResult) or result.is_error:
             raise ToolCallError(self._name, tool["name"], result)
-        if "responseSchema" in tool:
-            text = _text(result)
-            value = None if text is None else json.loads(text)
-            self._validate(
-                tool["responseSchema"],
-                value,
-                f"response from {self._name}.{tool['name']}",
-            )
-            return value
-        return result.structured_content if "outputSchema" in tool else result
+        if "outputSchema" in tool:
+            return result.structured_content
+        if "responseSchema" not in tool:
+            return result
+        text = _text(result)
+        value = None if text is None else json.loads(text)
+        self._validate(
+            tool["responseSchema"], value, f"response from {self._name}.{tool['name']}"
+        )
+        return value
 
 
 class Apps:

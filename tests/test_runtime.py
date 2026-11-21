@@ -153,23 +153,12 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             assert (await plain.orders.tools.read(id="good")).content[0].text == (
                 '{"order": "unchecked"}'
             )
+            stale = {"tools": [tool], "responses": ["read"]}
             with pytest.raises(ValueError, match="holon types generate"):
-                Apps(
-                    identity,
-                    {"orders": {"tools": [tool], "responses": ["read"]}},
-                    bindings,
-                )
+                Apps(identity, {"orders": stale}, bindings)
             response = {"type": "object", "properties": {"order": {"type": "string"}}}
-            parsed = Apps(
-                identity,
-                {
-                    "orders": {
-                        "tools": [{**tool, "responseSchema": response}],
-                        "responses": ["read"],
-                    }
-                },
-                bindings,
-            )
+            current = {**stale, "tools": [{**tool, "responseSchema": response}]}
+            parsed = Apps(identity, {"orders": current}, bindings)
             assert await parsed.orders.tools.read(id="good") == {"order": "unchecked"}
             for value in ["bad", "empty"]:
                 with pytest.raises(ValueError):

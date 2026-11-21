@@ -425,7 +425,6 @@ class Events(Extension):
             raise ValueError(f"Event {name} is already declared.")
         if not delivery:
             raise ValueError(f"Event {name} must be delivered by poll, push or both.")
-        checker = exact(input_schema)
         descriptor = {
             "name": name,
             **({"description": description} if description else {}),
@@ -435,7 +434,7 @@ class Events(Extension):
         declared = EventType(
             name,
             self,
-            checker,
+            exact(input_schema),
             descriptor,
             match,
             transform,

@@ -14,9 +14,7 @@ _STOCK = jsonschema.Draft202012Validator.VALIDATORS["multipleOf"]
 
 
 def _fraction(number: float) -> Fraction:
-    if isinstance(number, float) and not number.is_integer():
-        return Fraction(repr(number))
-    return Fraction(number)
+    return Fraction(repr(number) if isinstance(number, float) else number)
 
 
 def _multiple_of(

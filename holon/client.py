@@ -110,12 +110,6 @@ class CallOptions(TypedDict, total=False):
     elicit: Callable[[ElicitRequestParams], Awaitable[ElicitResult]]
 
 
-def _text(result: CallToolResult) -> str | None:
-    return next(
-        (part.text for part in result.content if isinstance(part, TextContent)), None
-    )
-
-
 class ToolCallError(RuntimeError):
     """Raised by ``tools.<name>`` when a tool fails or needs input.
 
@@ -136,7 +130,10 @@ class ToolCallError(RuntimeError):
             )
         else:
             message = "tool failed"
-            detail = _text(result) or ""
+            detail = next(
+                (part.text for part in result.content if isinstance(part, TextContent)),
+                "",
+            )
         if detail:
             message = f"{message}: {detail}"
         super().__init__(f"{app}.{tool}: {message}")

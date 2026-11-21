@@ -39,7 +39,6 @@ from mcp.types import (
     RequestParamsMeta,
     TextContent,
 )
-from referencing import Registry
 
 from holon._schema import exact
 from holon.context import _request
@@ -342,10 +341,8 @@ class _App:
     def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
         validator = self._validators.get(id(schema))
         if validator is None:
-            cls = exact(jsonschema.validators.validator_for(schema))
-            cls.check_schema(schema)
-            validator = self._validators[id(schema)] = cls(
-                schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
+            validator = self._validators[id(schema)] = exact(
+                schema, jsonschema.FormatChecker()
             )
         if (
             error := jsonschema.exceptions.best_match(validator.iter_errors(value))

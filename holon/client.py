@@ -205,19 +205,20 @@ class _App:
         self._name = name
         self._identity = identity
         self._binding = binding
-        self._validators: dict[str, Validator] = {}
+        self._validators: dict[int, Validator] = {}
         self._definitions: dict[str, dict[str, Any]] = (
             {}
             if contract is None
             else {tool["name"]: tool for tool in contract["tools"]}
         )
-        parsed = set((contract or {}).get("responses", ()))
-        self._responses: dict[str, dict[str, Any]] = (contract or {}).get(
-            "responseSchemas", {}
-        )
+        schemas = (contract or {}).get("responseSchemas", {})
+        # The tools whose text is parsed, with the schema it is checked against, if any.
+        self._responses: dict[str, dict[str, Any] | None] = {
+            name: schemas.get(name) for name in (contract or {}).get("responses", ())
+        }
         self.tools = SimpleNamespace(
             **{
-                name: partial(self._call_tool, tool, name in parsed)
+                name: partial(self._call_tool, tool)
                 for name, tool in self._definitions.items()
                 if not name.startswith("_")
             }
@@ -232,9 +233,6 @@ class _App:
         **arguments: object,
     ) -> CallToolResult | InputRequiredResult:
         """Call a tool and return its full MCP result.
-
-        Unlike ``tools.<name>``, it does not check the text of a tool the contract lists under
-        ``responses``.
 
         Args:
             name: Tool name.
@@ -339,13 +337,13 @@ class _App:
         if failure is not None:
             raise failure
 
-    # Each label names one schema's kind and owner, so it keys that schema's validator.
+    # Keyed by schema: a validator holds its schema, so the id is not reused while cached.
     def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
-        validator = self._validators.get(label)
+        validator = self._validators.get(id(schema))
         if validator is None:
             cls = jsonschema.validators.validator_for(schema)
             cls.check_schema(schema)
-            validator = self._validators[label] = cls(
+            validator = self._validators[id(schema)] = cls(
                 schema, registry=Registry(), format_checker=jsonschema.FormatChecker()
             )
         if (
@@ -356,7 +354,6 @@ class _App:
     async def _call_tool(
         self,
         tool: dict[str, Any],
-        parsed: bool,
         options: CallOptions | None = None,
         /,
         **arguments: object,
@@ -364,12 +361,12 @@ class _App:
         result = await self.call_tool(tool["name"], options, **arguments)
         if isinstance(result, InputRequiredResult) or result.is_error:
             raise ToolCallError(self._name, tool["name"], result)
-        if parsed:
+        if tool["name"] in self._responses:
             text = _text(result)
             if text is None:
                 return None
             value = json.loads(text)
-            if (schema := self._responses.get(tool["name"])) is not None:
+            if (schema := self._responses[tool["name"]]) is not None:
                 self._validate(
                     schema, value, f"response from {self._name}.{tool['name']}"
                 )

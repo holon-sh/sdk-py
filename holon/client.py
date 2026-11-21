@@ -212,7 +212,6 @@ class _App:
             else {tool["name"]: tool for tool in contract["tools"]}
         )
         schemas = (contract or {}).get("responseSchemas", {})
-        # The tools whose text is parsed, with the schema it is checked against, if any.
         self._responses: dict[str, dict[str, Any] | None] = {
             name: schemas.get(name) for name in (contract or {}).get("responses", ())
         }
@@ -243,8 +242,7 @@ class _App:
             The complete result, or an input-required result for questions left unanswered.
 
         Raises:
-            ValueError: The structured output does not match the contract, or the dependency is
-                undeclared.
+            ValueError: The output does not match the contract, or the dependency is undeclared.
             RuntimeError: The dependency has no endpoint.
             holon.ext.files.FileTransferError: A file was not sent; the tool did not run.
             holon.ext.files.OutcomeUnknownError: The call failed after its files were sent.
@@ -337,7 +335,6 @@ class _App:
         if failure is not None:
             raise failure
 
-    # Keyed by schema: a validator holds its schema, so the id is not reused while cached.
     def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
         validator = self._validators.get(id(schema))
         if validator is None:
@@ -379,8 +376,8 @@ class Apps:
 
     Applications use ``apps`` or ``create_apps`` from ``holon.apps``. Each dependency is ``apps.<name>``
     or ``apps[name]``: its ``tools.<name>`` return structured output, or the parsed JSON text of a tool
-    the contract lists under ``responses``, checked against the tool's ``responseSchemas`` entry when
-    it has one, or raise :class:`ToolCallError`, and its ``call_tool`` returns the full result.
+    the contract lists under ``responses``, or raise :class:`ToolCallError`, and its ``call_tool``
+    returns the full result.
 
     Args:
         identity: Application name, version, and ``requires``.

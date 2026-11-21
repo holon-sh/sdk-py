@@ -328,6 +328,7 @@ class Subscription(Generic[D]):
         data = occurrence.get("data")
         if self._payload is not None:
             self._app._validate(
+                "events/" + self._name,
                 self._payload,
                 data,
                 f"data of {self._app._name} {self._name}",

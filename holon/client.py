@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
-from functools import partial
+from fractions import Fraction
+from functools import cache, partial
 from types import SimpleNamespace
 from typing import (
     Any,
@@ -115,6 +123,27 @@ def _text(result: CallToolResult) -> str | None:
     return next(
         (part.text for part in result.content if isinstance(part, TextContent)), None
     )
+
+
+def _fraction(number: float) -> Fraction:
+    return Fraction(repr(number)) if isinstance(number, float) else Fraction(number)
+
+
+def _multiple_of(
+    validator: Validator, divisor: float, instance: Any, schema: object
+) -> Iterator[jsonschema.ValidationError]:
+    if validator.is_type(instance, "number") and (
+        _fraction(instance) % _fraction(divisor)
+    ):
+        yield jsonschema.ValidationError(f"{instance!r} is not a multiple of {divisor}")
+
+
+@cache
+def _exact(cls: type[Validator]) -> type[Validator]:
+    exact: type[Validator] = jsonschema.validators.extend(
+        cls, {"multipleOf": _multiple_of}
+    )
+    return exact
 
 
 class ToolCallError(RuntimeError):
@@ -338,7 +367,7 @@ class _App:
     def _validate(self, schema: dict[str, Any], value: Any, label: str) -> None:
         validator = self._validators.get(id(schema))
         if validator is None:
-            cls = jsonschema.validators.validator_for(schema)
+            cls = _exact(jsonschema.validators.validator_for(schema))
             cls.check_schema(schema)
             validator = self._validators[id(schema)] = cls(
                 schema, registry=Registry(), format_checker=jsonschema.FormatChecker()

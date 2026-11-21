@@ -60,8 +60,9 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 )
             if id == "empty":
                 return CallToolResult(content=[])
+            text = '{"order": 1}' if id == "bad" else '{"order": "unchecked"}'
             return CallToolResult(
-                content=[TextContent(type="text", text='{"order": "unchecked"}')],
+                content=[TextContent(type="text", text=text)],
                 structured_content={"total": "bad" if id == "bad" else limit},
             )
 
@@ -152,11 +153,29 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
             assert (await plain.orders.tools.read(id="good")).content[0].text == (
                 '{"order": "unchecked"}'
             )
+            with pytest.raises(ValueError, match="holon types generate"):
+                Apps(
+                    identity,
+                    {"orders": {"tools": [tool], "responses": ["read"]}},
+                    bindings,
+                )
+            response = {"type": "object", "properties": {"order": {"type": "string"}}}
             parsed = Apps(
-                identity, {"orders": {"tools": [tool], "responses": ["read"]}}, bindings
+                identity,
+                {
+                    "orders": {
+                        "tools": [{**tool, "responseSchema": response}],
+                        "responses": ["read"],
+                    }
+                },
+                bindings,
             )
             assert await parsed.orders.tools.read(id="good") == {"order": "unchecked"}
-            assert await parsed.orders.tools.read(id="empty") is None
+            for value in ["bad", "empty"]:
+                with pytest.raises(ValueError):
+                    await parsed.orders.tools.read(id=value)
+            raw = await parsed.orders.call_tool("read", id="bad")
+            assert raw.content[0].text == '{"order": 1}'
             with pytest.raises(ToolCallError):
                 await parsed.orders.tools.read(id="error")
             with pytest.raises(RuntimeError):

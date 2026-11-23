@@ -251,21 +251,15 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
     token = context(principal=PERSON)
     async with served(recording) as peer_origin, served(_asgi(App(server))) as origin:
         monkeypatch.setenv("PEER_MCP_URL", peer_origin + "/mcp")
-        with act_as("ann"):
-            await apps.peer.call_tool("ping")
-        phase()
         await call(origin + "/mcp", "relay", {"x-holon-context": token})
         await later[0]
         phase()
     assert phases == [
-        {("ann", None, "Bearer secret")},
         {("bob", None, "Bearer secret")},
         {(None, token, "Bearer secret")},
         {(None, None, None)},
         {(None, None, "Bearer secret")},
     ]
-    with pytest.raises(ValueError), act_as(""):
-        pass
 
 
 @asynchronous

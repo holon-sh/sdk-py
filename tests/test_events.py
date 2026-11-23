@@ -75,10 +75,14 @@ async def until(condition):
         await asyncio.sleep(0.01)
 
 
-async def serve(app, port=0):
+async def serve(app, port=0, *, timeout_graceful_shutdown=0):
     sock = socket.create_server(("127.0.0.1", port))
     server = uvicorn.Server(
-        uvicorn.Config(app, log_level="warning", timeout_graceful_shutdown=0)
+        uvicorn.Config(
+            app,
+            log_level="warning",
+            timeout_graceful_shutdown=timeout_graceful_shutdown,
+        )
     )
     task = asyncio.create_task(server.serve(sockets=[sock]))
     await until(lambda: server.started)

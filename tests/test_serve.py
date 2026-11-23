@@ -13,7 +13,6 @@ from typing import ClassVar
 
 import httpx2
 import pytest
-import uvicorn
 from mcp import Client
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -28,7 +27,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
 )
 from starlette.datastructures import Headers
 from starlette.responses import RedirectResponse, Response
-from test_events import asynchronous, request, until
+from test_events import asynchronous, request, serve, until
 
 from holon.client import Apps
 from holon.context import Caller, Principal, RequestContext, _request, get_context
@@ -49,15 +48,11 @@ def context(**payload):
 
 @asynccontextmanager
 async def served(app):
-    sock = socket.create_server(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
-    task = asyncio.create_task(server.serve(sockets=[sock]))
-    await until(lambda: server.started)
+    port, stop = await serve(app, timeout_graceful_shutdown=None)
     try:
-        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+        yield f"http://127.0.0.1:{port}"
     finally:
-        server.should_exit = True
-        await task
+        await stop()
 
 
 async def call(url, tool, headers):

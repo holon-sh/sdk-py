@@ -197,58 +197,7 @@ async def test_outside_holon_the_same_headers_make_an_anonymous_request(monkeypa
 
 
 @asynchronous
-async def test_a_peer_call_carries_the_context_until_its_request_ends_and_the_apps_token_always(
-    monkeypatch,
-):
-    monkeypatch.setenv("HOLON_PLATFORM", "1")
-    monkeypatch.setenv("PEER_MCP_TOKEN", "secret")
-    peer, received = MCPServer("peer"), []
-
-    @peer.tool()
-    def ping() -> str:
-        return "pong"
-
-    answer = peer.streamable_http_app(stateless_http=True)
-
-    async def recording(scope, receive, send):
-        if scope["type"] == "http":
-            headers = Headers(scope=scope)
-            received.append(
-                (headers.get("x-holon-context"), headers.get("authorization"))
-            )
-        await answer(scope, receive, send)
-
-    server, apps, phases, later = MCPServer("caller"), Apps(IDENTITY, {}), [], []
-
-    @server.tool()
-    async def relay() -> str:
-        await apps.peer.call_tool("ping")
-        phases.append(len(received))
-        bound = {"endpoint": os.environ["PEER_MCP_URL"]}
-        await Apps(IDENTITY, {}, {"peer": bound}).peer.call_tool("ping")
-        phases.append(len(received))
-        request = _request.get()
-
-        async def afterwards():
-            await until(lambda: request.ended)
-            await apps.peer.call_tool("ping")
-
-        later.append(asyncio.create_task(afterwards()))
-        return "relayed"
-
-    token = context(principal=PERSON)
-    async with served(recording) as peer_origin, served(_asgi(App(server))) as origin:
-        monkeypatch.setenv("PEER_MCP_URL", peer_origin + "/mcp")
-        await call(origin + "/mcp", "relay", {"x-holon-context": token})
-        await later[0]
-    during, bound = received[: phases[0]], received[phases[0] : phases[1]]
-    assert set(during) == {(token, "Bearer secret")}
-    assert set(bound) == {(None, None)}
-    assert set(received[phases[1] :]) == {(None, "Bearer secret")}
-
-
-@asynchronous
-async def test_a_call_made_acting_for_a_person_names_them_in_place_of_any_context(
+async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_its_request_ends_and_an_explicit_binding_never_does(
     monkeypatch,
 ):
     monkeypatch.setenv("HOLON_PLATFORM", "1")
@@ -273,27 +222,48 @@ async def test_a_call_made_acting_for_a_person_names_them_in_place_of_any_contex
             )
         await answer(scope, receive, send)
 
-    server, apps = MCPServer("caller"), Apps(IDENTITY, {})
+    server, apps, phases, later = MCPServer("caller"), Apps(IDENTITY, {}), [], []
+
+    def phase():
+        phases.append(set(received))
+        received.clear()
 
     @server.tool()
     async def relay() -> str:
         with act_for("bob"):
             await asyncio.create_task(apps.peer.call_tool("ping"))
+        phase()
         await apps.peer.call_tool("ping")
+        phase()
+        bound = {"endpoint": os.environ["PEER_MCP_URL"]}
+        with act_for("bob"):
+            await Apps(IDENTITY, {}, {"peer": bound}).peer.call_tool("ping")
+        phase()
+        request = _request.get()
+
+        async def afterwards():
+            await until(lambda: request.ended)
+            await apps.peer.call_tool("ping")
+
+        later.append(asyncio.create_task(afterwards()))
         return "relayed"
 
+    token = context(principal=PERSON)
     async with served(recording) as peer_origin, served(_asgi(App(server))) as origin:
         monkeypatch.setenv("PEER_MCP_URL", peer_origin + "/mcp")
         with act_for("ann"):
             await apps.peer.call_tool("ping")
-        timer = len(received)
-        await apps.peer.call_tool("ping")
-        after = len(received)
-        token = context(principal=PERSON)
+        phase()
         await call(origin + "/mcp", "relay", {"x-holon-context": token})
-    assert set(received[:timer]) == {("ann", None, "Bearer secret")}
-    assert set(received[timer:after]) == {(None, None, "Bearer secret")}
-    assert {sent[:2] for sent in received[after:]} == {("bob", None), (None, token)}
+        await later[0]
+        phase()
+    assert phases == [
+        {("ann", None, "Bearer secret")},
+        {("bob", None, "Bearer secret")},
+        {(None, token, "Bearer secret")},
+        {(None, None, None)},
+        {(None, None, "Bearer secret")},
+    ]
     with pytest.raises(ValueError), act_for(""):
         pass
 

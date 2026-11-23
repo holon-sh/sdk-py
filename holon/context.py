@@ -60,7 +60,7 @@ class Caller:
     """The app a request comes from. A lifecycle hook's job calls as its app."""
 
     app: str  # as named in holon.yaml
-    session: str  # the namespace of the session both apps run in
+    session: str
 
 
 @dataclass(frozen=True)

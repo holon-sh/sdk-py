@@ -66,6 +66,23 @@ await apps.huggingface.tools.hub_search(query="llama")
 # error: "HuggingfaceTools" has no attribute "hub_search"; maybe "hub_repo_search"?  [attr-defined]
 ```
 
+## Acting for a person outside a request
+
+A call an app makes on a timer, at startup, or after a request was answered carries no user. `act_for` makes the calls
+inside it as a person who let this app act for them (`create_delegation`), so a per-user app such as Gmail reaches their
+account:
+
+```python
+from holon.apps import apps
+from holon.context import act_for
+
+with act_for(owner_subject):
+    await apps.gmail.tools.list_labels()
+```
+
+The apps called see the person as `principal` and this app as `principal.actor`. Holon refuses the calls once the person
+revokes the delegation or loses access.
+
 ## Community
 
 Ask questions and share what you're building on the [Holon Discord](https://discord.gg/jXExyBdy).

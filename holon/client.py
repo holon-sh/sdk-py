@@ -40,7 +40,7 @@ from mcp.types import (
 )
 
 from holon._schema import exact
-from holon.context import _request
+from holon.context import _acting, _request
 from holon.ext.events import AppEvents
 from holon.ext.files._client import (
     FILES,
@@ -286,7 +286,9 @@ class _App:
         token = os.environ.get(prefix + "TOKEN")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         request = _request.get()
-        if request is not None and not request.ended and request.token:
+        if subject := _acting.get():
+            headers["X-Holon-Act-For"] = subject
+        elif request is not None and not request.ended and request.token:
             headers["X-Holon-Context"] = request.token
         return endpoint, partial(http_client, headers=headers)
 

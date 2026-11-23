@@ -32,7 +32,14 @@ from starlette.responses import RedirectResponse, Response
 from test_events import request
 
 from holon.client import Apps
-from holon.context import Caller, Principal, RequestContext, _request, get_context
+from holon.context import (
+    Caller,
+    Principal,
+    RequestContext,
+    _request,
+    act_for,
+    get_context,
+)
 from holon.serve import App, _asgi
 
 PERSON = {"iss": "https://id.example", "sub": "ann", "client_id": "web"}
@@ -238,6 +245,57 @@ async def test_a_peer_call_carries_the_context_until_its_request_ends_and_the_ap
     assert set(during) == {(token, "Bearer secret")}
     assert set(bound) == {(None, None)}
     assert set(received[phases[1] :]) == {(None, "Bearer secret")}
+
+
+@asynchronous
+async def test_a_call_made_acting_for_a_person_names_them_in_place_of_any_context(
+    monkeypatch,
+):
+    monkeypatch.setenv("HOLON_PLATFORM", "1")
+    monkeypatch.setenv("PEER_MCP_TOKEN", "secret")
+    peer, received = MCPServer("peer"), []
+
+    @peer.tool()
+    def ping() -> str:
+        return "pong"
+
+    answer = peer.streamable_http_app(stateless_http=True)
+
+    async def recording(scope, receive, send):
+        if scope["type"] == "http" and scope["method"] == "POST":
+            headers = Headers(scope=scope)
+            received.append(
+                (
+                    headers.get("x-holon-act-for"),
+                    headers.get("x-holon-context"),
+                    headers.get("authorization"),
+                )
+            )
+        await answer(scope, receive, send)
+
+    server, apps = MCPServer("caller"), Apps(IDENTITY, {})
+
+    @server.tool()
+    async def relay() -> str:
+        with act_for("bob"):
+            await asyncio.create_task(apps.peer.call_tool("ping"))
+        await apps.peer.call_tool("ping")
+        return "relayed"
+
+    async with served(recording) as peer_origin, served(_asgi(App(server))) as origin:
+        monkeypatch.setenv("PEER_MCP_URL", peer_origin + "/mcp")
+        with act_for("ann"):
+            await apps.peer.call_tool("ping")
+        timer = len(received)
+        await apps.peer.call_tool("ping")
+        after = len(received)
+        token = context(principal=PERSON)
+        await call(origin + "/mcp", "relay", {"x-holon-context": token})
+    assert set(received[:timer]) == {("ann", None, "Bearer secret")}
+    assert set(received[timer:after]) == {(None, None, "Bearer secret")}
+    assert {sent[:2] for sent in received[after:]} == {("bob", None), (None, token)}
+    with pytest.raises(ValueError), act_for(""):
+        pass
 
 
 @asynchronous

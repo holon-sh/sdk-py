@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypedDict
@@ -102,3 +104,27 @@ class _Request:
 
 
 _request: ContextVar[_Request | None] = ContextVar("holon_request", default=None)
+
+
+_acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
+
+
+@contextmanager
+def act_for(subject: str) -> Iterator[None]:
+    """Call other apps as ``subject`` in this block, for work no request of theirs waits on.
+
+    Use it on a timer, at startup, or after a request was answered: those calls otherwise carry no user. Holon admits
+    them only from a production app the person let act for them, with ``create_delegation``, and only while that
+    delegation stands, with their current access. The apps called see them as ``principal``, and this app as
+    ``principal.actor``. Inside a request, the block acts for ``subject`` instead of the request's user.
+
+    Args:
+        subject: The person's ``principal.subject``.
+    """
+    if not subject:
+        raise ValueError("act_for needs the subject of a person")
+    acting = _acting.set(subject)
+    try:
+        yield
+    finally:
+        _acting.reset(acting)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypedDict
@@ -102,3 +104,22 @@ class _Request:
 
 
 _request: ContextVar[_Request | None] = ContextVar("holon_request", default=None)
+
+
+_acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
+
+
+@contextmanager
+def act_as(subject: str) -> Iterator[None]:
+    """Call other apps as ``subject`` in this block.
+
+    Args:
+        subject: The person's ``principal.subject``.
+    """
+    if not subject:
+        raise ValueError("act_as needs the subject of a person")
+    acting = _acting.set(subject)
+    try:
+        yield
+    finally:
+        _acting.reset(acting)

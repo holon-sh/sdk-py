@@ -36,7 +36,7 @@ from holon.serve import App, _asgi
 
 PERSON = {"iss": "https://id.example", "sub": "ann", "client_id": "web"}
 PROFILE = {"email": "ann@example.com", "email_verified": True}
-REPORTER = "production/reporter"
+REPORTER = "session/reporter"
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 IDENTITY = {"name": "caller", "version": "1", "requires": {"peer": {}}}
 
@@ -119,13 +119,13 @@ async def test_inside_holon_a_tool_sees_whom_the_waypoint_admitted_and_not_the_h
                 },
                 RequestContext(
                     Principal("https://id.example", "ann", "web", [], {}),
-                    Caller("reporter", "production"),
+                    Caller("reporter", "session"),
                 ),
             ),
             (
                 "/mcp",
                 {"x-holon-caller": REPORTER},
-                RequestContext(None, Caller("reporter", "production")),
+                RequestContext(None, Caller("reporter", "session")),
             ),
             ("/mcp", {"x-holon-context": context()}, RequestContext(None, None)),
         ]:

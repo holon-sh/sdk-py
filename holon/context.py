@@ -60,8 +60,6 @@ class Caller:
     """The app a request comes from. A lifecycle hook's job calls as its app."""
 
     app: str  # as named in holon.yaml
-    # The name of the Session both apps run in, such as "production". A Session
-    # keeps its name when it is recreated, as on a cluster migration.
     session: str
 
 

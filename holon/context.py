@@ -110,7 +110,7 @@ _acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
 
 
 @contextmanager
-def act_for(subject: str) -> Iterator[None]:
+def act_as(subject: str) -> Iterator[None]:
     """Call other apps as ``subject`` in this block, for work no request of theirs waits on.
 
     Use it on a timer, at startup, or after a request was answered: those calls otherwise carry no user. Holon admits
@@ -123,7 +123,7 @@ def act_for(subject: str) -> Iterator[None]:
         subject: The person's ``principal.subject``.
     """
     if not subject:
-        raise ValueError("act_for needs the subject of a person")
+        raise ValueError("act_as needs the subject of a person")
     acting = _acting.set(subject)
     try:
         yield

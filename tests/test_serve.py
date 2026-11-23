@@ -37,7 +37,7 @@ from holon.context import (
     Principal,
     RequestContext,
     _request,
-    act_for,
+    act_as,
     get_context,
 )
 from holon.serve import App, _asgi
@@ -215,7 +215,7 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
             headers = Headers(scope=scope)
             received.append(
                 (
-                    headers.get("x-holon-act-for"),
+                    headers.get("x-holon-act-as"),
                     headers.get("x-holon-context"),
                     headers.get("authorization"),
                 )
@@ -230,13 +230,13 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
 
     @server.tool()
     async def relay() -> str:
-        with act_for("bob"):
+        with act_as("bob"):
             await asyncio.create_task(apps.peer.call_tool("ping"))
         phase()
         await apps.peer.call_tool("ping")
         phase()
         bound = {"endpoint": os.environ["PEER_MCP_URL"]}
-        with act_for("bob"):
+        with act_as("bob"):
             await Apps(IDENTITY, {}, {"peer": bound}).peer.call_tool("ping")
         phase()
         request = _request.get()
@@ -251,7 +251,7 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
     token = context(principal=PERSON)
     async with served(recording) as peer_origin, served(_asgi(App(server))) as origin:
         monkeypatch.setenv("PEER_MCP_URL", peer_origin + "/mcp")
-        with act_for("ann"):
+        with act_as("ann"):
             await apps.peer.call_tool("ping")
         phase()
         await call(origin + "/mcp", "relay", {"x-holon-context": token})
@@ -264,7 +264,7 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
         {(None, None, None)},
         {(None, None, "Bearer secret")},
     ]
-    with pytest.raises(ValueError), act_for(""):
+    with pytest.raises(ValueError), act_as(""):
         pass
 
 

@@ -68,15 +68,15 @@ await apps.huggingface.tools.hub_search(query="llama")
 
 ## Acting for a person outside a request
 
-A call an app makes on a timer, at startup, or after a request was answered carries no user. `act_for` makes the calls
+A call an app makes on a timer, at startup, or after a request was answered carries no user. `act_as` makes the calls
 inside it to dependencies Holon binds as a person who let this app act for them on its page in Holon
 (`/connections?resource=<this app's MCP address>&action=delegate`), so a per-user app such as Gmail reaches their account:
 
 ```python
 from holon.apps import apps
-from holon.context import act_for
+from holon.context import act_as
 
-with act_for(owner_subject):
+with act_as(owner_subject):
     await apps.gmail.tools.list_labels()
 ```
 

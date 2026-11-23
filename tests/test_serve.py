@@ -7,7 +7,6 @@ import socket
 import subprocess
 import sys
 from contextlib import asynccontextmanager
-from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import ClassVar
@@ -29,7 +28,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
 )
 from starlette.datastructures import Headers
 from starlette.responses import RedirectResponse, Response
-from test_events import request
+from test_events import asynchronous, request, until
 
 from holon.client import Apps
 from holon.context import Caller, Principal, RequestContext, _request, get_context
@@ -42,23 +41,10 @@ TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 IDENTITY = {"name": "caller", "version": "1", "requires": {"peer": {}}}
 
 
-def asynchronous(test):
-    @wraps(test)
-    def run(*args, **kwargs):
-        asyncio.run(asyncio.wait_for(test(*args, **kwargs), timeout=20))
-
-    return run
-
-
 def context(**payload):
     claims = {"exp": 1900000060.25, "aud": ["https://holon.example"], **payload}
     encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
     return f"e30.{encoded.decode()}.signature"
-
-
-async def until(condition):
-    while not condition():
-        await asyncio.sleep(0.01)
 
 
 @asynccontextmanager

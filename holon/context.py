@@ -111,13 +111,7 @@ _acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
 
 @contextmanager
 def act_as(subject: str) -> Iterator[None]:
-    """Call other apps as ``subject`` in this block, for work no request of theirs waits on.
-
-    Use it on a timer, at startup, or after a request was answered: those calls otherwise carry no user. Holon admits
-    them only while the person lets this app act for them, with their current access. The apps called see them as
-    ``principal``, and this app as ``principal.actor``. Inside a request, the block acts for ``subject`` instead of the
-    request's user, so name only a person whose ``principal.subject`` this app read itself. Dependencies bound
-    explicitly never carry the person.
+    """Call other apps as ``subject`` in this block.
 
     Args:
         subject: The person's ``principal.subject``.

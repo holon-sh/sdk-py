@@ -196,7 +196,7 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
             headers = Headers(scope=scope)
             received.append(
                 (
-                    headers.get("x-holon-act-as"),
+                    headers.get("x-holon-subject"),
                     headers.get("x-holon-context"),
                     headers.get("authorization"),
                 )

@@ -287,7 +287,7 @@ class _App:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         request = _request.get()
         if subject := _acting.get():
-            headers["X-Holon-Act-As"] = subject
+            headers["X-Holon-Subject"] = subject
         elif request is not None and not request.ended and request.token:
             headers["X-Holon-Context"] = request.token
         return endpoint, partial(http_client, headers=headers)

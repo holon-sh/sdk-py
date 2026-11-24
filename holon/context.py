@@ -113,6 +113,8 @@ _acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
 def act_as(subject: str) -> Iterator[None]:
     """Call other apps as ``subject`` in this block.
 
+    https://www.rfc-editor.org/rfc/rfc8693.html#section-2.1
+
     Args:
         subject: The person's ``principal.subject``.
     """

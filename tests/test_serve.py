@@ -197,6 +197,7 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
             received.append(
                 (
                     headers.get("x-holon-subject"),
+                    headers.get("x-holon-actor"),
                     headers.get("x-holon-context"),
                     headers.get("authorization"),
                 )
@@ -213,6 +214,8 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
     async def relay() -> str:
         with act_as("bob"):
             await asyncio.create_task(apps.peer.call_tool("ping"))
+        with act_as("bob", actor="onboarding"):
+            await apps.peer.call_tool("ping")
         phase()
         await apps.peer.call_tool("ping")
         phase()
@@ -236,10 +239,13 @@ async def test_a_peer_call_acts_for_a_named_person_or_carries_the_context_until_
         await later[0]
         phase()
     assert phases == [
-        {("bob", None, "Bearer secret")},
-        {(None, token, "Bearer secret")},
-        {(None, None, None)},
-        {(None, None, "Bearer secret")},
+        {
+            ("bob", None, None, "Bearer secret"),
+            ("bob", "onboarding", None, "Bearer secret"),
+        },
+        {(None, None, token, "Bearer secret")},
+        {(None, None, None, None)},
+        {(None, None, None, "Bearer secret")},
     ]
 
 

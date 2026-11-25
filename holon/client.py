@@ -286,8 +286,10 @@ class _App:
         token = os.environ.get(prefix + "TOKEN")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         request = _request.get()
-        if subject := _acting.get():
-            headers["X-Holon-Subject"] = subject
+        if acting := _acting.get():
+            headers["X-Holon-Subject"] = acting.subject
+            if acting.actor is not None:
+                headers["X-Holon-Actor"] = acting.actor
         elif request is not None and not request.ended and request.token:
             headers["X-Holon-Context"] = request.token
         return endpoint, partial(http_client, headers=headers)

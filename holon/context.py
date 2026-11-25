@@ -106,21 +106,30 @@ class _Request:
 _request: ContextVar[_Request | None] = ContextVar("holon_request", default=None)
 
 
-_acting: ContextVar[str | None] = ContextVar("holon_acting", default=None)
+@dataclass(frozen=True)
+class _Acting:
+    subject: str
+    actor: str | None
+
+
+_acting: ContextVar[_Acting | None] = ContextVar("holon_acting", default=None)
 
 
 @contextmanager
-def act_as(subject: str) -> Iterator[None]:
+def act_as(subject: str, *, actor: str | None = None) -> Iterator[None]:
     """Call other apps as ``subject`` in this block.
 
     https://www.rfc-editor.org/rfc/rfc8693.html#section-2.1
+    https://www.rfc-editor.org/rfc/rfc8693.html#section-4.1
+    https://www.rfc-editor.org/rfc/rfc8693.html#section-4.4
 
     Args:
         subject: The person's ``principal.subject``.
+        actor: The app acting for ``subject``, when it is not this app.
     """
     if not subject:
         raise ValueError("act_as needs the subject of a person")
-    acting = _acting.set(subject)
+    acting = _acting.set(_Acting(subject, actor))
     try:
         yield
     finally:

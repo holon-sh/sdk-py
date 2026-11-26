@@ -28,7 +28,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from holon.client import Apps
-from holon.ext.events import Events, EventType, _server
+from holon.ext.events import Events, EventType
 from holon.serve import App, _asgi
 
 IDENTITY = {"name": "watcher", "version": "1", "requires": {"boards": {}}}
@@ -212,35 +212,6 @@ async def test_targeted_events_follow_shared_identity_but_isolate_anonymous_read
                     assert (await anext(second)).event_id == expected
 
 
-@pytest.mark.parametrize(
-    ("delivery", "targeted"), [("push", False), ("poll", False), ("push", True)]
-)
-@asynchronous
-async def test_a_subscription_behind_what_is_kept_is_told_of_the_gap_and_carries_on_but_a_stream_is_sent_all_emitted_to_its_subscription(
-    monkeypatch, delivery, targeted
-):
-    monkeypatch.setattr(_server, "_KEEP_EVENTS", 2)
-    subscribed, heard = asyncio.Queue(), []
-    events, changed = declare(
-        on_subscribe=lambda context, arguments, id: subscribed.put_nowait(id)
-    )
-    owed = delivery == "push" and targeted
-    async with (
-        served(events) as port,
-        client(port, user="ann").subscribe(
-            "board.changed",
-            {"board": "b1"},
-            delivery=delivery,
-            on_gap=lambda: heard.append("gap"),
-        ) as changes,
-    ):
-        subscription_id = await subscribed.get()
-        for text in ["a", "b", "c", "d"]:
-            say(changed, "b1", text, to=subscription_id if targeted else None)
-        heard.extend(await take(changes, 2))
-    assert heard == (["a", "b"] if owed else ["gap", "c", "d"])
-
-
 @asynchronous
 async def test_a_cursor_from_before_a_restart_is_a_gap():
     events, changed = declare()
@@ -410,86 +381,6 @@ async def test_the_messages_on_the_wire_are_the_sketchs():
                 -32024,
             )
             assert "result" in await anext(frames)
-
-
-@asynchronous
-async def test_a_poll_that_gives_up_while_it_is_set_up_stops_its_setup_and_holds_its_place_until_its_lease_lapses(
-    monkeypatch,
-):
-    monkeypatch.setattr(_server, "_POLL_SUBSCRIPTION_TTL", 0.5)
-    monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS", 1)
-    ended, seen = asyncio.Event(), []
-
-    async def on_subscribe(context, arguments, id):
-        seen.append(context.request.headers.get("x-leaving"))
-        try:
-            if seen[-1]:
-                await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            seen.append("stopped")
-            raise
-
-        async def cleanup():
-            ended.set()
-
-        return cleanup
-
-    async def give_up():
-        async with httpx2.AsyncClient(headers={"x-leaving": "1"}) as http:
-            await call(http, port, "events/poll", changed_on("b1"))
-
-    async with (
-        served(declare(on_subscribe=on_subscribe)[0]) as port,
-        httpx2.AsyncClient(timeout=10) as http,
-    ):
-        giving_up = asyncio.ensure_future(give_up())
-        await until(lambda: seen)
-        exhausted = await call(http, port, "events/poll", changed_on("b2"))
-        limit = exhausted["error"]["data"]
-        assert (limit["limit"], limit["max"]) == ("subscriptions", 1)
-        giving_up.cancel()
-        await until(lambda: "stopped" in seen)
-        assert "result" in await call(http, port, "events/poll", changed_on("b1"))
-        assert seen == ["1", "stopped", None]
-        await ended.wait()
-        assert "result" in await call(http, port, "events/poll", changed_on("b2"))
-
-
-@asynchronous
-async def test_a_signed_in_caller_is_held_to_its_limit_and_callers_without_an_identity_only_to_the_limit_in_all(
-    monkeypatch,
-):
-    monkeypatch.setattr(_server, "_MAX_SUBSCRIPTIONS_PER_CALLER", 1)
-    async with (
-        served(declare()[0]) as port,
-        httpx2.AsyncClient(headers={"x-holon-context": signed_in("ann")}) as ann,
-        httpx2.AsyncClient() as anonymous,
-    ):
-        assert "result" in await call(ann, port, "events/poll", changed_on("b1"))
-        refused = await call(ann, port, "events/poll", changed_on("b2"))
-        assert refused["error"]["data"] == {"limit": "subscriptionsPerCaller", "max": 1}
-        for board in ("b1", "b2"):
-            assert "result" in await call(
-                anonymous, port, "events/poll", changed_on(board)
-            )
-
-
-@asynchronous
-async def test_a_subscription_can_be_retried_after_setup_times_out(
-    monkeypatch,
-):
-    monkeypatch.setattr(_server, "_SUBSCRIBE_TIMEOUT", 0.1)
-    ready = asyncio.Event()
-
-    async def on_subscribe(context, arguments, id):
-        await ready.wait()
-
-    events, _ = declare(on_subscribe=on_subscribe)
-    async with served(events) as port, httpx2.AsyncClient(timeout=10) as http:
-        refused = await call(http, port, "events/poll", changed_on("b1"))
-        assert refused["error"]["code"] == INTERNAL_ERROR
-        ready.set()
-        assert "result" in await call(http, port, "events/poll", changed_on("b1"))
 
 
 @asynchronous

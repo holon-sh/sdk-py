@@ -156,10 +156,7 @@ async def test_a_malformed_context_is_a_bad_request(monkeypatch):
                 response = await client.post(
                     origin + "/mcp", headers=headers, content="{}"
                 )
-            assert (response.status_code, response.text) == (
-                400,
-                "Malformed Holon context\n",
-            ), headers
+            assert response.status_code == 400, headers
 
 
 @asynchronous

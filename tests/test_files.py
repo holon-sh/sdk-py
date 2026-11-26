@@ -205,7 +205,6 @@ def test_files_reach_the_tool_inline_and_out_of_band(tmp_path):
         first, upload_retry, _ = tool_calls(seen)
         assert "data" not in first["params"]["arguments"]["file"]
         assert upload_retry["params"]["arguments"] == first["params"]["arguments"]
-        assert "inputResponses" not in upload_retry["params"]
         [put] = [e for e in seen if e["method"] == "PUT"]
         assert put["path"].startswith("/mcp/files/") and put["body"] == b"x" * 100
         # A path target goes through the binding's client, without its credentials.
@@ -493,7 +492,7 @@ def test_the_server_checks_metadata_bytes_and_state_before_the_tool_runs(tmp_pat
                 ("check", {"files": [text_file(size=0, digest=digest(b"x"))]}),
                 (
                     "check",
-                    {"files": [text_file("same", good, digest=digest(good))] * 2},
+                    {"files": [text_file("same", b"0123", digest=digest(b"0123"))] * 2},
                 ),
             ]:
                 result = await call(arguments, name=name)

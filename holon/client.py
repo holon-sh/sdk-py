@@ -276,22 +276,13 @@ class _App:
         /,
         **arguments: object,
     ) -> CallToolResult | InputRequiredResult | CreateTaskResult:
-        """Call a tool, accepting a task in place of its result.
-
-        Declares the Tasks extension on this one request. Takes what ``call_tool`` takes.
-
-        Returns:
-            The server's answer: the complete result, an input-required result, or the task.
-        """
         return await self._call(name, options, arguments, [FILES, TASKS], STARTED)
 
     async def get_task(
         self, task_id: str, *, timeout: float | None = None
     ) -> DetailedTask:
-        """Send ``tasks/get`` and return the task as the server reports it."""
-        return await self._task(
-            "tasks/get", TaskParams(task_id=task_id), DETAILED, timeout
-        )
+        request = TaskRequest(method="tasks/get", params=TaskParams(task_id=task_id))
+        return await self._task(request, DETAILED, timeout)
 
     async def update_task(
         self,
@@ -300,15 +291,13 @@ class _App:
         *,
         timeout: float | None = None,
     ) -> None:
-        """Send ``tasks/update`` with answers to a task's ``input_requests``."""
         params = UpdateParams(task_id=task_id, input_responses=input_responses)
-        await self._task("tasks/update", params, EmptyResult, timeout)
+        request = TaskRequest(method="tasks/update", params=params)
+        await self._task(request, EmptyResult, timeout)
 
     async def cancel_task(self, task_id: str, *, timeout: float | None = None) -> None:
-        """Send ``tasks/cancel``. The server may still finish the task."""
-        await self._task(
-            "tasks/cancel", TaskParams(task_id=task_id), EmptyResult, timeout
-        )
+        request = TaskRequest(method="tasks/cancel", params=TaskParams(task_id=task_id))
+        await self._task(request, EmptyResult, timeout)
 
     async def _call(
         self,
@@ -344,16 +333,13 @@ class _App:
 
     async def _task(
         self,
-        method: Literal["tasks/get", "tasks/update", "tasks/cancel"],
-        params: TaskParams,
+        request: TaskRequest,
         decode: TypeAdapter[Reply] | type[Reply],
         timeout: float | None,
     ) -> Reply:
         async with self._session(timeout, extensions=[TASKS]) as client:
             return await client.session.send_request(
-                TaskRequest(method=method, params=params),
-                decode,
-                request_read_timeout_seconds=timeout,
+                request, decode, request_read_timeout_seconds=timeout
             )
 
     def _connection(

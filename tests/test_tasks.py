@@ -1,12 +1,10 @@
-"""Tasks through the generated client, against a server that serves them."""
-
 import asyncio
 
 import httpx2
 import pytest
 from mcp.server.lowlevel import Server
 from mcp.shared.exceptions import MCPError
-from mcp.types import CLIENT_CAPABILITIES_META_KEY, INVALID_PARAMS, ErrorData
+from mcp.types import CLIENT_CAPABILITIES_META_KEY, INVALID_PARAMS
 
 from holon.client import Apps
 
@@ -47,8 +45,6 @@ def task(status, **fields):
 
 def serve(reply, log):
     async def tasks(ctx, call_next):
-        if not (ctx.method == "tools/call" or ctx.method.startswith("tasks/")):
-            return await call_next(ctx)
         params = dict(ctx.params)
         meta = params.pop("_meta")[CLIENT_CAPABILITIES_META_KEY]
         declared = TASKS in meta.get("extensions", {})
@@ -58,7 +54,6 @@ def serve(reply, log):
         return reply
 
     server = Server("orders")
-    server.extensions[TASKS] = {}
     server.middleware.insert(0, tasks)
     return server.streamable_http_app(stateless_http=True, json_response=True)
 
@@ -86,13 +81,14 @@ def run(act, reply):
             except MCPError as error:
                 return error.error
 
-    return asyncio.run(asyncio.wait_for(main(), timeout=15)), log
+    return asyncio.run(main()), log
 
 
 def shape(outcome):
-    if outcome is None or isinstance(outcome, ErrorData):
-        return outcome
-    return type(outcome).__name__, outcome.model_dump(by_alias=True, exclude_none=True)
+    return outcome and (
+        type(outcome).__name__,
+        outcome.model_dump(by_alias=True, exclude_none=True),
+    )
 
 
 def get(orders):
@@ -167,7 +163,7 @@ CASES = {
     "an unknown task is the server's error": (
         get,
         UNKNOWN,
-        ErrorData(**UNKNOWN),
+        ("ErrorData", UNKNOWN),
         ("tasks/get", ID, True, NAMED),
     ),
 }

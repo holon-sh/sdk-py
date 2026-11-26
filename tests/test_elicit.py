@@ -9,7 +9,6 @@ from mcp.types import (
     CallToolResult,
     ElicitRequest,
     ElicitRequestFormParams,
-    ElicitRequestURLParams,
     ElicitResult,
     InputRequiredResult,
 )
@@ -18,8 +17,6 @@ from pydantic import BaseModel
 from holon.client import Apps, ToolCallError
 
 QUESTION = "Which size should I ship?"
-CONNECT = "Connect your account."
-LINK = "https://orders.example/connect"
 ID_ONLY = {
     "type": "object",
     "properties": {"id": {"type": "string"}},
@@ -69,13 +66,7 @@ def exercise(body):
                 message=QUESTION,
                 requested_schema={"type": "object", "properties": {}},
             )
-            url = ElicitRequestURLParams(message=CONNECT, url=LINK, elicitation_id="l")
-            return InputRequiredResult(
-                input_requests={
-                    "q": ElicitRequest(params=form),
-                    "l": ElicitRequest(params=url),
-                }
-            )
+            return InputRequiredResult(input_requests={"q": ElicitRequest(params=form)})
 
         app = server.streamable_http_app(stateless_http=True)
 

@@ -21,6 +21,7 @@ import jsonschema
 from jsonschema.protocols import Validator
 from mcp import Client
 from mcp.client import Transport
+from mcp.client.extension import ClientExtension
 from mcp.client.session import ClientRequestContext
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import (
@@ -32,14 +33,32 @@ from mcp.types import (
     ElicitRequest,
     ElicitRequestParams,
     ElicitResult,
+    EmptyResult,
     Implementation,
     InputRequiredResult,
     InputResponses,
     RequestParamsMeta,
+    Result,
     TextContent,
 )
+from pydantic import TypeAdapter
 
 from holon._schema import exact
+from holon._tasks import (
+    DETAILED,
+    STARTED,
+    TASKS,
+    CancelledTask,
+    CompletedTask,
+    CreateTaskResult,
+    DetailedTask,
+    FailedTask,
+    InputRequiredTask,
+    TaskParams,
+    TaskRequest,
+    UpdateParams,
+    WorkingTask,
+)
 from holon.context import _acting, _request
 from holon.ext.events import AppEvents
 from holon.ext.files._client import (
@@ -55,12 +74,20 @@ __all__ = [
     "Apps",
     "Binding",
     "CallOptions",
+    "CancelledTask",
     "CompleteResult",
+    "CompletedTask",
+    "CreateTaskResult",
+    "DetailedTask",
+    "FailedTask",
+    "InputRequiredTask",
     "ToolCallError",
     "ToolResult",
+    "WorkingTask",
 ]
 
 Output = TypeVar("Output")
+Reply = TypeVar("Reply", bound=Result)
 
 
 class Binding(TypedDict):
@@ -151,7 +178,8 @@ async def _send(
     arguments: dict[str, Any],
     options: CallOptions,
     transfers: Transfers,
-) -> CallToolResult | InputRequiredResult:
+    decode: TypeAdapter[UploadRequiredResult | Reply],
+) -> Reply:
     elicit = options.get("elicit")
     responses, state = options.get("input_responses"), options.get("request_state")
     answered = 0
@@ -167,7 +195,7 @@ async def _send(
                         _meta=options.get("meta"),
                     )
                 ),
-                CALL_RESULT,
+                decode,
                 request_read_timeout_seconds=options.get("timeout"),
             )
         except Exception as error:
@@ -239,17 +267,59 @@ class _App:
             holon.ext.files.FileTransferError: A file was not sent; the tool did not run.
             holon.ext.files.OutcomeUnknownError: The call failed after its files were sent.
         """
+        return await self._call(name, options, arguments, [FILES], CALL_RESULT)
+
+    async def start_task(
+        self,
+        name: str,
+        options: CallOptions | None = None,
+        /,
+        **arguments: object,
+    ) -> CallToolResult | InputRequiredResult | CreateTaskResult:
+        return await self._call(name, options, arguments, [FILES, TASKS], STARTED)
+
+    async def get_task(
+        self, task_id: str, *, timeout: float | None = None
+    ) -> DetailedTask:
+        request = TaskRequest(method="tasks/get", params=TaskParams(task_id=task_id))
+        return await self._task(request, DETAILED, timeout)
+
+    async def update_task(
+        self,
+        task_id: str,
+        input_responses: InputResponses,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        params = UpdateParams(task_id=task_id, input_responses=input_responses)
+        request = TaskRequest(method="tasks/update", params=params)
+        await self._task(request, EmptyResult, timeout)
+
+    async def cancel_task(self, task_id: str, *, timeout: float | None = None) -> None:
+        request = TaskRequest(method="tasks/cancel", params=TaskParams(task_id=task_id))
+        await self._task(request, EmptyResult, timeout)
+
+    async def _call(
+        self,
+        name: str,
+        options: CallOptions | None,
+        arguments: dict[str, Any],
+        extensions: Sequence[ClientExtension],
+        decode: TypeAdapter[UploadRequiredResult | Reply],
+    ) -> Reply:
         options = options or {}
         definition = self._definitions.get(name, {})
         transfers = Transfers(
             f"{self._name}.{name}",
             self._binding.get("file_origins") if self._binding else None,
         )
-        async with self._session(options.get("timeout"), transfers=transfers) as client:
+        async with self._session(
+            options.get("timeout"), transfers=transfers, extensions=extensions
+        ) as client:
             if holds_file(arguments):
                 schema = definition.get("inputSchema")
                 arguments = await transfers.prepare(client, name, schema, arguments)
-            result = await _send(client, name, arguments, options, transfers)
+            result = await _send(client, name, arguments, options, transfers, decode)
         if isinstance(result, CallToolResult):
             remember(result, transfers)
             if not result.is_error and "outputSchema" in definition:
@@ -260,6 +330,17 @@ class _App:
                     f"structured output from {self._name}.{name}",
                 )
         return result
+
+    async def _task(
+        self,
+        request: TaskRequest,
+        decode: TypeAdapter[Reply] | type[Reply],
+        timeout: float | None,
+    ) -> Reply:
+        async with self._session(timeout, extensions=[TASKS]) as client:
+            return await client.session.send_request(
+                request, decode, request_read_timeout_seconds=timeout
+            )
 
     def _connection(
         self, timeout: float | None
@@ -301,6 +382,7 @@ class _App:
         timeout: float | None,
         wrap: Callable[[Transport], Transport] | None = None,
         transfers: Transfers | None = None,
+        extensions: Sequence[ClientExtension] = (FILES,),
     ) -> AsyncIterator[Client]:
         endpoint, http_client = self._connection(timeout)
         failure: Exception | None = None
@@ -320,7 +402,7 @@ class _App:
                     ),
                     mode=LATEST_PROTOCOL_VERSION,
                     elicitation_callback=_declare_elicitation,
-                    extensions=[FILES],
+                    extensions=extensions,
                 ) as client:
                     try:
                         yield client

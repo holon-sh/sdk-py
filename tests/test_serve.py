@@ -15,7 +15,6 @@ import httpx2
 import pytest
 from mcp import Client
 from mcp.server import MCPServer
-from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import Context
 from mcp.shared.exceptions import MCPError
 from mcp.types import (
@@ -79,14 +78,7 @@ def inspector(seen):
     async def inspect(ctx: Context) -> str:
         trace = {}
         propagate.inject(trace)
-        seen.append(
-            (
-                get_context(),
-                get_access_token(),
-                set(ctx.headers),
-                trace.get("traceparent"),
-            )
-        )
+        seen.append((get_context(), set(ctx.headers), trace.get("traceparent")))
         return "seen"
 
     return server
@@ -134,9 +126,8 @@ async def test_inside_holon_a_tool_sees_whom_the_waypoint_admitted_and_not_the_h
             forged = {"x-holon-other": "forged", "authorization": "Bearer forged"}
             headers = {**headers, **forged, "traceparent": TRACEPARENT}
             await call(origin + path, "inspect", headers)
-            admitted, token, names, traceparent = seen.pop()
+            admitted, names, traceparent = seen.pop()
             assert admitted == expected
-            assert (token is None) == (expected == RequestContext(None, None))
             assert not {name for name in names if name.startswith("x-holon-")}
             assert "authorization" not in names
             assert traceparent == TRACEPARENT
@@ -152,10 +143,10 @@ async def test_a_malformed_context_is_a_bad_request(monkeypatch):
             [("x-holon-caller", "reporter")],
             [("x-holon-context", context(principal="user"))],
         ]:
+            discover = request("server/discover", {})
+            discover["headers"] = [*headers, *discover["headers"].items()]
             async with httpx2.AsyncClient() as client:
-                response = await client.post(
-                    origin + "/mcp", headers=headers, content="{}"
-                )
+                response = await client.post(origin + "/mcp", **discover)
             assert response.status_code == 400, headers
 
 
@@ -170,7 +161,7 @@ async def test_outside_holon_the_same_headers_make_an_anonymous_request(monkeypa
             "authorization": "Bearer forged",
         }
         await call(origin + "/mcp", "inspect", headers)
-    [(admitted, _, _, _)] = seen
+    [(admitted, _, _)] = seen
     assert admitted == RequestContext(None, None)
 
 

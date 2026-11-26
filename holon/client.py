@@ -282,7 +282,14 @@ class _App:
         self, task_id: str, *, timeout: float | None = None
     ) -> DetailedTask:
         request = TaskRequest(method="tasks/get", params=TaskParams(task_id=task_id))
-        return await self._task(request, DETAILED, timeout)
+        transfers = Transfers(
+            f"{self._name}.{task_id}",
+            self._binding.get("file_origins") if self._binding else None,
+        )
+        task = await self._task(request, DETAILED, timeout, transfers)
+        if isinstance(task, CompletedTask):
+            remember(task.result, transfers)
+        return task
 
     async def update_task(
         self,
@@ -336,8 +343,11 @@ class _App:
         request: TaskRequest,
         decode: TypeAdapter[Reply] | type[Reply],
         timeout: float | None,
+        transfers: Transfers | None = None,
     ) -> Reply:
-        async with self._session(timeout, extensions=[TASKS]) as client:
+        async with self._session(
+            timeout, transfers=transfers, extensions=[FILES, TASKS]
+        ) as client:
             return await client.session.send_request(
                 request, decode, request_read_timeout_seconds=timeout
             )

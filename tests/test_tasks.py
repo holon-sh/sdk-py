@@ -71,6 +71,8 @@ def serve(reply, log):
         log.append((ctx.method, ctx.request.headers.get("mcp-name"), declared, params))
         if "code" in reply:
             raise MCPError(**reply)
+        if reply.get("result") is LABELLED and EXTENSION not in meta["extensions"]:
+            return {**reply, "result": SHIPPED}
         return reply
 
     async def label(request):

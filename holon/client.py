@@ -346,7 +346,7 @@ class _App:
         transfers: Transfers | None = None,
     ) -> Reply:
         async with self._session(
-            timeout, transfers=transfers, extensions=[TASKS]
+            timeout, transfers=transfers, extensions=[FILES, TASKS]
         ) as client:
             return await client.session.send_request(
                 request, decode, request_read_timeout_seconds=timeout

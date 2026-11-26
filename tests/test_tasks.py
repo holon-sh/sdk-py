@@ -5,8 +5,11 @@ import pytest
 from mcp.server.lowlevel import Server
 from mcp.shared.exceptions import MCPError
 from mcp.types import CLIENT_CAPABILITIES_META_KEY, INVALID_PARAMS
+from starlette.responses import Response
+from starlette.routing import Route
 
 from holon.client import Apps
+from holon.ext.files import EXTENSION, downloads
 
 TASKS = "io.modelcontextprotocol/tasks"
 ID = "786512e2-9e0d-44bd-8f29-789f320fe840"
@@ -29,6 +32,23 @@ ANSWER = {"q": {"action": "accept", "content": {"size": "large"}}}
 UNKNOWN = {"code": INVALID_PARAMS, "message": "Failed to retrieve task: Task not found"}
 CALLED = {"name": "ship", "arguments": {"id": "A-1"}}
 NAMED = {"taskId": ID}
+LABEL = b"%PDF-1.7 label"
+LABELLED = {
+    **SHIPPED,
+    "_meta": {
+        EXTENSION: {
+            "downloads": [
+                {
+                    "path": "/files/label.pdf",
+                    "name": "label.pdf",
+                    "mimeType": "application/pdf",
+                    "size": len(LABEL),
+                    "credentials": "omit",
+                }
+            ]
+        }
+    },
+}
 
 
 def task(status, **fields):
@@ -53,9 +73,16 @@ def serve(reply, log):
             raise MCPError(**reply)
         return reply
 
+    async def label(request):
+        return Response(LABEL)
+
     server = Server("orders")
     server.middleware.insert(0, tasks)
-    return server.streamable_http_app(stateless_http=True, json_response=True)
+    return server.streamable_http_app(
+        stateless_http=True,
+        json_response=True,
+        custom_starlette_routes=[Route("/mcp/files/label.pdf", label)],
+    )
 
 
 def run(act, reply):
@@ -177,3 +204,16 @@ def test_each_call_sends_one_request_and_returns_the_answer_unchanged(
 
     assert shape(outcome) == expected
     assert log == [sent]
+
+
+def test_the_file_a_completed_task_returns_is_listed_and_fetched():
+    async def fetch(orders):
+        completed = await orders.get_task(ID)
+        [download] = downloads(completed.result)
+        return download.name, await download.read()
+
+    fetched, _ = run(
+        fetch, {"resultType": "complete", **task("completed", result=LABELLED)}
+    )
+
+    assert fetched == ("label.pdf", LABEL)

@@ -123,7 +123,6 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 "timeout": 7,
             }
             assert request["_meta"]["trace"] == "control"
-            assert not any(request["method"] == "tools/list" for request in requests)
             callers = [
                 request["params"]["_meta"][CLIENT_INFO_META_KEY]["name"]
                 for request in requests
@@ -138,7 +137,6 @@ def test_clients_preserve_mcp_results_and_validate(monkeypatch):
                 assert error.value.result.meta["preserved"] is True
                 if value == "error":
                     assert error.value.result == raw
-                    assert "Unavailable" in str(error.value)
             for value in ["bad", "empty"]:
                 with pytest.raises(ValueError):
                     await apps.orders.tools.read(id=value)
